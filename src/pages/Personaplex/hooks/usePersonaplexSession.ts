@@ -252,14 +252,43 @@ export const usePersonaplexSession = ({
 
       fetchVoiceAudio(text, selectedVoiceId)
         .then(async ({ base64, format }) => {
+          const mime = format === "mp3" ? "audio/mpeg" : "audio/wav";
+          const binary = atob(base64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const blob = new Blob([bytes], { type: mime });
+          const blobUrl = URL.createObjectURL(blob);
+
+          const playWithHtmlAudio = () => {
+            const audioEl = new Audio();
+            currentAudioRef.current = audioEl;
+            audioEl.playsInline = true;
+            audioEl.onended = () => {
+              URL.revokeObjectURL(blobUrl);
+              currentAudioRef.current = null;
+              done();
+            };
+            audioEl.onerror = () => {
+              URL.revokeObjectURL(blobUrl);
+              currentAudioRef.current = null;
+              setError("Audio playback failed");
+              done();
+            };
+            audioEl.src = blobUrl;
+            audioEl.play().catch(() => {
+              URL.revokeObjectURL(blobUrl);
+              currentAudioRef.current = null;
+              setError("Audio playback failed");
+              done();
+            });
+          };
+
+          const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
           const ctx = playbackContextRef.current;
-          if (ctx) {
+          if (!isIOS && ctx) {
             try {
-              await ctx.resume();
-              const binary = atob(base64);
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-              const buffer = await ctx.decodeAudioData(bytes.buffer);
+              await Promise.race([ctx.resume(), new Promise((_, r) => setTimeout(() => r(new Error("resume timeout")), 3000))]);
+              const buffer = await ctx.decodeAudioData(bytes.buffer.slice(0, bytes.byteLength));
               const source = ctx.createBufferSource();
               source.buffer = buffer;
               source.connect(ctx.destination);
@@ -269,30 +298,13 @@ export const usePersonaplexSession = ({
                 done();
               };
               source.start(0);
+              URL.revokeObjectURL(blobUrl);
             } catch (e) {
-              console.error("[Personaplex] Web Audio playback failed:", e);
-              setError("Audio playback failed");
-              done();
+              console.warn("[Personaplex] Web Audio failed, trying HTML Audio:", e);
+              playWithHtmlAudio();
             }
           } else {
-            const mime = format === "mp3" ? "audio/mpeg" : "audio/wav";
-            const dataUrl = `data:${mime};base64,${base64}`;
-            const audioEl = new Audio(dataUrl);
-            currentAudioRef.current = audioEl;
-            audioEl.onended = () => {
-              currentAudioRef.current = null;
-              done();
-            };
-            audioEl.onerror = () => {
-              currentAudioRef.current = null;
-              setError("ElevenLabs audio playback failed");
-              done();
-            };
-            audioEl.play().catch(() => {
-              currentAudioRef.current = null;
-              setError("ElevenLabs audio playback failed");
-              done();
-            });
+            playWithHtmlAudio();
           }
         })
         .catch((err) => {
@@ -436,6 +448,7 @@ export const usePersonaplexSession = ({
         };
 
         ws.onopen = () => {
+          setErrorMessage(null);
           try {
             const source = ctx.createMediaStreamSource(stream);
             sourceRef.current = source;
