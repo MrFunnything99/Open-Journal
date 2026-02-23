@@ -9,7 +9,7 @@ import { ConnectButton } from "./components/ConnectButton";
 import { JournalGallery } from "./components/JournalGallery";
 
 /** Default journaling assistant prompt */
-const DEFAULT_PERSONAPLEX_PROMPT = `You are an empathetic and insightful conversational journaling assistant. Your goal is to provide a supportive space for the user to reflect on their thoughts, experiences, and emotions. Read the user's entries and respond naturally. Ask open-ended questions to encourage further exploration, but always let the user guide the direction and depth of the conversation. Avoid being overly prescriptive, giving unsolicited advice, or summarizing their thoughts unnecessarily. Just be a curious, active listener. Always facilitate conversation that gets the user exploring their thoughts and emotions.`;
+const DEFAULT_PERSONAPLEX_PROMPT = `You are an empathetic and insightful conversational journaling assistant. Your goal is to provide a supportive space for the user to reflect on their thoughts, experiences, and emotions. Read the user's entries and respond naturally. Ask open-ended questions to encourage further exploration, but always let the user guide the direction and depth of the conversation. Avoid being overly prescriptive, giving unsolicited advice, or summarizing their thoughts unnecessarily. Just be a curious, active listener. Always facilitate conversation that gets the user exploring their thoughts and emotions. Try to keep responses brief and concise when possible to conserve tokens.`;
 
 const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Rachel
 
@@ -141,9 +141,9 @@ export const Personaplex = () => {
       </div>
 
       {/* Header */}
-      <header className="flex-none relative z-10 flex items-center justify-between px-6 py-4">
-        <div className="flex items-center gap-4">
-          <h1 className="text-xl font-light tracking-widest text-slate-300 uppercase">
+      <header className="flex-none relative z-10 flex items-center justify-between px-4 sm:px-6 py-3 sm:py-4 gap-2 flex-wrap sm:flex-nowrap">
+        <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+          <h1 className="text-base sm:text-xl font-light tracking-widest text-slate-300 uppercase truncate">
             OpenJournal
           </h1>
           <ConnectionStatus status={status} />
@@ -151,11 +151,11 @@ export const Personaplex = () => {
             <span className="text-sm text-red-400">{errorMessage}</span>
           )}
         </div>
-        <div className="flex items-center gap-2">
-          <button
+        <div className="flex items-center gap-2 shrink-0">
+            <button
             type="button"
             onClick={() => setShowGallery((v) => !v)}
-            className="px-4 py-2 rounded-lg bg-slate-700/50 text-slate-300 text-sm font-medium hover:bg-slate-600/50 transition-colors flex items-center gap-2"
+            className="px-3 py-1.5 sm:px-4 sm:py-2 rounded-lg bg-slate-700/50 text-slate-300 text-sm font-medium hover:bg-slate-600/50 transition-colors flex items-center gap-2"
             title={showGallery ? "Back to session" : "Journal history"}
           >
             <svg
@@ -200,7 +200,7 @@ export const Personaplex = () => {
           }`}
         >
           {/* 3-column grid: desktop | single column: mobile/tablet */}
-          <div className="h-full min-h-0 grid grid-cols-1 lg:grid-cols-[1fr_2fr_1fr] gap-4 lg:gap-6 grid-rows-[repeat(3,minmax(0,1fr))] lg:grid-rows-[minmax(0,1fr)]">
+          <div className="h-full min-h-0 grid grid-cols-1 lg:grid-cols-[1fr_2fr_1fr] gap-4 lg:gap-6 grid-rows-[auto auto minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]">
             {/* Left column - Settings (order 1 on mobile) */}
             <div className="order-1 lg:order-none flex flex-col min-h-0 rounded-xl bg-slate-900/50 border border-slate-700/50 p-4">
               <h2 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-3">
@@ -226,7 +226,7 @@ export const Personaplex = () => {
               </div>
               <div className="mt-4">
                 <label
-                  className={`flex items-center gap-2 cursor-pointer select-none ${
+                  className={`flex flex-col sm:flex-row sm:items-center gap-2 cursor-pointer select-none ${
                     isConnected ? "cursor-not-allowed opacity-70" : ""
                   }`}
                 >
@@ -258,7 +258,7 @@ export const Personaplex = () => {
             </div>
 
             {/* Center column - Prompt, Orb (order 2 on mobile) */}
-            <div className="order-2 lg:order-none flex flex-col items-center justify-center gap-4 min-h-0 py-4 lg:py-0">
+            <div className="order-2 lg:order-none flex flex-col items-center justify-center gap-2 sm:gap-4 min-h-0 py-2 sm:py-4 lg:py-0">
               <div className="w-full max-w-md">
                 <label htmlFor="personaplex-text-prompt" className="block text-sm font-medium text-slate-400 uppercase tracking-wider mb-1.5">
                   System Prompt
