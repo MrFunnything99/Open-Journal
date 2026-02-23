@@ -262,7 +262,6 @@ export const usePersonaplexSession = ({
           const playWithHtmlAudio = () => {
             const audioEl = new Audio();
             currentAudioRef.current = audioEl;
-            audioEl.playsInline = true;
             audioEl.onended = () => {
               URL.revokeObjectURL(blobUrl);
               currentAudioRef.current = null;
