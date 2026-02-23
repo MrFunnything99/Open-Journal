@@ -49,7 +49,7 @@ export const Orb: FC<OrbProps> = ({ state, className = "" }) => {
       <div
         className={`
           absolute rounded-full bg-gradient-to-br ${getInnerGlowClass()}
-          w-32 h-32 md:w-80 md:h-80
+          w-24 h-24 sm:w-32 sm:h-32 md:w-80 md:h-80
           ${getPulseClass()} ${getGlowClass()}
           transition-all duration-700 ease-in-out
         `}
@@ -57,7 +57,7 @@ export const Orb: FC<OrbProps> = ({ state, className = "" }) => {
       <div
         className={`
           relative rounded-full
-          w-28 h-28 md:w-64 md:h-64
+          w-20 h-20 sm:w-28 sm:h-28 md:w-64 md:h-64
           bg-gradient-to-br from-slate-800/90 to-slate-900/95
           border border-slate-700/50
           backdrop-blur-sm

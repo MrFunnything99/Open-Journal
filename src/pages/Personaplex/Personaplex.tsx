@@ -195,14 +195,14 @@ export const Personaplex = () => {
       {/* Main content - 3-column grid or gallery */}
       <main className="flex-1 flex flex-col min-h-0 relative z-10">
         <div
-          className={`flex-1 min-h-0 p-4 md:p-6 transition-opacity duration-300 ${
+          className={`flex-1 min-h-0 p-4 md:p-6 transition-opacity duration-300 overflow-y-auto overflow-x-hidden lg:overflow-visible ${
             showGallery ? "opacity-0 pointer-events-none absolute inset-0" : "opacity-100"
           }`}
         >
-          {/* 3-column grid: desktop | single column: mobile/tablet */}
-          <div className="h-full min-h-0 grid grid-cols-1 lg:grid-cols-[1fr_2fr_1fr] gap-4 lg:gap-6 grid-rows-[auto auto minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]">
+          {/* 3-column grid: desktop | scrollable single column: mobile/tablet */}
+          <div className="min-h-full lg:h-full lg:min-h-0 grid grid-cols-1 lg:grid-cols-[1fr_2fr_1fr] gap-4 lg:gap-6 grid-rows-[auto auto auto] lg:grid-rows-[minmax(0,1fr)]">
             {/* Left column - Settings (order 1 on mobile) */}
-            <div className="order-1 lg:order-none flex flex-col min-h-0 rounded-xl bg-slate-900/50 border border-slate-700/50 p-4">
+            <div className="order-1 lg:order-none flex flex-col min-h-0 min-w-0 rounded-xl bg-slate-900/50 border border-slate-700/50 p-4">
               <h2 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-3">
                 Settings
               </h2>
@@ -224,7 +224,7 @@ export const Personaplex = () => {
                   ))}
                 </select>
               </div>
-              <div className="mt-4">
+              <div className="mt-4 space-y-3">
                 <label
                   className={`flex flex-col sm:flex-row sm:items-center gap-2 cursor-pointer select-none ${
                     isConnected ? "cursor-not-allowed opacity-70" : ""
@@ -233,7 +233,7 @@ export const Personaplex = () => {
                   <span className="text-sm font-medium text-slate-400 uppercase tracking-wider">
                     Manual mode
                   </span>
-                  <div className="relative w-11 h-6 shrink-0">
+                  <div className="relative w-11 h-6 shrink-0 self-start sm:self-center">
                     <input
                       type="checkbox"
                       checked={manualMode}
@@ -251,15 +251,15 @@ export const Personaplex = () => {
                     />
                   </div>
                 </label>
-                <p className="mt-1.5 text-xs text-slate-500">
+                <p className="text-xs text-slate-500 leading-relaxed">
                   When on, tap &quot;Done speaking&quot; when you finish instead of waiting for auto-detection.
                 </p>
               </div>
             </div>
 
             {/* Center column - Prompt, Orb (order 2 on mobile) */}
-            <div className="order-2 lg:order-none flex flex-col items-center justify-center gap-2 sm:gap-4 min-h-0 py-2 sm:py-4 lg:py-0">
-              <div className="w-full max-w-md">
+            <div className="order-2 lg:order-none flex flex-col items-center justify-center gap-2 sm:gap-4 min-h-0 py-2 sm:py-4 lg:py-0 min-w-0 w-full">
+              <div className="w-full max-w-md min-w-0">
                 <label htmlFor="personaplex-text-prompt" className="block text-sm font-medium text-slate-400 uppercase tracking-wider mb-1.5">
                   System Prompt
                 </label>
@@ -268,8 +268,8 @@ export const Personaplex = () => {
                   value={textPrompt}
                   onChange={(e) => setTextPrompt(e.target.value)}
                   disabled={isConnected}
-                  rows={6}
-                  className="w-full px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 disabled:opacity-60 disabled:cursor-not-allowed resize-y min-h-[120px] max-h-[200px]"
+                  rows={5}
+                  className="w-full min-w-0 px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 disabled:opacity-60 disabled:cursor-not-allowed resize-y min-h-[100px] max-h-[180px] overflow-auto"
                   placeholder="Enter system prompt for the AI..."
                 />
               </div>
@@ -289,7 +289,7 @@ export const Personaplex = () => {
 
             {/* Right column - Transcript (order 3 on mobile) */}
             <div
-              className="order-3 lg:order-none flex min-h-0 flex-col rounded-xl bg-slate-900/50 border border-slate-700/50 overflow-hidden"
+              className="order-3 lg:order-none flex min-h-0 flex-col rounded-xl bg-slate-900/50 border border-slate-700/50 overflow-hidden min-h-[120px] lg:min-h-0"
               aria-label="Conversation transcript"
             >
               <div className="flex-none shrink-0 px-4 py-2 border-b border-slate-700/50">
