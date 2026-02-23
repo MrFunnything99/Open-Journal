@@ -1,0 +1,21 @@
+name: Question
+description: You have a question about this project.
+labels: ["question", "triage"]
+body:
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Due diligence
+      description: Have you searched existing issues and documentation?
+      options:
+        - label: I have done my due diligence in trying to find the answer myself.
+          required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What is your question?
+      placeholder: Your question about OpenJournal.
+    validations:
+      required: true
