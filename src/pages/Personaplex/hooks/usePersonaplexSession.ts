@@ -193,6 +193,7 @@ export const usePersonaplexSession = ({
   const pendingManualCommitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const manualModeRef = useRef(manualMode);
   manualModeRef.current = manualMode;
+  const isConnectedRef = useRef(false);
 
   const POST_AI_LISTEN_DELAY_MS = 700;
   const DEBUG_LOG = true; // Set to false to disable session logs
@@ -343,7 +344,7 @@ export const usePersonaplexSession = ({
   }, []);
 
   const startRecording = useCallback(() => {
-    if (isProcessingRef.current || isListeningRef.current) return;
+    if (!isConnectedRef.current || isProcessingRef.current || isListeningRef.current) return;
 
     const start = async () => {
       try {
@@ -529,9 +530,11 @@ export const usePersonaplexSession = ({
   }, [stopRecording, processUserInput]);
 
   const startRecordingAfterAI = useCallback(() => {
+    if (!isConnectedRef.current) return;
     log("Scheduling startRecording in", POST_AI_LISTEN_DELAY_MS, "ms");
     startRecordingTimeoutRef.current = setTimeout(() => {
       startRecordingTimeoutRef.current = null;
+      if (!isConnectedRef.current) return;
       log("Starting recording (mic open)");
       startRecording();
     }, POST_AI_LISTEN_DELAY_MS);
@@ -565,6 +568,7 @@ export const usePersonaplexSession = ({
 
   const connect = useCallback(() => {
     log("Connect");
+    isConnectedRef.current = true;
     setStatus("connecting");
     setErrorMessage(null);
     transcriptRef.current = [];
@@ -580,6 +584,7 @@ export const usePersonaplexSession = ({
 
   const disconnect = useCallback(() => {
     log("Disconnect");
+    isConnectedRef.current = false;
     if (pendingManualCommitTimeoutRef.current) {
       clearTimeout(pendingManualCommitTimeoutRef.current);
       pendingManualCommitTimeoutRef.current = null;
