@@ -152,15 +152,6 @@ function float32ToPcmBase64(float32: Float32Array, targetRate?: number, sourceRa
 const SCRIBE_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
 const SCRIBE_MODEL = "scribe_v2_realtime";
 
-const SAMPLE_RATE_TO_FORMAT: Record<number, string> = {
-  8000: "pcm_8000",
-  16000: "pcm_16000",
-  22050: "pcm_22050",
-  24000: "pcm_24000",
-  44100: "pcm_44100",
-  48000: "pcm_48000",
-};
-
 function createSilentPcmBase64(numSamples: number): string {
   const pcm = new Int16Array(numSamples);
   const bytes = new Uint8Array(pcm.buffer);
@@ -186,9 +177,11 @@ export const usePersonaplexSession = ({
   const streamRef = useRef<MediaStream | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const currentPlaybackSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const transcriptRef = useRef<Array<{ role: "user" | "ai"; text: string }>>([]);
   const isProcessingRef = useRef(false);
   const isListeningRef = useRef(false);
@@ -258,27 +251,49 @@ export const usePersonaplexSession = ({
       setError(null);
 
       fetchVoiceAudio(text, selectedVoiceId)
-        .then(({ base64, format }) => {
-          const mime = format === "mp3" ? "audio/mpeg" : "audio/wav";
-          const dataUrl = `data:${mime};base64,${base64}`;
-          const audioEl = new Audio(dataUrl);
-          currentAudioRef.current = audioEl;
-
-          audioEl.onended = () => {
-            currentAudioRef.current = null;
-            done();
-          };
-          audioEl.onerror = () => {
-            currentAudioRef.current = null;
-            setError("ElevenLabs audio playback failed");
-            done();
-          };
-
-          audioEl.play().catch(() => {
-            currentAudioRef.current = null;
-            setError("ElevenLabs audio playback failed");
-            done();
-          });
+        .then(async ({ base64, format }) => {
+          const ctx = playbackContextRef.current;
+          if (ctx) {
+            try {
+              await ctx.resume();
+              const binary = atob(base64);
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+              const buffer = await ctx.decodeAudioData(bytes.buffer);
+              const source = ctx.createBufferSource();
+              source.buffer = buffer;
+              source.connect(ctx.destination);
+              currentPlaybackSourceRef.current = source;
+              source.onended = () => {
+                currentPlaybackSourceRef.current = null;
+                done();
+              };
+              source.start(0);
+            } catch (e) {
+              console.error("[Personaplex] Web Audio playback failed:", e);
+              setError("Audio playback failed");
+              done();
+            }
+          } else {
+            const mime = format === "mp3" ? "audio/mpeg" : "audio/wav";
+            const dataUrl = `data:${mime};base64,${base64}`;
+            const audioEl = new Audio(dataUrl);
+            currentAudioRef.current = audioEl;
+            audioEl.onended = () => {
+              currentAudioRef.current = null;
+              done();
+            };
+            audioEl.onerror = () => {
+              currentAudioRef.current = null;
+              setError("ElevenLabs audio playback failed");
+              done();
+            };
+            audioEl.play().catch(() => {
+              currentAudioRef.current = null;
+              setError("ElevenLabs audio playback failed");
+              done();
+            });
+          }
         })
         .catch((err) => {
           const msg = err instanceof Error ? err.message : "Voice API failed";
@@ -329,19 +344,21 @@ export const usePersonaplexSession = ({
         audioContextRef.current = ctx;
 
         const sourceRate = ctx.sampleRate;
-        const audioFormat = SAMPLE_RATE_TO_FORMAT[sourceRate] ?? "pcm_16000";
-        const targetRate = audioFormat === "pcm_16000" ? 16000 : sourceRate;
+        // Force 16kHz for best mobile compatibility - ElevenLabs recommends it for speech
+        const targetRate = 16000;
+        const audioFormat = "pcm_16000";
 
         const token = await fetchScribeToken();
         targetRateRef.current = targetRate;
 
         const commitStrategy = manualMode ? "manual" : "vad";
-        log("WebSocket params: commit_strategy =", commitStrategy);
+        log("WebSocket params: commit_strategy =", commitStrategy, "sourceRate =", sourceRate);
         const params = new URLSearchParams({
           token,
           model_id: SCRIBE_MODEL,
           commit_strategy: commitStrategy,
           audio_format: audioFormat,
+          language_code: "en",
         });
         if (!manualMode) {
           params.set("vad_silence_threshold_secs", "2.0");
@@ -520,6 +537,14 @@ export const usePersonaplexSession = ({
         currentAudioRef.current.pause();
         currentAudioRef.current = null;
       }
+      if (currentPlaybackSourceRef.current) {
+        try {
+          currentPlaybackSourceRef.current.stop();
+        } catch {
+          /* already stopped */
+        }
+        currentPlaybackSourceRef.current = null;
+      }
 
       speakWithVoiceApi(text, startRecordingAfterAI, setErrorMessage);
     },
@@ -531,6 +556,11 @@ export const usePersonaplexSession = ({
     setStatus("connecting");
     setErrorMessage(null);
     transcriptRef.current = [];
+
+    const PlaybackCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const ctx = new PlaybackCtx();
+    playbackContextRef.current = ctx;
+    ctx.resume().catch(() => {});
 
     setStatus("connected");
     speak("Hello, I am your OpenJournal assistant. How can I help you?");
@@ -549,6 +579,18 @@ export const usePersonaplexSession = ({
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
       currentAudioRef.current = null;
+    }
+    if (currentPlaybackSourceRef.current) {
+      try {
+        currentPlaybackSourceRef.current.stop();
+      } catch {
+        /* already stopped */
+      }
+      currentPlaybackSourceRef.current = null;
+    }
+    if (playbackContextRef.current) {
+      playbackContextRef.current.close().catch(() => {});
+      playbackContextRef.current = null;
     }
     stopRecording();
     setStatus("disconnected");

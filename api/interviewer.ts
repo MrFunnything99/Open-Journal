@@ -9,7 +9,7 @@ export async function POST(request: Request) {
   const jsonResponse = (body: { error?: string; question?: string }, status: number) =>
     new Response(JSON.stringify(body), {
       status,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json; charset=utf-8" },
     });
 
   try {
