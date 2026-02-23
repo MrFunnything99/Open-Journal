@@ -194,8 +194,10 @@ export const usePersonaplexSession = ({
   const manualModeRef = useRef(manualMode);
   manualModeRef.current = manualMode;
   const isConnectedRef = useRef(false);
+  const pendingReconnectRef = useRef(false);
 
-  const POST_AI_LISTEN_DELAY_MS = 700;
+  const isIOS = typeof navigator !== "undefined" && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+  const POST_AI_LISTEN_DELAY_MS = isIOS ? 1800 : 700;
   const DEBUG_LOG = true; // Set to false to disable session logs
   const log = (...args: unknown[]) => DEBUG_LOG && console.log("[Personaplex]", ...args);
 
@@ -233,17 +235,17 @@ export const usePersonaplexSession = ({
   );
 
   const speakWithVoiceApi = useCallback(
-    (text: string, onDone: () => void, setError: (msg: string | null) => void) => {
+    (text: string, onDone: (playbackFailed?: boolean) => void, setError: (msg: string | null) => void) => {
       if (!text.trim()) {
         onDone();
         return;
       }
 
-      const done = () => {
+      const done = (playbackFailed?: boolean) => {
         isAiSpeakingRef.current = false;
         setIsAiSpeaking(false);
-        log("AI finished speaking:", text.slice(0, 100) + (text.length > 100 ? "..." : ""));
-        onDone();
+        log("AI finished speaking:", text.slice(0, 100) + (text.length > 100 ? "..." : ""), playbackFailed ? "(playback failed)" : "");
+        onDone(playbackFailed);
       };
 
       isAiSpeakingRef.current = true;
@@ -272,14 +274,14 @@ export const usePersonaplexSession = ({
               URL.revokeObjectURL(blobUrl);
               currentAudioRef.current = null;
               setError("Audio playback failed");
-              done();
+              done(true);
             };
             audioEl.src = blobUrl;
             audioEl.play().catch(() => {
               URL.revokeObjectURL(blobUrl);
               currentAudioRef.current = null;
               setError("Audio playback failed");
-              done();
+              done(true);
             });
           };
 
@@ -311,7 +313,7 @@ export const usePersonaplexSession = ({
           const msg = err instanceof Error ? err.message : "Voice API failed";
           setError(msg);
           console.error("[Personaplex] Voice API error:", err);
-          done();
+          done(true);
         });
     },
     [selectedVoiceId]
@@ -440,7 +442,11 @@ export const usePersonaplexSession = ({
               console.error("[Personaplex] Scribe error:", err);
               setErrorMessage(err);
               stopRecording();
-              startRecording();
+              if (isAiSpeakingRef.current) {
+                pendingReconnectRef.current = true;
+              } else {
+                startRecording();
+              }
             }
           } catch {
             // ignore parse errors
@@ -529,15 +535,18 @@ export const usePersonaplexSession = ({
     }, 1500);
   }, [stopRecording, processUserInput]);
 
-  const startRecordingAfterAI = useCallback(() => {
+  const startRecordingAfterAI = useCallback((playbackFailed?: boolean) => {
     if (!isConnectedRef.current) return;
-    log("Scheduling startRecording in", POST_AI_LISTEN_DELAY_MS, "ms");
+    const wasPendingReconnect = pendingReconnectRef.current;
+    if (pendingReconnectRef.current) pendingReconnectRef.current = false;
+    const delay = wasPendingReconnect ? 0 : (playbackFailed ? 2500 : POST_AI_LISTEN_DELAY_MS);
+    log("Scheduling startRecording in", delay, "ms", wasPendingReconnect ? "(pending reconnect)" : playbackFailed ? "(playback failed)" : "");
     startRecordingTimeoutRef.current = setTimeout(() => {
       startRecordingTimeoutRef.current = null;
       if (!isConnectedRef.current) return;
       log("Starting recording (mic open)");
       startRecording();
-    }, POST_AI_LISTEN_DELAY_MS);
+    }, delay);
   }, [startRecording]);
 
   const speak = useCallback(
@@ -619,6 +628,7 @@ export const usePersonaplexSession = ({
     isListeningRef.current = false;
     manualBufferRef.current = [];
     pendingManualCommitRef.current = false;
+    pendingReconnectRef.current = false;
   }, [stopRecording]);
 
   return {
