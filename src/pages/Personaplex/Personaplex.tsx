@@ -74,6 +74,8 @@ export const Personaplex = () => {
     isVoiceMemoRecording,
     startVoiceMemoRecording,
     stopVoiceMemoRecording,
+    lastPlaybackFailed,
+    playLastFailedPlayback,
   } = usePersonaplexSession({
     systemPrompt: textPrompt,
     selectedVoiceId,
@@ -290,7 +292,15 @@ export const Personaplex = () => {
                     >
                       Done
                     </button>
-                  ) : !isAiSpeaking && (
+                  ) : lastPlaybackFailed ? (
+                    <button
+                      type="button"
+                      onClick={playLastFailedPlayback}
+                      className="px-6 py-3 rounded-full bg-violet-500/80 hover:bg-violet-500 text-white text-sm font-medium transition-colors"
+                    >
+                      Play response
+                    </button>
+                  ) : !isAiSpeaking ? (
                     <button
                       type="button"
                       onClick={startVoiceMemoRecording}
@@ -298,7 +308,7 @@ export const Personaplex = () => {
                     >
                       Record
                     </button>
-                  )
+                  ) : null
                 )}
                 {!isVoiceMemoMode && isConnected && manualMode && isUserSpeaking && (
                   <button

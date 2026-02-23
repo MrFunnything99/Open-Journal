@@ -196,11 +196,13 @@ export const usePersonaplexSession = ({
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [isVoiceMemoRecording, setIsVoiceMemoRecording] = useState(false);
+  const [lastPlaybackFailed, setLastPlaybackFailed] = useState(false);
 
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceMemoStreamRef = useRef<MediaStream | null>(null);
   const voiceMemoChunksRef = useRef<Blob[]>([]);
+  const lastFailedPlaybackRef = useRef<{ blob: Blob; mime: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
@@ -270,12 +272,17 @@ export const usePersonaplexSession = ({
       const done = (playbackFailed?: boolean) => {
         isAiSpeakingRef.current = false;
         setIsAiSpeaking(false);
+        if (playbackFailed && isVoiceMemoMode) setLastPlaybackFailed(true);
         log("AI finished speaking:", text.slice(0, 100) + (text.length > 100 ? "..." : ""), playbackFailed ? "(playback failed)" : "");
         onDone(playbackFailed);
       };
 
       isAiSpeakingRef.current = true;
       setIsAiSpeaking(true);
+      if (isVoiceMemoMode) {
+        lastFailedPlaybackRef.current = null;
+        setLastPlaybackFailed(false);
+      }
       log("AI started speaking:", text);
       setError(null);
 
@@ -289,24 +296,28 @@ export const usePersonaplexSession = ({
           const blobUrl = URL.createObjectURL(blob);
 
           const playWithHtmlAudio = () => {
+            if (isVoiceMemoMode) lastFailedPlaybackRef.current = { blob, mime };
             const audioEl = new Audio();
             currentAudioRef.current = audioEl;
             audioEl.onended = () => {
               URL.revokeObjectURL(blobUrl);
               currentAudioRef.current = null;
+              if (isVoiceMemoMode) lastFailedPlaybackRef.current = null;
               done();
             };
             audioEl.onerror = () => {
               URL.revokeObjectURL(blobUrl);
               currentAudioRef.current = null;
-              setError("Audio playback failed");
+              if (isVoiceMemoMode) setError("Audio playback failed. Tap Play to hear.");
+              else setError("Audio playback failed");
               done(true);
             };
             audioEl.src = blobUrl;
             audioEl.play().catch(() => {
               URL.revokeObjectURL(blobUrl);
               currentAudioRef.current = null;
-              setError("Audio playback failed");
+              if (isVoiceMemoMode) setError("Audio playback failed. Tap Play to hear.");
+              else setError("Audio playback failed");
               done(true);
             });
           };
@@ -563,6 +574,9 @@ export const usePersonaplexSession = ({
   const startVoiceMemoRecording = useCallback(async () => {
     if (!isConnectedRef.current || isProcessingRef.current || isVoiceMemoRecording) return;
     try {
+      const silent = new Audio("data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
+      silent.volume = 0;
+      silent.play().catch(() => {});
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       voiceMemoStreamRef.current = stream;
       const recorder = new MediaRecorder(stream);
@@ -579,6 +593,27 @@ export const usePersonaplexSession = ({
       setErrorMessage("Microphone access denied or unavailable");
     }
   }, [isVoiceMemoRecording]);
+
+  const playLastFailedPlayback = useCallback(() => {
+    const pending = lastFailedPlaybackRef.current;
+    if (!pending) return;
+    lastFailedPlaybackRef.current = null;
+    setLastPlaybackFailed(false);
+    setErrorMessage(null);
+    const url = URL.createObjectURL(pending.blob);
+    const audioEl = new Audio(url);
+    audioEl.onended = () => {
+      URL.revokeObjectURL(url);
+    };
+    audioEl.onerror = () => {
+      URL.revokeObjectURL(url);
+      setErrorMessage("Playback failed");
+    };
+    audioEl.play().catch(() => {
+      URL.revokeObjectURL(url);
+      setErrorMessage("Playback failed");
+    });
+  }, []);
 
   const stopVoiceMemoRecording = useCallback(async () => {
     const recorder = mediaRecorderRef.current;
@@ -673,6 +708,12 @@ export const usePersonaplexSession = ({
     playbackContextRef.current = ctx;
     ctx.resume().catch(() => {});
 
+    if (isVoiceMemoMode) {
+      const silent = new Audio("data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
+      silent.volume = 0;
+      silent.play().catch(() => {});
+    }
+
     setStatus("connected");
     speak("Hello, I am your OpenJournal assistant. How can I help you?");
   }, [speak]);
@@ -722,6 +763,8 @@ export const usePersonaplexSession = ({
     manualBufferRef.current = [];
     pendingManualCommitRef.current = false;
     pendingReconnectRef.current = false;
+    lastFailedPlaybackRef.current = null;
+    setLastPlaybackFailed(false);
   }, [stopRecording]);
 
   return {
@@ -737,5 +780,7 @@ export const usePersonaplexSession = ({
     isVoiceMemoRecording,
     startVoiceMemoRecording,
     stopVoiceMemoRecording,
+    lastPlaybackFailed,
+    playLastFailedPlayback,
   };
 };
