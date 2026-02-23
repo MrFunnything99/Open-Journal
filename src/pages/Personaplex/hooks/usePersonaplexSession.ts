@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from "react";
+import { blobToWavBase64 } from "../utils/audioToWav";
 
 export type PersonaplexConnectionStatus =
   | "disconnected"
@@ -121,6 +122,27 @@ async function fetchScribeToken(): Promise<string> {
   return data.token;
 }
 
+async function fetchTranscribe(audioBase64: string): Promise<string> {
+  const res = await fetch("/api/transcribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audio: audioBase64 }),
+  });
+  const rawText = await res.text();
+  let data: { error?: string; text?: string } = {};
+  if (rawText.trim()) {
+    try {
+      data = JSON.parse(rawText) as { error?: string; text?: string };
+    } catch {
+      throw new Error(res.ok ? "Invalid transcription response" : `Transcription failed (${res.status})`);
+    }
+  }
+  if (!res.ok) {
+    throw new Error(data.error ?? `Transcription failed (${res.status})`);
+  }
+  return (data.text ?? "").trim();
+}
+
 function float32ToPcmBase64(float32: Float32Array, targetRate?: number, sourceRate?: number): string {
   let samples = float32;
   if (targetRate && sourceRate && targetRate !== sourceRate) {
@@ -173,8 +195,12 @@ export const usePersonaplexSession = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
+  const [isVoiceMemoRecording, setIsVoiceMemoRecording] = useState(false);
 
   const streamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceMemoStreamRef = useRef<MediaStream | null>(null);
+  const voiceMemoChunksRef = useRef<Blob[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
@@ -196,8 +222,8 @@ export const usePersonaplexSession = ({
   const isConnectedRef = useRef(false);
   const pendingReconnectRef = useRef(false);
 
-  const isIOS = typeof navigator !== "undefined" && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
-  const POST_AI_LISTEN_DELAY_MS = isIOS ? 1800 : 700;
+  const isVoiceMemoMode = typeof navigator !== "undefined" && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+  const POST_AI_LISTEN_DELAY_MS = isVoiceMemoMode ? 1800 : 700;
   const DEBUG_LOG = true; // Set to false to disable session logs
   const log = (...args: unknown[]) => DEBUG_LOG && console.log("[Personaplex]", ...args);
 
@@ -206,7 +232,7 @@ export const usePersonaplexSession = ({
       if (isProcessingRef.current || !userText.trim()) return;
       log("processUserInput called", { text: userText.slice(0, 50) });
       isProcessingRef.current = true;
-      stopRecording();
+      if (!isVoiceMemoMode) stopRecording();
 
       const nextWithUser = [...transcriptRef.current, { role: "user" as const, text: userText }];
       transcriptRef.current = nextWithUser;
@@ -285,9 +311,8 @@ export const usePersonaplexSession = ({
             });
           };
 
-          const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
           const ctx = playbackContextRef.current;
-          if (!isIOS && ctx) {
+          if (!isVoiceMemoMode && ctx) {
             try {
               await Promise.race([ctx.resume(), new Promise((_, r) => setTimeout(() => r(new Error("resume timeout")), 3000))]);
               const buffer = await ctx.decodeAudioData(bytes.buffer.slice(0, bytes.byteLength));
@@ -535,8 +560,69 @@ export const usePersonaplexSession = ({
     }, 1500);
   }, [stopRecording, processUserInput]);
 
+  const startVoiceMemoRecording = useCallback(async () => {
+    if (!isConnectedRef.current || isProcessingRef.current || isVoiceMemoRecording) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      voiceMemoStreamRef.current = stream;
+      const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      voiceMemoChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) voiceMemoChunksRef.current.push(e.data);
+      };
+      recorder.start();
+      setIsVoiceMemoRecording(true);
+      setErrorMessage(null);
+    } catch (err) {
+      console.error("[Personaplex] Voice memo start error:", err);
+      setErrorMessage("Microphone access denied or unavailable");
+    }
+  }, [isVoiceMemoRecording]);
+
+  const stopVoiceMemoRecording = useCallback(async () => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") return;
+    const chunks = voiceMemoChunksRef.current;
+    return new Promise<void>((resolve) => {
+      recorder.onstop = async () => {
+        mediaRecorderRef.current = null;
+        const stream = voiceMemoStreamRef.current;
+        voiceMemoStreamRef.current = null;
+        setIsVoiceMemoRecording(false);
+        stream?.getTracks().forEach((t) => t.stop());
+        if (!isConnectedRef.current) {
+          resolve();
+          return;
+        }
+        if (chunks.length === 0) {
+          setErrorMessage("Recording too short");
+          resolve();
+          return;
+        }
+        try {
+          const blob = new Blob(chunks, { type: recorder.mimeType });
+          const base64 = await blobToWavBase64(blob);
+          const text = await fetchTranscribe(base64);
+          if (text && isConnectedRef.current) {
+            onInterimTranscript("");
+            processUserInput(text);
+          } else if (!text) {
+            setErrorMessage("No speech detected");
+          }
+        } catch (err) {
+          console.error("[Personaplex] Voice memo transcribe error:", err);
+          setErrorMessage(err instanceof Error ? err.message : "Transcription failed");
+        }
+        resolve();
+      };
+      recorder.stop();
+    });
+  }, [onInterimTranscript, processUserInput]);
+
   const startRecordingAfterAI = useCallback((playbackFailed?: boolean) => {
     if (!isConnectedRef.current) return;
+    if (isVoiceMemoMode) return;
     const wasPendingReconnect = pendingReconnectRef.current;
     if (pendingReconnectRef.current) pendingReconnectRef.current = false;
     const delay = wasPendingReconnect ? 0 : (playbackFailed ? 2500 : POST_AI_LISTEN_DELAY_MS);
@@ -618,6 +704,13 @@ export const usePersonaplexSession = ({
       playbackContextRef.current.close().catch(() => {});
       playbackContextRef.current = null;
     }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      voiceMemoStreamRef.current?.getTracks().forEach((t) => t.stop());
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current = null;
+      voiceMemoStreamRef.current = null;
+      setIsVoiceMemoRecording(false);
+    }
     stopRecording();
     setStatus("disconnected");
     setErrorMessage(null);
@@ -640,5 +733,9 @@ export const usePersonaplexSession = ({
     isConnected: status === "connected",
     isUserSpeaking,
     isAiSpeaking,
+    isVoiceMemoMode,
+    isVoiceMemoRecording,
+    startVoiceMemoRecording,
+    stopVoiceMemoRecording,
   };
 };

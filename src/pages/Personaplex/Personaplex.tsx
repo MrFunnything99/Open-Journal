@@ -70,6 +70,10 @@ export const Personaplex = () => {
     isConnected,
     isUserSpeaking,
     isAiSpeaking,
+    isVoiceMemoMode,
+    isVoiceMemoRecording,
+    startVoiceMemoRecording,
+    stopVoiceMemoRecording,
   } = usePersonaplexSession({
     systemPrompt: textPrompt,
     selectedVoiceId,
@@ -224,37 +228,39 @@ export const Personaplex = () => {
                   ))}
                 </select>
               </div>
-              <div className="mt-4 space-y-3">
-                <label
-                  className={`flex flex-col sm:flex-row sm:items-center gap-2 cursor-pointer select-none ${
-                    isConnected ? "cursor-not-allowed opacity-70" : ""
-                  }`}
-                >
-                  <span className="text-sm font-medium text-slate-400 uppercase tracking-wider">
-                    Manual mode
-                  </span>
-                  <div className="relative w-11 h-6 shrink-0 self-start sm:self-center">
-                    <input
-                      type="checkbox"
-                      checked={manualMode}
-                      onChange={(e) => setManualMode(e.target.checked)}
-                      disabled={isConnected}
-                      className="peer sr-only"
-                    />
-                    <div
-                      className="absolute inset-0 rounded-full bg-slate-600 transition-colors duration-200 ease-out
-                        peer-checked:bg-violet-500 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/50 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-slate-900"
-                    />
-                    <div
-                      className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-sm
-                        transition-transform duration-200 ease-out peer-checked:translate-x-5"
-                    />
-                  </div>
-                </label>
-                <p className="text-xs text-slate-500 leading-relaxed">
-                  When on, tap &quot;Done speaking&quot; when you finish instead of waiting for auto-detection.
-                </p>
-              </div>
+              {!isVoiceMemoMode && (
+                <div className="mt-4 space-y-3">
+                  <label
+                    className={`flex flex-col sm:flex-row sm:items-center gap-2 cursor-pointer select-none ${
+                      isConnected ? "cursor-not-allowed opacity-70" : ""
+                    }`}
+                  >
+                    <span className="text-sm font-medium text-slate-400 uppercase tracking-wider">
+                      Manual mode
+                    </span>
+                    <div className="relative w-11 h-6 shrink-0 self-start sm:self-center">
+                      <input
+                        type="checkbox"
+                        checked={manualMode}
+                        onChange={(e) => setManualMode(e.target.checked)}
+                        disabled={isConnected}
+                        className="peer sr-only"
+                      />
+                      <div
+                        className="absolute inset-0 rounded-full bg-slate-600 transition-colors duration-200 ease-out
+                          peer-checked:bg-violet-500 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/50 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-slate-900"
+                      />
+                      <div
+                        className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-sm
+                          transition-transform duration-200 ease-out peer-checked:translate-x-5"
+                      />
+                    </div>
+                  </label>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    When on, tap &quot;Done speaking&quot; when you finish instead of waiting for auto-detection.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Center column - Prompt, Orb (order 2 on mobile) */}
@@ -275,7 +281,26 @@ export const Personaplex = () => {
               </div>
               <div className="flex-none flex flex-col items-center gap-3">
                 <Orb state={orbState} />
-                {isConnected && manualMode && isUserSpeaking && (
+                {isVoiceMemoMode && isConnected && (
+                  isVoiceMemoRecording ? (
+                    <button
+                      type="button"
+                      onClick={stopVoiceMemoRecording}
+                      className="px-6 py-3 rounded-full bg-red-500/80 hover:bg-red-500 text-white text-sm font-medium transition-colors"
+                    >
+                      Done
+                    </button>
+                  ) : !isAiSpeaking && (
+                    <button
+                      type="button"
+                      onClick={startVoiceMemoRecording}
+                      className="px-6 py-3 rounded-full bg-emerald-500/80 hover:bg-emerald-500 text-white text-sm font-medium transition-colors"
+                    >
+                      Record
+                    </button>
+                  )
+                )}
+                {!isVoiceMemoMode && isConnected && manualMode && isUserSpeaking && (
                   <button
                     type="button"
                     onClick={commitManual}
@@ -304,7 +329,9 @@ export const Personaplex = () => {
               >
                 {transcript.length === 0 && !interimTranscript ? (
                   <p className="text-sm text-slate-500 italic">
-                    Conversation will appear here as you speak...
+                    {isVoiceMemoMode
+                      ? "Tap Record, speak, then tap Done. Your words will appear here."
+                      : "Conversation will appear here as you speak..."}
                   </p>
                 ) : (
                   <>
