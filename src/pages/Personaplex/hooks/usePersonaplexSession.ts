@@ -15,26 +15,33 @@ export type UsePersonaplexSessionOptions = {
   onInterimTranscript: (text: string) => void;
 };
 
+const BACKEND_URL =
+  import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
+
 async function fetchInterviewerQuestion(
-  systemPrompt: string,
-  messages: Array<{ role: "user" | "ai"; text: string }>
-): Promise<string> {
-  const res = await fetch("/api/interviewer", {
+  text: string,
+  sessionId: string | null
+): Promise<{ question: string; sessionId: string }> {
+  const res = await fetch(`${BACKEND_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ systemPrompt, messages }),
+    body: JSON.stringify({ text, session_id: sessionId }),
   });
 
   const rawText = await res.text();
-  let data: { error?: string; question?: string } = {};
+  let data: { error?: string; response?: string; session_id?: string } = {};
   if (rawText.trim()) {
     try {
-      data = JSON.parse(rawText) as { error?: string; question?: string };
+      data = JSON.parse(rawText) as {
+        error?: string;
+        response?: string;
+        session_id?: string;
+      };
     } catch {
       const snippet = rawText.slice(0, 80).replace(/\s+/g, " ");
       throw new Error(
         res.status === 404
-          ? "API route not found. Use 'vercel dev' for local dev with API."
+          ? "Backend not found. Make sure the Python backend is running."
           : res.ok
             ? "Invalid response from server"
             : `Server error (${res.status}): ${snippet || res.statusText}`
@@ -46,11 +53,16 @@ async function fetchInterviewerQuestion(
     throw new Error(data.error || `Interviewer API failed (${res.status})`);
   }
 
-  if (!data.question || typeof data.question !== "string") {
-    throw new Error(data.error || "No question in response");
+  if (
+    !data.response ||
+    typeof data.response !== "string" ||
+    !data.session_id ||
+    typeof data.session_id !== "string"
+  ) {
+    throw new Error(data.error || "Invalid response from backend");
   }
 
-  return data.question;
+  return { question: data.response, sessionId: data.session_id };
 }
 
 async function fetchVoiceAudio(
@@ -223,6 +235,7 @@ export const usePersonaplexSession = ({
   manualModeRef.current = manualMode;
   const isConnectedRef = useRef(false);
   const pendingReconnectRef = useRef(false);
+  const backendSessionIdRef = useRef<string | null>(null);
 
   const isVoiceMemoMode = typeof navigator !== "undefined" && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
   const POST_AI_LISTEN_DELAY_MS = isVoiceMemoMode ? 1800 : 700;
@@ -242,10 +255,11 @@ export const usePersonaplexSession = ({
       onInterimTranscript("");
 
       try {
-        const question = await fetchInterviewerQuestion(
-          systemPrompt,
-          nextWithUser
+        const { question, sessionId } = await fetchInterviewerQuestion(
+          userText,
+          backendSessionIdRef.current
         );
+        backendSessionIdRef.current = sessionId;
         const nextWithAi = [...nextWithUser, { role: "ai" as const, text: question }];
         transcriptRef.current = nextWithAi;
         onTranscriptUpdate(() => nextWithAi);
