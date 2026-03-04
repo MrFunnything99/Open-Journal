@@ -7,6 +7,11 @@ import os
 from pathlib import Path
 from typing import Annotated, TypedDict
 
+try:
+    from typing import NotRequired
+except ImportError:
+    from typing_extensions import NotRequired
+
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
@@ -14,12 +19,15 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-from library import save_session_data
+from library import get_relevant_context, save_session_data
 
-# State: list of messages + session_id for Librarian
+# State: list of messages + session_id for Librarian + personalization + intrusiveness + optional retrieval log
 class JournalState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     session_id: str
+    personalization: float
+    intrusiveness: NotRequired[float]
+    retrieval_log: NotRequired[str]
 
 
 def _get_llm():
@@ -36,15 +44,60 @@ def _get_llm():
     )
 
 
+def _last_user_text(messages: list) -> str:
+    """Get the most recent user message content for retrieval query."""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            content = getattr(m, "content", str(m))
+            if isinstance(content, list):
+                content = " ".join(c.get("text", str(c)) for c in content if isinstance(c, dict))
+            return (content or "").strip()
+    return ""
+
+
 def interviewer_node(state: JournalState) -> JournalState:
-    """Echo back an empathetic response. No DB read for this sprint."""
+    """
+    Respond with empathy. When personalization > 0, retrieve relevant context from
+    Chroma (gist_facts + episodic_log) and inject it so the model can personalize.
+    """
     llm = _get_llm()
-    system = SystemMessage(
-        content="You are a warm, empathetic journaling companion. Listen actively and respond with care. Keep replies concise (2-4 sentences)."
-    )
+    personalization = max(0.0, min(1.0, state.get("personalization", 1.0)))
+    personalization_percent = int(personalization * 100)
+    intrusiveness = max(0.0, min(1.0, state.get("intrusiveness", 0.5)))
+    intrusiveness_percent = int(intrusiveness * 100)
+
+    system_parts = [
+        "You are a warm, empathetic journaling companion. Listen actively and respond with care. "
+        "Keep replies concise (2-4 sentences). "
+        f"Personalization level: {personalization_percent}%. "
+        "At 0%, do not use memory or prior context; keep questions general and present-focused only. "
+        "At low levels, keep questions more general and present-focused. "
+        "At high levels, ask more personalized questions that connect to what you know about the user's life and past journals.",
+        f"Questioning style (intrusiveness): {intrusiveness_percent}%. "
+        "At 0%, be very gentle and non-intrusive; ask only soft, open-ended questions and let the user lead entirely. "
+        "At low levels, ask sparingly and avoid probing. "
+        "At high levels, you may ask more direct or probing questions when it feels supportive, while still respecting boundaries.",
+    ]
+
+    retrieval_log: str | None = None
+    if personalization > 0:
+        query = _last_user_text(state["messages"])
+        if not query and state["messages"]:
+            query = str(state["messages"][-1])[:500]
+        try:
+            context = get_relevant_context(query, top_k_gist=10, top_k_episodic=6)
+            system_parts.append("\n\nRelevant context from the user's journals and memory (use this to personalize when appropriate):\n" + context)
+            retrieval_log = context
+        except Exception:
+            system_parts.append("\n\n(Memory retrieval unavailable; respond without prior context.)")
+
+    system = SystemMessage(content="\n".join(system_parts))
     messages = [system] + state["messages"]
     response = llm.invoke(messages)
-    return {"messages": [response]}
+    out: dict = {"messages": [response]}
+    if retrieval_log is not None:
+        out["retrieval_log"] = retrieval_log
+    return out
 
 
 def librarian_node(state: JournalState) -> JournalState:

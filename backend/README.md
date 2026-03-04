@@ -29,7 +29,12 @@ Copy `.env.example` to `.env` in the project root and add:
 
 ```bash
 # From backend/ with venv activated
-uvicorn main:app --reload --port 8000
+# From backend directory. Use the venv so uvicorn is available:
+.venv/bin/python -m uvicorn main:app --reload --port 8000
+
+# Or activate the venv first, then:
+# source .venv/bin/activate   # on macOS/Linux
+# uvicorn main:app --reload --port 8000
 ```
 
 - API: http://localhost:8000

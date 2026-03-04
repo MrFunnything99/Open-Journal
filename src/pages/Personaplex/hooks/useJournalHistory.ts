@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
-export type ChatMessage = { role: "user" | "ai"; text: string };
+export type ChatMessage = { role: "user" | "ai"; text: string; retrievalLog?: string };
 
 export type JournalEntry = {
   id: string;
@@ -52,6 +52,46 @@ function transcriptToPreview(messages: ChatMessage[], maxLen = 100): string {
   return text.slice(0, maxLen).trim() + "…";
 }
 
+export const EXPORT_VERSION = 1;
+
+export type ExportPayload = {
+  version: number;
+  exportedAt: string;
+  entries: JournalEntry[];
+};
+
+function isExportPayload(obj: unknown): obj is ExportPayload {
+  if (obj == null || typeof obj !== "object") return false;
+  const o = obj as Record<string, unknown>;
+  return (
+    typeof o.version === "number" &&
+    typeof o.exportedAt === "string" &&
+    Array.isArray(o.entries)
+  );
+}
+
+function normalizeMessage(m: unknown): ChatMessage | null {
+  if (m == null || typeof m !== "object") return null;
+  const o = m as Record<string, unknown>;
+  if (o.role !== "user" && o.role !== "ai") return null;
+  if (typeof o.text !== "string") return null;
+  const retrievalLog = typeof o.retrievalLog === "string" ? o.retrievalLog : undefined;
+  return { role: o.role as "user" | "ai", text: o.text, retrievalLog };
+}
+
+function normalizeEntry(raw: unknown): JournalEntry | null {
+  if (raw == null || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const fullTranscript = Array.isArray(o.fullTranscript)
+    ? o.fullTranscript.map(normalizeMessage).filter((m): m is ChatMessage => m != null)
+    : [];
+  if (fullTranscript.length === 0) return null;
+  const id = typeof o.id === "string" ? o.id : generateId();
+  const date = typeof o.date === "string" ? o.date : new Date().toISOString();
+  const preview = typeof o.preview === "string" ? o.preview : transcriptToPreview(fullTranscript);
+  return { id, date, preview, fullTranscript };
+}
+
 export const useJournalHistory = () => {
   const [entries, setEntries] = useState<JournalEntry[]>([]);
 
@@ -90,11 +130,36 @@ export const useJournalHistory = () => {
     return formatDate(entry.date);
   }, []);
 
+  const exportAllJournals = useCallback((): string => {
+    const payload: ExportPayload = {
+      version: EXPORT_VERSION,
+      exportedAt: new Date().toISOString(),
+      entries,
+    };
+    return JSON.stringify(payload, null, 2);
+  }, [entries]);
+
+  const importEntriesFromExport = useCallback((payload: ExportPayload): number => {
+    const normalized = payload.entries
+      .map((raw) => normalizeEntry(raw))
+      .filter((e): e is JournalEntry => e != null);
+    if (normalized.length === 0) return 0;
+    const withNewIds = normalized.map((e) => ({
+      ...e,
+      id: generateId(),
+    }));
+    setEntries((prev) => [...withNewIds, ...prev]);
+    return withNewIds.length;
+  }, []);
+
   return {
     entries,
     saveEntry,
     clearHistory,
     deleteEntry,
     getFormattedDate,
+    exportAllJournals,
+    importEntriesFromExport,
+    isExportPayload,
   };
 };

@@ -7,35 +7,57 @@ export type PersonaplexConnectionStatus =
   | "connected"
   | "error";
 
+export type VoiceSettings = {
+  stability?: number;
+  similarity_boost?: number;
+  style?: number;
+  speed?: number;
+};
+
 export type UsePersonaplexSessionOptions = {
   systemPrompt: string;
   selectedVoiceId: string;
   manualMode?: boolean;
-  onTranscriptUpdate: (updater: (prev: Array<{ role: "user" | "ai"; text: string }>) => Array<{ role: "user" | "ai"; text: string }>) => void;
+  personalization: number;
+  intrusiveness?: number;
+  voiceSettings?: VoiceSettings;
+  onTranscriptUpdate: (updater: (prev: TranscriptEntry[]) => TranscriptEntry[]) => void;
   onInterimTranscript: (text: string) => void;
 };
 
 const BACKEND_URL =
   import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
 
+export type TranscriptEntry = { role: "user" | "ai"; text: string; retrievalLog?: string };
+
+const CHAT_FETCH_TIMEOUT_MS = 90_000;
+
 async function fetchInterviewerQuestion(
   text: string,
-  sessionId: string | null
-): Promise<{ question: string; sessionId: string }> {
+  sessionId: string | null,
+  personalization: number,
+  intrusiveness: number
+): Promise<{ question: string; sessionId: string; retrievalLog?: string }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), CHAT_FETCH_TIMEOUT_MS);
   const res = await fetch(`${BACKEND_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, session_id: sessionId }),
+    body: JSON.stringify({ text, session_id: sessionId, personalization, intrusiveness }),
+    signal: controller.signal,
   });
+  clearTimeout(timeoutId);
 
   const rawText = await res.text();
-  let data: { error?: string; response?: string; session_id?: string } = {};
+  let data: { error?: string; detail?: string; response?: string; session_id?: string; retrieval_log?: string } = {};
   if (rawText.trim()) {
     try {
       data = JSON.parse(rawText) as {
         error?: string;
+        detail?: string;
         response?: string;
         session_id?: string;
+        retrieval_log?: string;
       };
     } catch {
       const snippet = rawText.slice(0, 80).replace(/\s+/g, " ");
@@ -50,7 +72,7 @@ async function fetchInterviewerQuestion(
   }
 
   if (!res.ok) {
-    throw new Error(data.error || `Interviewer API failed (${res.status})`);
+    throw new Error(data.detail || data.error || `Interviewer API failed (${res.status})`);
   }
 
   if (
@@ -62,17 +84,22 @@ async function fetchInterviewerQuestion(
     throw new Error(data.error || "Invalid response from backend");
   }
 
-  return { question: data.response, sessionId: data.session_id };
+  return {
+    question: data.response,
+    sessionId: data.session_id,
+    retrievalLog: typeof data.retrieval_log === "string" ? data.retrieval_log : undefined,
+  };
 }
 
 async function fetchVoiceAudio(
   text: string,
-  voiceId: string
+  voiceId: string,
+  voiceSettings?: VoiceSettings
 ): Promise<{ base64: string; format: string }> {
   const res = await fetch("/api/voice", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, voiceId }),
+    body: JSON.stringify({ text, voiceId, voice_settings: voiceSettings ?? undefined }),
   });
 
   const rawText = await res.text();
@@ -200,11 +227,15 @@ export const usePersonaplexSession = ({
   systemPrompt,
   selectedVoiceId,
   manualMode = false,
+  personalization,
+  intrusiveness = 0.5,
+  voiceSettings,
   onTranscriptUpdate,
   onInterimTranscript,
 }: UsePersonaplexSessionOptions) => {
   const [status, setStatus] = useState<PersonaplexConnectionStatus>("disconnected");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [isVoiceMemoRecording, setIsVoiceMemoRecording] = useState(false);
@@ -222,7 +253,7 @@ export const usePersonaplexSession = ({
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const currentPlaybackSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const transcriptRef = useRef<Array<{ role: "user" | "ai"; text: string }>>([]);
+  const transcriptRef = useRef<TranscriptEntry[]>([]);
   const isProcessingRef = useRef(false);
   const isListeningRef = useRef(false);
   const startRecordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -233,13 +264,19 @@ export const usePersonaplexSession = ({
   const pendingManualCommitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const manualModeRef = useRef(manualMode);
   manualModeRef.current = manualMode;
+  /** Accumulates committed speech until user says "I'm done open journal"; then we send and clear. */
+  const speechBufferRef = useRef<string[]>([]);
+  /** While AI is speaking, last few committed chunks to detect "open journal" across chunks. */
+  const interruptBufferRef = useRef<string[]>([]);
   const isConnectedRef = useRef(false);
   const pendingReconnectRef = useRef(false);
   const backendSessionIdRef = useRef<string | null>(null);
+  const startRecordingAfterAIRef = useRef<((playbackFailed?: boolean) => void) | null>(null);
+  const speakRef = useRef<((text: string) => Promise<void>) | null>(null);
 
   const isVoiceMemoMode = typeof navigator !== "undefined" && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
   const POST_AI_LISTEN_DELAY_MS = isVoiceMemoMode ? 1800 : 700;
-  const DEBUG_LOG = true; // Set to false to disable session logs
+  const DEBUG_LOG = false;
   const log = (...args: unknown[]) => DEBUG_LOG && console.log("[Personaplex]", ...args);
 
   const processUserInput = useCallback(
@@ -247,33 +284,53 @@ export const usePersonaplexSession = ({
       if (isProcessingRef.current || !userText.trim()) return;
       log("processUserInput called", { text: userText.slice(0, 50) });
       isProcessingRef.current = true;
-      if (!isVoiceMemoMode) stopRecording();
+      setIsProcessing(true);
+      // Keep mic on so user can say "open journal" to interrupt AI
+      // if (!isVoiceMemoMode) stopRecording();
 
-      const nextWithUser = [...transcriptRef.current, { role: "user" as const, text: userText }];
+      const nextWithUser: TranscriptEntry[] = [...transcriptRef.current, { role: "user", text: userText }];
       transcriptRef.current = nextWithUser;
       onTranscriptUpdate(() => nextWithUser);
       onInterimTranscript("");
 
       try {
-        const { question, sessionId } = await fetchInterviewerQuestion(
+        log("Fetching /chat...");
+        const { question, sessionId, retrievalLog } = await fetchInterviewerQuestion(
           userText,
-          backendSessionIdRef.current
+          backendSessionIdRef.current,
+          personalization,
+          intrusiveness
         );
+        log("Got response, speaking...");
         backendSessionIdRef.current = sessionId;
-        const nextWithAi = [...nextWithUser, { role: "ai" as const, text: question }];
+        const nextWithAi: TranscriptEntry[] = [...nextWithUser, { role: "ai", text: question, ...(retrievalLog != null ? { retrievalLog } : {}) }];
         transcriptRef.current = nextWithAi;
         onTranscriptUpdate(() => nextWithAi);
-        await speak(question);
+        if (speakRef.current) {
+          await speakRef.current(question);
+        } else {
+          log("speakRef.current is null, reopening mic");
+          if (!isVoiceMemoMode && isConnectedRef.current && startRecordingAfterAIRef.current) {
+            startRecordingAfterAIRef.current(true);
+          }
+        }
       } catch (err) {
         console.error("[Personaplex] Interviewer API error:", err);
-        setErrorMessage(err instanceof Error ? err.message : "API error");
+        const message =
+          err instanceof Error
+            ? (err.name === "AbortError" ? "Request timed out. Check the backend and try again." : err.message)
+            : "API error";
+        setErrorMessage(message);
         setStatus("error");
-        isProcessingRef.current = false;
+        if (!isVoiceMemoMode && isConnectedRef.current && startRecordingAfterAIRef.current) {
+          startRecordingAfterAIRef.current(true);
+        }
       } finally {
         isProcessingRef.current = false;
+        setIsProcessing(false);
       }
     },
-    [systemPrompt, onTranscriptUpdate, onInterimTranscript]
+    [personalization, intrusiveness, onTranscriptUpdate, onInterimTranscript]
   );
 
   const speakWithVoiceApi = useCallback(
@@ -300,7 +357,7 @@ export const usePersonaplexSession = ({
       log("AI started speaking:", text);
       setError(null);
 
-      fetchVoiceAudio(text, selectedVoiceId)
+      fetchVoiceAudio(text, selectedVoiceId, voiceSettings)
         .then(async ({ base64, format }) => {
           const mime = format === "mp3" ? "audio/mpeg" : "audio/wav";
           const binary = atob(base64);
@@ -369,6 +426,26 @@ export const usePersonaplexSession = ({
     [selectedVoiceId]
   );
 
+  const stopAiPlayback = useCallback(() => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current.currentTime = 0;
+      currentAudioRef.current = null;
+    }
+    if (currentPlaybackSourceRef.current) {
+      try {
+        currentPlaybackSourceRef.current.stop();
+      } catch {
+        /* already stopped */
+      }
+      currentPlaybackSourceRef.current = null;
+    }
+    isAiSpeakingRef.current = false;
+    setIsAiSpeaking(false);
+    interruptBufferRef.current = [];
+    log("AI playback stopped (interrupt)");
+  }, []);
+
   const stopRecording = useCallback(() => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -400,7 +477,18 @@ export const usePersonaplexSession = ({
 
     const start = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        let stream: MediaStream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
         streamRef.current = stream;
 
         const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -415,7 +503,8 @@ export const usePersonaplexSession = ({
         const token = await fetchScribeToken();
         targetRateRef.current = targetRate;
 
-        const commitStrategy = manualMode ? "manual" : "vad";
+        // Single flow: always VAD. (Manual mode commented out: commitStrategy = manualMode ? "manual" : "vad")
+        const commitStrategy = "vad";
         log("WebSocket params: commit_strategy =", commitStrategy, "sourceRate =", sourceRate);
         const params = new URLSearchParams({
           token,
@@ -424,11 +513,10 @@ export const usePersonaplexSession = ({
           audio_format: audioFormat,
           language_code: "en",
         });
-        if (!manualMode) {
-          params.set("vad_silence_threshold_secs", "2.0");
-          params.set("vad_threshold", "0.55");
-          params.set("min_speech_duration_ms", "250");
-        }
+        params.set("vad_silence_threshold_secs", "2.0");
+        params.set("vad_threshold", "0.65");
+        params.set("min_speech_duration_ms", "350");
+        params.set("min_silence_duration_ms", "200");
         const ws = new WebSocket(`${SCRIBE_WS_URL}?${params}`);
         wsRef.current = ws;
 
@@ -447,21 +535,67 @@ export const usePersonaplexSession = ({
             const type = msg.message_type;
 
             if (type === "partial_transcript" && typeof msg.text === "string") {
-              if (manualModeRef.current && manualBufferRef.current.length > 0) {
-                const accumulated = manualBufferRef.current.join(" ") + " " + msg.text;
-                onInterimTranscript(accumulated);
-              } else {
-                onInterimTranscript(msg.text);
+              if (isAiSpeakingRef.current) {
+                const partialNorm = msg.text.toLowerCase().replace(/\s+/g, " ").trim();
+                if (/\bopen\s*journal\b/.test(partialNorm)) {
+                  log("Interrupt (user said 'open journal' in partial while AI speaking)");
+                  interruptBufferRef.current = [];
+                  stopAiPlayback();
+                }
               }
+              const accumulated = speechBufferRef.current.length > 0
+                ? speechBufferRef.current.join(" ") + " " + msg.text
+                : msg.text;
+              onInterimTranscript(accumulated);
             } else if (type === "committed_transcript" && typeof msg.text === "string") {
               const text = msg.text.trim();
               if (text) {
+                const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
+                const openJournalInterruptPhrase = /\bopen\s*journal\b/;
                 if (isAiSpeakingRef.current) {
-                  log("IGNORED committed_transcript (AI still speaking):", text.slice(0, 50));
+                  interruptBufferRef.current = [...interruptBufferRef.current.slice(-2), text].filter(Boolean);
+                  const interruptText = interruptBufferRef.current.join(" ").toLowerCase().replace(/\s+/g, " ").trim();
+                  if (openJournalInterruptPhrase.test(interruptText)) {
+                    log("Interrupt (user said 'open journal' while AI speaking)");
+                    interruptBufferRef.current = [];
+                    stopAiPlayback();
+                  } else {
+                    log("IGNORED committed_transcript (AI still speaking):", text.slice(0, 50));
+                  }
                   return;
                 }
-                log("committed_transcript received:", text.slice(0, 50), "manualMode:", manualModeRef.current);
+                interruptBufferRef.current = [];
+                log("committed_transcript received:", text.slice(0, 50));
 
+                // Only send when user says "I'm done open journal". Check full accumulated text (phrase can span chunks).
+                const fullText = [...speechBufferRef.current, text].join(" ").trim();
+                const normalizedFull = fullText
+                  .toLowerCase()
+                  .replace(/[.,!?\-]/g, " ")
+                  .replace(/\s+/g, " ")
+                  .trim();
+                const donePhrase = /i'?m\s+done\s+open\s*journal/;
+                const donePhraseAlt = /i'?m\s+don\s+opanjero/;
+                const isDonePhrase = donePhrase.test(normalizedFull) || donePhraseAlt.test(normalizedFull);
+                if (isDonePhrase) {
+                  speechBufferRef.current = [];
+                  const cleaned = fullText
+                    .replace(/\s*i'?m\s+done[.,!?\s]*open\s*journal\s*/gi, " ")
+                    .replace(/\s*i'?m\s+don\s+opanjero\s*/gi, " ")
+                    .replace(/\s+/g, " ")
+                    .trim();
+                  if (cleaned) {
+                    log("Processing (user said 'I'm done open-journal'):", cleaned.slice(0, 50));
+                    processUserInput(cleaned);
+                  } else {
+                    onInterimTranscript("");
+                  }
+                  return;
+                }
+                speechBufferRef.current.push(text);
+                onInterimTranscript(speechBufferRef.current.join(" "));
+
+                /* Manual mode (commented out in case we want to restore):
                 if (manualModeRef.current) {
                   manualBufferRef.current.push(text);
                   if (pendingManualCommitRef.current) {
@@ -482,10 +616,9 @@ export const usePersonaplexSession = ({
                     onInterimTranscript(manualBufferRef.current.join(" "));
                   }
                 } else {
-                  log("Processing (VAD mode)");
-                  stopRecording();
-                  processUserInput(text);
+                  ... VAD branch is above ...
                 }
+                */
               }
             } else if (type === "error" || type === "auth_error" || type === "quota_exceeded") {
               const err = msg.error ?? "Transcription error";
@@ -535,7 +668,7 @@ export const usePersonaplexSession = ({
 
             isListeningRef.current = true;
             setIsUserSpeaking(true);
-            if (manualModeRef.current) manualBufferRef.current = [];
+            speechBufferRef.current = [];
             onInterimTranscript("Listening...");
           } catch (err) {
             console.error("[Personaplex] Mic access error:", err);
@@ -552,7 +685,7 @@ export const usePersonaplexSession = ({
     };
 
     start();
-  }, [processUserInput, onInterimTranscript, stopRecording, manualMode]);
+  }, [processUserInput, onInterimTranscript, stopRecording, stopAiPlayback]);
 
   const commitManual = useCallback(() => {
     const w = wsRef.current;
@@ -591,7 +724,18 @@ export const usePersonaplexSession = ({
       const silent = new Audio("data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
       silent.volume = 0;
       silent.play().catch(() => {});
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
       voiceMemoStreamRef.current = stream;
       const recorder = new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
@@ -672,6 +816,7 @@ export const usePersonaplexSession = ({
   const startRecordingAfterAI = useCallback((playbackFailed?: boolean) => {
     if (!isConnectedRef.current) return;
     if (isVoiceMemoMode) return;
+    if (isListeningRef.current) return; // mic never stopped; no need to start again
     const wasPendingReconnect = pendingReconnectRef.current;
     if (pendingReconnectRef.current) pendingReconnectRef.current = false;
     const delay = wasPendingReconnect ? 0 : (playbackFailed ? 2500 : POST_AI_LISTEN_DELAY_MS);
@@ -683,6 +828,7 @@ export const usePersonaplexSession = ({
       startRecording();
     }, delay);
   }, [startRecording]);
+  startRecordingAfterAIRef.current = startRecordingAfterAI;
 
   const speak = useCallback(
     async (text: string) => {
@@ -709,6 +855,7 @@ export const usePersonaplexSession = ({
     },
     [speakWithVoiceApi, startRecordingAfterAI, startRecording]
   );
+  speakRef.current = speak;
 
   const connect = useCallback(() => {
     log("Connect");
@@ -775,6 +922,7 @@ export const usePersonaplexSession = ({
     isProcessingRef.current = false;
     isListeningRef.current = false;
     manualBufferRef.current = [];
+    speechBufferRef.current = [];
     pendingManualCommitRef.current = false;
     pendingReconnectRef.current = false;
     lastFailedPlaybackRef.current = null;
@@ -784,6 +932,7 @@ export const usePersonaplexSession = ({
   return {
     status,
     errorMessage,
+    isProcessing,
     connect,
     disconnect,
     commitManual,

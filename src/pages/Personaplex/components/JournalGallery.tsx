@@ -26,18 +26,71 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
   onToast,
 }) => {
   const [selectedEntry, setSelectedEntry] = useState<JournalEntry | null>(null);
+  const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [reformattedModal, setReformattedModal] = useState<{ text: string; entry: JournalEntry } | null>(null);
+  const [thinkingLogsModal, setThinkingLogsModal] = useState<string | null>(null);
 
   const openModal = useCallback((entry: JournalEntry) => {
     setSelectedEntry(entry);
+    setExpandedLogIndex(null);
     setReformattedModal(null);
+    setThinkingLogsModal(null);
   }, []);
 
   const closeModal = useCallback(() => {
     setSelectedEntry(null);
     setReformattedModal(null);
+    setThinkingLogsModal(null);
   }, []);
+
+  const buildThinkingLogsContent = useCallback((entry: JournalEntry): string => {
+    const lines: string[] = [
+      `AI Thinking Logs — ${getFormattedDate(entry)}`,
+      "=".repeat(50),
+      "",
+    ];
+    let aiIndex = 0;
+    entry.fullTranscript.forEach((msg, i) => {
+      if (msg.role === "ai") {
+        aiIndex += 1;
+        lines.push(`--- AI Response ${aiIndex} ---`);
+        lines.push("");
+        lines.push("Reply:");
+        lines.push(msg.text);
+        lines.push("");
+        if (msg.retrievalLog) {
+          lines.push("Memory context from vector DB:");
+          lines.push(msg.retrievalLog);
+        } else {
+          lines.push("(No memory context retrieved for this response.)");
+        }
+        lines.push("");
+      }
+    });
+    if (aiIndex === 0) {
+      lines.push("No AI responses in this entry.");
+    }
+    return lines.join("\n");
+  }, [getFormattedDate]);
+
+  const handleAiThinkingLogs = useCallback(
+    (entry: JournalEntry) => {
+      const content = buildThinkingLogsContent(entry);
+      const dateStr = new Date(entry.date).toISOString().slice(0, 10);
+      const filename = `AI_Thinking_Logs_${dateStr}.txt`;
+      const blob = new Blob([content], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      setThinkingLogsModal(content);
+      onToast?.("Downloaded. Viewing logs.");
+    },
+    [buildThinkingLogsContent, onToast]
+  );
 
   const handleAiReformat = useCallback(
     async (entry: JournalEntry) => {
@@ -200,7 +253,7 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
                   type="button"
                   onClick={() => exportToFile(selectedEntry)}
                   className="px-3 py-2 rounded-lg bg-slate-700/50 text-slate-300 text-sm font-medium hover:bg-slate-600/50 transition-colors flex items-center gap-2"
-                  title="Download as .txt"
+                  title="Download transcript as .txt"
                 >
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
@@ -218,6 +271,29 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
                     />
                   </svg>
                   Download
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleAiThinkingLogs(selectedEntry)}
+                  className="px-3 py-2 rounded-lg bg-slate-700/50 text-slate-300 text-sm font-medium hover:bg-slate-600/50 transition-colors flex items-center gap-2"
+                  title="Download and view AI thinking logs (memory context)"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    className="h-4 w-4"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    aria-hidden
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                    />
+                  </svg>
+                  AI thinking logs
                 </button>
                 <button
                   type="button"
@@ -249,10 +325,61 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
                         {msg.role === "user" ? "You" : "AI"}
                       </span>
                       <p className="whitespace-pre-wrap break-words">{msg.text}</p>
+                      {msg.role === "ai" && msg.retrievalLog && (
+                        <div className="mt-2 text-left">
+                          <button
+                            type="button"
+                            onClick={() => setExpandedLogIndex((prev) => (prev === i ? null : i))}
+                            className="text-xs text-violet-400/90 hover:text-violet-300 font-medium"
+                          >
+                            {expandedLogIndex === i ? "Hide" : "Show"} memory context (vector DB)
+                          </button>
+                          {expandedLogIndex === i && (
+                            <pre className="mt-1.5 p-2 rounded bg-slate-800/80 text-slate-400 text-xs whitespace-pre-wrap break-words border border-slate-700/50 max-h-48 overflow-y-auto font-sans">
+                              {msg.retrievalLog}
+                            </pre>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {thinkingLogsModal !== null && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md"
+          onClick={() => setThinkingLogsModal(null)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => e.key === "Escape" && setThinkingLogsModal(null)}
+          aria-label="Close AI thinking logs"
+        >
+          <div
+            className="bg-slate-900/95 border border-slate-700/80 rounded-2xl max-w-2xl w-full max-h-[85vh] flex flex-col shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-6 py-4 border-b border-slate-700/80 flex justify-between items-center bg-slate-800/30">
+              <h3 className="text-lg font-medium text-slate-200 tracking-wide">
+                AI thinking logs
+              </h3>
+              <button
+                type="button"
+                onClick={() => setThinkingLogsModal(null)}
+                className="p-2 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-700/50 transition-colors"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-6 scrollbar">
+              <pre className="font-sans text-sm text-slate-300 whitespace-pre-wrap break-words">
+                {thinkingLogsModal}
+              </pre>
             </div>
           </div>
         </div>

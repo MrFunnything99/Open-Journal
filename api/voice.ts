@@ -5,6 +5,10 @@ const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Rachel
 const DEFAULT_MODEL = "eleven_multilingual_v2";
 const OUTPUT_FORMAT = "mp3_44100_128";
 
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
 export async function POST(request: Request) {
   const jsonResponse = (body: { error?: string; audio?: string }, status: number) =>
     new Response(JSON.stringify(body), {
@@ -18,9 +22,10 @@ export async function POST(request: Request) {
       return jsonResponse({ error: "ELEVENLABS_API_KEY is not configured" }, 500);
     }
 
-    let body: { text?: string; voiceId?: string };
+    type VoiceSettings = { stability?: number; similarity_boost?: number; style?: number; speed?: number };
+    let body: { text?: string; voiceId?: string; voice_settings?: VoiceSettings };
     try {
-      body = (await request.json()) as { text?: string; voiceId?: string };
+      body = (await request.json()) as typeof body;
     } catch {
       return jsonResponse({ error: "Invalid JSON in request body" }, 400);
     }
@@ -31,6 +36,27 @@ export async function POST(request: Request) {
     }
 
     const voiceId = body?.voiceId ?? DEFAULT_VOICE_ID;
+
+    const raw = body?.voice_settings ?? {};
+    const stability = clamp(
+      typeof raw.stability === "number" ? raw.stability : 0.5,
+      0,
+      1
+    );
+    const similarity_boost = clamp(
+      typeof raw.similarity_boost === "number" ? raw.similarity_boost : 0.75,
+      0,
+      1
+    );
+    const style = clamp(typeof raw.style === "number" ? raw.style : 0,
+      0,
+      1
+    );
+    const speed = clamp(
+      typeof raw.speed === "number" ? raw.speed : 1,
+      0.5,
+      2
+    );
 
     const res = await fetch(`${ELEVENLABS_API_URL}/${voiceId}`, {
       method: "POST",
@@ -43,6 +69,7 @@ export async function POST(request: Request) {
         text: text.trim(),
         model_id: DEFAULT_MODEL,
         output_format: OUTPUT_FORMAT,
+        voice_settings: { stability, similarity_boost, style, speed },
       }),
     });
 
