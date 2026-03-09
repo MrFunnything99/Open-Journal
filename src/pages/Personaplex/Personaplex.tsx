@@ -95,8 +95,7 @@ export const Personaplex = () => {
   const [voices, setVoices] = useState<VoiceOption[]>(FALLBACK_VOICES);
   const [selectedVoiceId, setSelectedVoiceId] = useState(DEFAULT_VOICE_ID);
   const [voiceDynamics, setVoiceDynamics] = useState(0.5);
-  // Manual mode (commented out – single flow: VAD + "I'm done open journal" to stop)
-  // const [manualMode, setManualMode] = useState(false);
+  // Manual mode: user taps Done to end a turn (no hands-free phrases).
   const voiceSettings = useMemo(
     () => ({
       stability: 1 - voiceDynamics,
@@ -243,7 +242,7 @@ export const Personaplex = () => {
   } = usePersonaplexSession({
     systemPrompt: textPrompt,
     selectedVoiceId,
-    manualMode: false,
+    manualMode: true,
     personalization,
     intrusiveness,
     voiceSettings,
@@ -543,17 +542,6 @@ export const Personaplex = () => {
                   {Math.round(voiceDynamics * 100)}% — calmer ↔ more expressive
                 </p>
               </div>
-              {/* Manual mode (commented out – single flow: say "I'm done open journal" to stop)
-              {!isVoiceMemoMode && (
-                <div className="mt-3 space-y-1.5">
-                  <label ...>
-                    <span>Manual mode</span>
-                    <input type="checkbox" checked={manualMode} onChange={...} />
-                  </label>
-                  <p>Tap "Done speaking" when finished (no auto-detect).</p>
-                </div>
-              )}
-              */}
               <div className="mt-3 space-y-1.5">
                 <label htmlFor="personaplex-personalization" className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
                   Personalization
@@ -676,11 +664,15 @@ export const Personaplex = () => {
                     </button>
                   ) : null
                 )}
-                {/* Manual mode: "Done speaking" button (commented out)
-                {!isVoiceMemoMode && isConnected && manualMode && isUserSpeaking && (
-                  <button type="button" onClick={commitManual} ...>Done speaking</button>
+                {!isVoiceMemoMode && isConnected && isUserSpeaking && !isAiSpeaking && (
+                  <button
+                    type="button"
+                    onClick={commitManual}
+                    className="px-6 py-3 rounded-full bg-violet-500/80 hover:bg-violet-500 text-white text-sm font-medium transition-colors"
+                  >
+                    Done recording
+                  </button>
                 )}
-                */}
               </div>
             </div>
 
@@ -703,7 +695,7 @@ export const Personaplex = () => {
                   <p className="text-sm text-slate-500 italic">
                     {isVoiceMemoMode
                       ? "Tap Record, speak, then tap Done. Your words will appear here."
-                      : "Conversation will appear here. Say \"I'm done open journal\" when you're finished. Say \"open journal\" to interrupt the AI."}
+                      : "Conversation will appear here as you speak. Tap Done recording to finish your turn."}
                   </p>
                 ) : (
                   <>

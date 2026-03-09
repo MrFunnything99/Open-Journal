@@ -264,17 +264,14 @@ export const usePersonaplexSession = ({
   const pendingManualCommitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const manualModeRef = useRef(manualMode);
   manualModeRef.current = manualMode;
-  /** Accumulates committed speech until user says "I'm done open journal"; then we send and clear. */
-  const speechBufferRef = useRef<string[]>([]);
-  /** While AI is speaking, last few committed chunks to detect "open journal" across chunks. */
-  const interruptBufferRef = useRef<string[]>([]);
   const isConnectedRef = useRef(false);
   const pendingReconnectRef = useRef(false);
   const backendSessionIdRef = useRef<string | null>(null);
   const startRecordingAfterAIRef = useRef<((playbackFailed?: boolean) => void) | null>(null);
   const speakRef = useRef<((text: string) => Promise<void>) | null>(null);
 
-  const isVoiceMemoMode = typeof navigator !== "undefined" && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+  // Use the same simple \"record then Done\" flow on all devices (no live transcription UI).
+  const isVoiceMemoMode = true;
   const POST_AI_LISTEN_DELAY_MS = isVoiceMemoMode ? 1800 : 700;
   const DEBUG_LOG = false;
   const log = (...args: unknown[]) => DEBUG_LOG && console.log("[Personaplex]", ...args);
@@ -285,8 +282,6 @@ export const usePersonaplexSession = ({
       log("processUserInput called", { text: userText.slice(0, 50) });
       isProcessingRef.current = true;
       setIsProcessing(true);
-      // Keep mic on so user can say "open journal" to interrupt AI
-      // if (!isVoiceMemoMode) stopRecording();
 
       const nextWithUser: TranscriptEntry[] = [...transcriptRef.current, { role: "user", text: userText }];
       transcriptRef.current = nextWithUser;
@@ -442,8 +437,7 @@ export const usePersonaplexSession = ({
     }
     isAiSpeakingRef.current = false;
     setIsAiSpeaking(false);
-    interruptBufferRef.current = [];
-    log("AI playback stopped (interrupt)");
+    log("AI playback stopped");
   }, []);
 
   const stopRecording = useCallback(() => {
@@ -470,6 +464,7 @@ export const usePersonaplexSession = ({
     audioContextRef.current?.close();
     audioContextRef.current = null;
     isListeningRef.current = false;
+    setIsUserSpeaking(false);
   }, []);
 
   const startRecording = useCallback(() => {
@@ -503,8 +498,8 @@ export const usePersonaplexSession = ({
         const token = await fetchScribeToken();
         targetRateRef.current = targetRate;
 
-        // Single flow: always VAD. (Manual mode commented out: commitStrategy = manualMode ? "manual" : "vad")
-        const commitStrategy = "vad";
+        // Manual turn-taking: user ends turn with button, no hands-free phrases.
+        const commitStrategy = "manual";
         log("WebSocket params: commit_strategy =", commitStrategy, "sourceRate =", sourceRate);
         const params = new URLSearchParams({
           token,
@@ -513,10 +508,6 @@ export const usePersonaplexSession = ({
           audio_format: audioFormat,
           language_code: "en",
         });
-        params.set("vad_silence_threshold_secs", "2.0");
-        params.set("vad_threshold", "0.65");
-        params.set("min_speech_duration_ms", "350");
-        params.set("min_silence_duration_ms", "200");
         const ws = new WebSocket(`${SCRIBE_WS_URL}?${params}`);
         wsRef.current = ws;
 
@@ -535,90 +526,38 @@ export const usePersonaplexSession = ({
             const type = msg.message_type;
 
             if (type === "partial_transcript" && typeof msg.text === "string") {
-              if (isAiSpeakingRef.current) {
-                const partialNorm = msg.text.toLowerCase().replace(/\s+/g, " ").trim();
-                if (/\bopen\s*journal\b/.test(partialNorm)) {
-                  log("Interrupt (user said 'open journal' in partial while AI speaking)");
-                  interruptBufferRef.current = [];
-                  stopAiPlayback();
-                }
+              // While user is speaking, just show the latest partial text.
+              if (!isAiSpeakingRef.current) {
+                onInterimTranscript(msg.text);
               }
-              const accumulated = speechBufferRef.current.length > 0
-                ? speechBufferRef.current.join(" ") + " " + msg.text
-                : msg.text;
-              onInterimTranscript(accumulated);
             } else if (type === "committed_transcript" && typeof msg.text === "string") {
               const text = msg.text.trim();
               if (text) {
-                const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
-                const openJournalInterruptPhrase = /\bopen\s*journal\b/;
+                // Manual mode: buffer committed chunks until the user taps Done, then send once.
                 if (isAiSpeakingRef.current) {
-                  interruptBufferRef.current = [...interruptBufferRef.current.slice(-2), text].filter(Boolean);
-                  const interruptText = interruptBufferRef.current.join(" ").toLowerCase().replace(/\s+/g, " ").trim();
-                  if (openJournalInterruptPhrase.test(interruptText)) {
-                    log("Interrupt (user said 'open journal' while AI speaking)");
-                    interruptBufferRef.current = [];
-                    stopAiPlayback();
-                  } else {
-                    log("IGNORED committed_transcript (AI still speaking):", text.slice(0, 50));
-                  }
+                  log("IGNORED committed_transcript (AI still speaking):", text.slice(0, 50));
                   return;
                 }
-                interruptBufferRef.current = [];
-                log("committed_transcript received:", text.slice(0, 50));
-
-                // Only send when user says "I'm done open journal". Check full accumulated text (phrase can span chunks).
-                const fullText = [...speechBufferRef.current, text].join(" ").trim();
-                const normalizedFull = fullText
-                  .toLowerCase()
-                  .replace(/[.,!?\-]/g, " ")
-                  .replace(/\s+/g, " ")
-                  .trim();
-                const donePhrase = /i'?m\s+done\s+open\s*journal/;
-                const donePhraseAlt = /i'?m\s+don\s+opanjero/;
-                const isDonePhrase = donePhrase.test(normalizedFull) || donePhraseAlt.test(normalizedFull);
-                if (isDonePhrase) {
-                  speechBufferRef.current = [];
-                  const cleaned = fullText
-                    .replace(/\s*i'?m\s+done[.,!?\s]*open\s*journal\s*/gi, " ")
-                    .replace(/\s*i'?m\s+don\s+opanjero\s*/gi, " ")
-                    .replace(/\s+/g, " ")
-                    .trim();
-                  if (cleaned) {
-                    log("Processing (user said 'I'm done open-journal'):", cleaned.slice(0, 50));
-                    processUserInput(cleaned);
+                manualBufferRef.current.push(text);
+                if (pendingManualCommitRef.current) {
+                  if (pendingManualCommitTimeoutRef.current) {
+                    clearTimeout(pendingManualCommitTimeoutRef.current);
+                    pendingManualCommitTimeoutRef.current = null;
+                  }
+                  const fullText = manualBufferRef.current.join(" ").trim();
+                  manualBufferRef.current = [];
+                  pendingManualCommitRef.current = false;
+                  stopRecording();
+                  if (fullText) {
+                    log("Processing (user clicked Done):", fullText.slice(0, 50));
+                    processUserInput(fullText);
                   } else {
                     onInterimTranscript("");
                   }
-                  return;
-                }
-                speechBufferRef.current.push(text);
-                onInterimTranscript(speechBufferRef.current.join(" "));
-
-                /* Manual mode (commented out in case we want to restore):
-                if (manualModeRef.current) {
-                  manualBufferRef.current.push(text);
-                  if (pendingManualCommitRef.current) {
-                    if (pendingManualCommitTimeoutRef.current) {
-                      clearTimeout(pendingManualCommitTimeoutRef.current);
-                      pendingManualCommitTimeoutRef.current = null;
-                    }
-                    const fullText = manualBufferRef.current.join(" ").trim();
-                    manualBufferRef.current = [];
-                    pendingManualCommitRef.current = false;
-                    stopRecording();
-                    if (fullText) {
-                      log("Processing (user clicked Done)");
-                      processUserInput(fullText);
-                    }
-                  } else {
-                    log("Buffered chunk (waiting for Done click)");
-                    onInterimTranscript(manualBufferRef.current.join(" "));
-                  }
                 } else {
-                  ... VAD branch is above ...
+                  log("Buffered chunk (waiting for Done click)");
+                  onInterimTranscript(manualBufferRef.current.join(" "));
                 }
-                */
               }
             } else if (type === "error" || type === "auth_error" || type === "quota_exceeded") {
               const err = msg.error ?? "Transcription error";
@@ -668,7 +607,7 @@ export const usePersonaplexSession = ({
 
             isListeningRef.current = true;
             setIsUserSpeaking(true);
-            speechBufferRef.current = [];
+            manualBufferRef.current = [];
             onInterimTranscript("Listening...");
           } catch (err) {
             console.error("[Personaplex] Mic access error:", err);
@@ -922,7 +861,6 @@ export const usePersonaplexSession = ({
     isProcessingRef.current = false;
     isListeningRef.current = false;
     manualBufferRef.current = [];
-    speechBufferRef.current = [];
     pendingManualCommitRef.current = false;
     pendingReconnectRef.current = false;
     lastFailedPlaybackRef.current = null;
