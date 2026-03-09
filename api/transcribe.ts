@@ -3,8 +3,8 @@
 import FormData from "form-data";
 import https from "node:https";
 
-const MISTRAL_STT_URL = "https://api.mistral.ai/v1/audio/transcriptions";
-const MISTRAL_MODEL = "voxtral-mini-latest";
+const ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
+const SCRIBE_MODEL = "scribe_v2";
 
 export async function POST(request: Request) {
   const jsonResponse = (body: { error?: string; text?: string }, status: number) =>
@@ -14,9 +14,9 @@ export async function POST(request: Request) {
     });
 
   try {
-    const apiKey = process.env.MISTRAL_API_KEY;
+    const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) {
-      return jsonResponse({ error: "MISTRAL_API_KEY is not configured" }, 500);
+      return jsonResponse({ error: "ELEVENLABS_API_KEY is not configured" }, 500);
     }
 
     let body: { audio?: string; format?: string };
@@ -38,19 +38,18 @@ export async function POST(request: Request) {
 
     const form = new FormData();
     form.append("file", buffer, { filename: "audio.wav", contentType: "audio/wav" });
-    form.append("model", MISTRAL_MODEL);
-    form.append("language", "en");
+    form.append("model_id", SCRIBE_MODEL);
 
     const { rawText, statusCode } = await new Promise<{ rawText: string; statusCode: number }>(
       (resolve, reject) => {
-        const url = new URL(MISTRAL_STT_URL);
+        const url = new URL(ELEVENLABS_STT_URL);
         const req = https.request(
           {
             hostname: url.hostname,
             path: url.pathname,
             method: "POST",
             headers: {
-              Authorization: `Bearer ${apiKey}`,
+              "xi-api-key": apiKey,
               ...form.getHeaders(),
             },
           },
@@ -76,7 +75,7 @@ export async function POST(request: Request) {
       try {
         data = JSON.parse(rawText) as Record<string, unknown>;
       } catch {
-        console.error("[transcribe] Mistral STT returned non-JSON:", rawText.slice(0, 300));
+        console.error("[transcribe] ElevenLabs returned non-JSON:", rawText.slice(0, 300));
       }
     }
 
@@ -87,8 +86,8 @@ export async function POST(request: Request) {
         (typeof errDetail === "string" ? errDetail : null) ??
         (data?.message as string) ??
         (rawText.trim() ? rawText.slice(0, 300) : null) ??
-        `Mistral STT failed (${statusCode})`;
-      console.error("[transcribe] Mistral STT error:", statusCode, errMsg);
+        `ElevenLabs STT failed (${statusCode})`;
+      console.error("[transcribe] ElevenLabs error:", statusCode, errMsg);
       return jsonResponse({ error: errMsg }, 500);
     }
 

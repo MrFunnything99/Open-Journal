@@ -52,17 +52,8 @@ import { ConnectButton } from "./components/ConnectButton";
 import { JournalGallery } from "./components/JournalGallery";
 import { MemoryDiagram } from "./components/MemoryDiagram";
 
-/** Default journaling assistant prompt (base; personalization suffix is appended from slider) */
+/** Default journaling assistant prompt (base; personalization is always \"high\" / memory-connected) */
 const DEFAULT_PERSONAPLEX_PROMPT = `You are an empathetic and insightful conversational journaling assistant. Your goal is to provide a supportive space for the user to reflect on their thoughts, experiences, and emotions. Read the user's entries and respond naturally. Ask open-ended questions to encourage further exploration, but always let the user guide the direction and depth of the conversation. Avoid being overly prescriptive, giving unsolicited advice, or summarizing their thoughts unnecessarily. Just be a curious, active listener. Always facilitate conversation that gets the user exploring their thoughts and emotions. Try to keep responses brief and concise when possible to conserve tokens.`;
-
-const PERSONALIZATION_LEVELS = [0, 0.25, 0.5, 0.75, 1] as const;
-const PERSONALIZATION_LABELS: Record<number, string> = {
-  0: "Do not use memory or prior context; keep questions general and present-focused only.",
-  0.25: "Keep questions general and present-focused.",
-  0.5: "Occasionally reference what you know about the user.",
-  0.75: "Often tailor questions to the user's life and past entries.",
-  1: "Fully personalize: connect deeply to the user's life and past journals.",
-};
 
 const INTRUSIVENESS_LEVELS = [0, 0.25, 0.5, 0.75, 1] as const;
 const INTRUSIVENESS_LABELS: Record<number, string> = {
@@ -90,32 +81,30 @@ const FALLBACK_VOICES: VoiceOption[] = [
 ];
 
 export const Personaplex = () => {
-  const [personalization, setPersonalization] = useState(0.5);
+  // Personalization is always \"high\": the agent should actively connect past memories and journals to the current conversation when relevant.
+  const personalization = 1;
   const [intrusiveness, setIntrusiveness] = useState(0.5);
   const [voices, setVoices] = useState<VoiceOption[]>(FALLBACK_VOICES);
   const [selectedVoiceId, setSelectedVoiceId] = useState(DEFAULT_VOICE_ID);
-  const [voiceDynamics, setVoiceDynamics] = useState(0.5);
-  // Manual mode: user taps Done to end a turn (no hands-free phrases).
+  // Fixed voice settings: slightly expressive, 20% stability, speed 1.2x.
   const voiceSettings = useMemo(
     () => ({
-      stability: 1 - voiceDynamics,
+      stability: 0.2,
       similarity_boost: 0.75,
-      style: voiceDynamics,
+      style: 0.6,
+      speed: 1.2,
     }),
-    [voiceDynamics]
+    []
   );
   const textPrompt = useMemo(
     () =>
       DEFAULT_PERSONAPLEX_PROMPT +
-      "\n\nLevel of personalization: " +
-      Math.round(personalization * 100) +
-      "%. " +
-      (PERSONALIZATION_LABELS[personalization as keyof typeof PERSONALIZATION_LABELS] ?? PERSONALIZATION_LABELS[0.5]) +
+      "\n\nPersonalization: Always look for relevant connections between today's journaling and the user's past entries and memories. When appropriate, bring prior sessions or stories back into the conversation to deepen reflection (for example, if the user asks what to journal about today, suggest follow-ups based on past sessions)." +
       "\n\nQuestioning style (intrusiveness): " +
       Math.round(intrusiveness * 100) +
       "%. " +
       (INTRUSIVENESS_LABELS[intrusiveness as keyof typeof INTRUSIVENESS_LABELS] ?? INTRUSIVENESS_LABELS[0.5]),
-    [personalization, intrusiveness]
+    [intrusiveness]
   );
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
@@ -126,6 +115,7 @@ export const Personaplex = () => {
   const [isIngesting, setIsIngesting] = useState(false);
   const [memoryStats, setMemoryStats] = useState<{ gist_facts_count: number; episodic_log_count: number } | null>(null);
   const [isWipingMemory, setIsWipingMemory] = useState(false);
+  const [showLiveTranscription, setShowLiveTranscription] = useState(true);
 
   const {
     entries,
@@ -253,6 +243,7 @@ export const Personaplex = () => {
       });
     }, []),
     onInterimTranscript: setInterimTranscript,
+    showLiveTranscription,
   });
 
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
@@ -344,50 +335,120 @@ export const Personaplex = () => {
 
   const handleImportFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+      // Capture file(s) before clearing input — some browsers clear FileList when value is reset.
+      const fileList = Array.from(files);
       e.target.value = "";
-      if (!file) return;
+
+      // Multiple files: treat each as a journal (no JSON export handling).
+      if (fileList.length > 1) {
+        setIsImporting(true);
+        (async () => {
+          let imported = 0;
+          let synced = 0;
+          try {
+            for (const file of fileList) {
+              const lowerName = file.name.toLowerCase();
+              if (!/\.(txt|md|markdown|journal|log|json)$/.test(lowerName)) continue;
+              let text: string;
+              try {
+                text = (await file.text()).trim();
+              } catch {
+                continue;
+              }
+              if (!text) continue;
+              imported += 1;
+              saveEntry([{ role: "user", text }]);
+              try {
+                const r = await fetch(`${BACKEND_URL}/ingest-history`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ text }),
+                });
+                if (r.ok) synced += 1;
+              } catch {
+                /* continue */
+              }
+            }
+            if (imported > 0) fetchMemoryStats();
+            if (imported === 0) {
+              setToastMessage("No readable journal files in selection.");
+            } else if (synced === imported) {
+              setToastMessage(`Imported ${imported} journal${imported === 1 ? "" : "s"} and synced to memory.`);
+            } else {
+              setToastMessage(`Imported ${imported} journal${imported === 1 ? "" : "s"}. ${synced} synced to memory.`);
+            }
+          } finally {
+            setTimeout(() => setToastMessage(null), 5000);
+            setIsImporting(false);
+          }
+        })();
+        return;
+      }
+
+      // Single file: JSON export or one journal.
+      const file = fileList[0]!;
       setIsImporting(true);
       const reader = new FileReader();
       reader.onload = async () => {
         try {
           const text = reader.result;
           if (typeof text !== "string") throw new Error("Invalid file");
-          const parsed = JSON.parse(text) as unknown;
-          if (!isExportPayload(parsed)) throw new Error("Not a valid OpenJournal export file");
-          const count = importEntriesFromExport(parsed);
-          if (count === 0) {
-            setToastMessage("No valid entries in file.");
-            setTimeout(() => setToastMessage(null), 4000);
-            return;
-          }
-          setToastMessage(`Imported ${count} journal${count === 1 ? "" : "s"}. Syncing to memory…`);
-          const entries = parsed.entries as { fullTranscript?: { role: string; text: string }[] }[];
-          let synced = 0;
-          for (const entry of entries) {
-            const msgs = entry?.fullTranscript;
-            if (!Array.isArray(msgs) || msgs.length === 0) continue;
-            const transcriptText = msgs
-              .map((m) => (m?.role === "user" ? "You: " + (m?.text ?? "") : "AI: " + (m?.text ?? "")))
-              .join("\n");
-            if (!transcriptText.trim()) continue;
+          const lowerName = file.name.toLowerCase();
+
+          if (lowerName.endsWith(".json")) {
+            const parsed = JSON.parse(text) as unknown;
+            if (!isExportPayload(parsed)) throw new Error("Not a valid OpenJournal export file");
+            const count = importEntriesFromExport(parsed);
+            if (count === 0) {
+              setToastMessage("No valid entries in file.");
+              setTimeout(() => setToastMessage(null), 4000);
+              return;
+            }
+            setToastMessage(`Imported ${count} journal${count === 1 ? "" : "s"}. Syncing to memory…`);
+            const entries = parsed.entries as { fullTranscript?: { role: string; text: string }[] }[];
+            let synced = 0;
+            for (const entry of entries) {
+              const msgs = entry?.fullTranscript;
+              if (!Array.isArray(msgs) || msgs.length === 0) continue;
+              const transcriptText = msgs
+                .map((m) => (m?.role === "user" ? "You: " + (m?.text ?? "") : "AI: " + (m?.text ?? "")))
+                .join("\n");
+              if (!transcriptText.trim()) continue;
+              try {
+                const r = await fetch(`${BACKEND_URL}/ingest-history`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ text: transcriptText }),
+                });
+                if (r.ok) synced += 1;
+              } catch {
+                /* continue with next entry */
+              }
+            }
+            fetchMemoryStats();
+            setToastMessage(
+              synced === entries.length
+                ? `Imported ${count} journal${count === 1 ? "" : "s"} and synced to memory.`
+                : `Imported ${count} journal${count === 1 ? "" : "s"}. ${synced} synced to memory.`
+            );
+          } else {
+            const content = text.trim();
+            if (!content) throw new Error("File is empty.");
+            saveEntry([{ role: "user", text: content }]);
             try {
-              const r = await fetch(`${BACKEND_URL}/ingest-history`, {
+              await fetch(`${BACKEND_URL}/ingest-history`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: transcriptText }),
+                body: JSON.stringify({ text: content }),
               });
-              if (r.ok) synced += 1;
+              fetchMemoryStats();
+              setToastMessage("Imported journal and synced to memory.");
             } catch {
-              /* continue with next entry */
+              setToastMessage("Imported journal, but syncing to memory failed.");
             }
           }
-          fetchMemoryStats();
-          setToastMessage(
-            synced === entries.length
-              ? `Imported ${count} journal${count === 1 ? "" : "s"} and synced to memory.`
-              : `Imported ${count} journal${count === 1 ? "" : "s"}. ${synced} synced to memory.`
-          );
         } catch (err) {
           setToastMessage(err instanceof Error ? err.message : "Import failed.");
         }
@@ -401,7 +462,7 @@ export const Personaplex = () => {
       };
       reader.readAsText(file);
     },
-    [importEntriesFromExport, isExportPayload, fetchMemoryStats]
+    [importEntriesFromExport, isExportPayload, fetchMemoryStats, saveEntry]
   );
 
   useEffect(() => {
@@ -449,9 +510,6 @@ export const Personaplex = () => {
             }`}
             title="Journaling session"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 sm:h-5 sm:w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v3m0 0V10m0 3V7a3 3 0 016 0v3m-4 0h.01M12 19h.01M12 16h.01M12 13h.01M12 10h.01M12 7h.01M8 19h.01M8 16h.01" />
-            </svg>
             <span className="hidden sm:inline">Session</span>
           </button>
           <button
@@ -525,62 +583,6 @@ export const Personaplex = () => {
                 </select>
               </div>
               <div className="mt-3 space-y-1.5">
-                <label htmlFor="personaplex-voice-dynamics" className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
-                  Voice dynamics
-                </label>
-                <input
-                  id="personaplex-voice-dynamics"
-                  type="range"
-                  min={0}
-                  max={100}
-                  value={Math.round(voiceDynamics * 100)}
-                  onChange={(e) => setVoiceDynamics(Number(e.target.value) / 100)}
-                  disabled={isConnected}
-                  className="w-full h-2 rounded-full bg-slate-600 accent-violet-500 disabled:opacity-60"
-                />
-                <p className="text-xs text-slate-500">
-                  {Math.round(voiceDynamics * 100)}% — calmer ↔ more expressive
-                </p>
-              </div>
-              <div className="mt-3 space-y-1.5">
-                <label htmlFor="personaplex-personalization" className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
-                  Personalization
-                </label>
-                <div className="hidden sm:block">
-                  <input
-                    id="personaplex-personalization"
-                    type="range"
-                    min={0}
-                    max={PERSONALIZATION_LEVELS.length - 1}
-                    step={1}
-                    value={Math.max(0, PERSONALIZATION_LEVELS.findIndex((p) => p === personalization))}
-                    onChange={(e) => setPersonalization(PERSONALIZATION_LEVELS[Number(e.target.value)])}
-                    disabled={isConnected}
-                    className="w-full h-2 rounded-full bg-slate-600 accent-violet-500 disabled:opacity-60"
-                    aria-valuenow={Math.round(personalization * 100)}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuetext={`${Math.round(personalization * 100)}%`}
-                  />
-                </div>
-                <select
-                  aria-label="Personalization level"
-                  value={personalization}
-                  onChange={(e) => setPersonalization(Number(e.target.value))}
-                  disabled={isConnected}
-                  className="sm:hidden w-full px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/50"
-                >
-                  {PERSONALIZATION_LEVELS.map((p) => (
-                    <option key={p} value={p}>
-                      {Math.round(p * 100)}%
-                    </option>
-                  ))}
-                </select>
-                <p className="text-xs text-slate-500">
-                  {Math.round(personalization * 100)}% — present only ↔ use journal memory
-                </p>
-              </div>
-              <div className="mt-3 space-y-1.5">
                 <label htmlFor="personaplex-intrusiveness" className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
                   Questioning style
                 </label>
@@ -617,6 +619,36 @@ export const Personaplex = () => {
                 <p className="text-xs text-slate-500">
                   {Math.round(intrusiveness * 100)}% — context building ↔ dynamic questions
                 </p>
+              </div>
+              <div className="mt-3 space-y-1.5">
+                <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
+                  Live transcription
+                </label>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowLiveTranscription((v) => !v)}
+                    className={`relative w-10 h-5 rounded-full transition-colors duration-200 ease-out ${
+                      showLiveTranscription ? "bg-violet-500" : "bg-slate-600"
+                    }`}
+                    aria-pressed={showLiveTranscription}
+                    aria-label="Toggle live transcription"
+                    disabled={isVoiceMemoMode}
+                  >
+                    <span
+                      className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform duration-200 ease-out ${
+                        showLiveTranscription ? "translate-x-5" : ""
+                      }`}
+                    />
+                  </button>
+                  <span className="text-xs text-slate-500">
+                    {isVoiceMemoMode
+                      ? "On mobile, transcription appears after you tap Done."
+                      : showLiveTranscription
+                        ? "Show words as you speak."
+                        : "Only show what you said after you tap Done."}
+                  </span>
+                </div>
               </div>
               <div className="mt-3 flex-1 min-h-0 flex flex-col">
                 <label htmlFor="personaplex-text-prompt" className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1.5">
@@ -754,10 +786,11 @@ export const Personaplex = () => {
                     <input
                       ref={importFileInputRef}
                       type="file"
-                      accept=".json,application/json"
+                      accept=".json,.txt,.md,.markdown,.journal,.log,application/json,text/plain"
+                      multiple
                       onChange={handleImportFileChange}
                       className="hidden"
-                      aria-label="Import journals from file"
+                      aria-label="Import journal(s) or export file"
                     />
                     <button
                       type="button"

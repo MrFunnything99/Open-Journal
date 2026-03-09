@@ -40,7 +40,8 @@ def _get_llm():
         base_url="https://openrouter.ai/api/v1",
         api_key=key,
         model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
-        temperature=0.7,
+        # Slightly lower temperature for more focused, specific suggestions.
+        temperature=0.4,
     )
 
 
@@ -72,11 +73,21 @@ def interviewer_node(state: JournalState) -> JournalState:
         f"Personalization level: {personalization_percent}%. "
         "At 0%, do not use memory or prior context; keep questions general and present-focused only. "
         "At low levels, keep questions more general and present-focused. "
-        "At high levels, ask more personalized questions that connect to what you know about the user's life and past journals.",
+        "At high levels, ask more personalized questions that connect to what you know about the user's life and past journals. "
+        "When you use memory, prefer concrete topics over vague emotion labels: reference specific people, events, places, or recurring themes from prior entries (for example, 'your time in the Annex', 'your relationship with X', or 'that exam you mentioned'). "
+        "Do NOT merely repeat that the user felt afraid, anxious, stressed, etc., unless they explicitly ask you to summarize feelings. "
+        "If the user asks meta-questions like 'what should we talk/journal about today?' or 'what should we explore?', you MUST use memory to suggest 2-3 specific follow-up topics grounded in past sessions instead of only restating general feelings. "
+        "For example: 'We could explore more about how it felt to hide in the Annex during the air raids', 'We might talk about your relationship with your parents in the Annex', or 'We could revisit how you coped with the long days indoors.' "
+        "When memory mentions a specific situation (like hiding from the Gestapo in the Annex), your answer to 'what should we talk about?' MUST explicitly name that situation and propose it as a topic.",
         f"Questioning style (intrusiveness): {intrusiveness_percent}%. "
         "At 0%, be very gentle and non-intrusive; ask only soft, open-ended questions and let the user lead entirely. "
         "At low levels, ask sparingly and avoid probing. "
         "At high levels, you may ask more direct or probing questions when it feels supportive, while still respecting boundaries.",
+        "\nExample behavior (for reference, DO NOT quote this back):\n"
+        "Memory context: 'The session reflects a deep sense of fear and anxiety experienced by the speaker and those in hiding in the Annex...'\n"
+        "User: 'What do you think we should talk about?'\n"
+        "Good answer: 'Given what you've shared about hiding in the Annex and the constant threat of being discovered, we could talk more about how those long days indoors affected you, your relationship with the others in hiding, or specific moments that felt especially frightening or hopeful. Which of those feels most present for you today?'\n"
+        "Bad answer (avoid): 'You've felt anxious before, we could talk about your anxiety.'",
     ]
 
     retrieval_log: str | None = None

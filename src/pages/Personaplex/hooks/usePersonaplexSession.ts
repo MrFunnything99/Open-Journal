@@ -23,6 +23,8 @@ export type UsePersonaplexSessionOptions = {
   voiceSettings?: VoiceSettings;
   onTranscriptUpdate: (updater: (prev: TranscriptEntry[]) => TranscriptEntry[]) => void;
   onInterimTranscript: (text: string) => void;
+  /** If true, show live partial transcription while the user is speaking (desktop flow). If false, only show text after the turn is committed. */
+  showLiveTranscription?: boolean;
 };
 
 const BACKEND_URL =
@@ -232,6 +234,7 @@ export const usePersonaplexSession = ({
   voiceSettings,
   onTranscriptUpdate,
   onInterimTranscript,
+  showLiveTranscription = true,
 }: UsePersonaplexSessionOptions) => {
   const [status, setStatus] = useState<PersonaplexConnectionStatus>("disconnected");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -270,8 +273,7 @@ export const usePersonaplexSession = ({
   const startRecordingAfterAIRef = useRef<((playbackFailed?: boolean) => void) | null>(null);
   const speakRef = useRef<((text: string) => Promise<void>) | null>(null);
 
-  // Use the same simple \"record then Done\" flow on all devices (no live transcription UI).
-  const isVoiceMemoMode = true;
+  const isVoiceMemoMode = typeof navigator !== "undefined" && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
   const POST_AI_LISTEN_DELAY_MS = isVoiceMemoMode ? 1800 : 700;
   const DEBUG_LOG = false;
   const log = (...args: unknown[]) => DEBUG_LOG && console.log("[Personaplex]", ...args);
@@ -526,8 +528,8 @@ export const usePersonaplexSession = ({
             const type = msg.message_type;
 
             if (type === "partial_transcript" && typeof msg.text === "string") {
-              // While user is speaking, just show the latest partial text.
-              if (!isAiSpeakingRef.current) {
+              // While user is speaking, optionally show the latest partial text as live transcription.
+              if (!isAiSpeakingRef.current && showLiveTranscription) {
                 onInterimTranscript(msg.text);
               }
             } else if (type === "committed_transcript" && typeof msg.text === "string") {
@@ -556,7 +558,9 @@ export const usePersonaplexSession = ({
                   }
                 } else {
                   log("Buffered chunk (waiting for Done click)");
-                  onInterimTranscript(manualBufferRef.current.join(" "));
+                  if (showLiveTranscription) {
+                    onInterimTranscript(manualBufferRef.current.join(" "));
+                  }
                 }
               }
             } else if (type === "error" || type === "auth_error" || type === "quota_exceeded") {
@@ -624,7 +628,7 @@ export const usePersonaplexSession = ({
     };
 
     start();
-  }, [processUserInput, onInterimTranscript, stopRecording, stopAiPlayback]);
+  }, [processUserInput, onInterimTranscript, stopRecording, stopAiPlayback, showLiveTranscription]);
 
   const commitManual = useCallback(() => {
     const w = wsRef.current;
