@@ -11,11 +11,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import chromadb
+from google import genai
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-from langchain_openai import ChatOpenAI
-from voyageai import Client as VoyageClient
-
 # Paths
 CHROMA_PATH = Path(__file__).resolve().parent.parent / "chroma_data"
 COLLECTION_GIST = "gist_facts"
@@ -24,9 +22,7 @@ COLLECTION_CONSUMED = "consumed_content"
 
 # Clients (lazy init)
 _client: chromadb.PersistentClient | None = None
-_voyage: VoyageClient | None = None
-_llm: ChatOpenAI | None = None
-_recommendations_llm: ChatOpenAI | None = None
+_embeddings_client: genai.Client | None = None
 
 
 def _get_chroma() -> chromadb.PersistentClient:
@@ -37,45 +33,45 @@ def _get_chroma() -> chromadb.PersistentClient:
     return _client
 
 
-def _get_voyage() -> VoyageClient:
-    global _voyage
-    if _voyage is None:
-        key = os.getenv("VOYAGE_API_KEY")
+def _get_embeddings_client() -> genai.Client:
+    global _embeddings_client
+    if _embeddings_client is None:
+        key = os.getenv("GEMINI_API_KEY")
         if not key:
-            raise ValueError("VOYAGE_API_KEY is required. Get one at https://dash.voyageai.com/")
-        _voyage = VoyageClient(api_key=key)
-    return _voyage
+            raise ValueError(
+                "GEMINI_API_KEY is required for embeddings. See https://ai.google.dev/gemini-api/docs/get-started"
+            )
+        _embeddings_client = genai.Client(api_key=key)
+    return _embeddings_client
 
 
-def _get_llm() -> ChatOpenAI:
-    global _llm
-    if _llm is None:
-        key = os.getenv("OPENROUTER_API_KEY")
-        if not key:
-            raise ValueError("OPENROUTER_API_KEY is required. Get one at https://openrouter.ai/keys")
-        _llm = ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=key,
-            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
-            temperature=0.3,
-        )
-    return _llm
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    """
+    Embed a batch of texts using Gemini Embedding 2.
+    Returns a list of embedding vectors (one per text).
+    """
+    if not texts:
+        return []
+    client = _get_embeddings_client()
+    model = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2-preview")
+    result = client.models.embed_content(model=model, contents=texts)
+    return [emb.values for emb in result.embeddings]
 
 
-def _get_recommendations_llm() -> ChatOpenAI:
-    """Dedicated LLM for recommendations: uses Gemini for accurate article URLs (non-negotiable)."""
-    global _recommendations_llm
-    if _recommendations_llm is None:
-        key = os.getenv("OPENROUTER_API_KEY")
-        if not key:
-            raise ValueError("OPENROUTER_API_KEY is required for recommendations")
-        _recommendations_llm = ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=key,
-            model=os.getenv("RECOMMENDATIONS_MODEL", "google/gemini-3.1-pro-preview"),
-            temperature=0.2,
-        )
-    return _recommendations_llm
+def _call_gemini(prompt: str) -> str:
+    """
+    Call the primary Gemini chat model (Flash 3.1 by default) with a single text prompt.
+    Returns the response text (empty string on failure).
+    """
+    try:
+        client = _get_embeddings_client()
+        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash")
+        result = client.models.generate_content(model=model, contents=prompt)
+        text = getattr(result, "text", "") or ""
+        return text.strip()
+    except Exception as e:
+        print("[backend] _call_gemini error:", e)
+        return ""
 
 
 def _ensure_collections():
@@ -116,7 +112,6 @@ def add_consumed(
     """
     _ensure_collections()
     client = _get_chroma()
-    voyage = _get_voyage()
     ts = datetime.utcnow().isoformat() + "Z"
     ts_safe = ts.replace(":", "-").replace(".", "-")
     doc = f"User consumed {content_type}: {title}"
@@ -127,11 +122,7 @@ def add_consumed(
         doc += f" Completed: {date_completed}."
     if note:
         doc += f" Note: {note}"
-    emb = voyage.embed(
-        [doc],
-        model=os.getenv("VOYAGE_MODEL", "voyage-3"),
-        input_type="document",
-    ).embeddings[0]
+    emb = _embed_texts([doc])[0]
     col = client.get_collection(COLLECTION_CONSUMED)
     uid = f"consumed_{ts_safe}_{hash(title) % 10**8}"
     col.add(
@@ -163,7 +154,6 @@ def process_library_note(text: str, type_filter: str | None = None) -> int:
     type_hint = (type_filter or "").strip().lower()
     if type_hint not in ("book", "podcast", "article", "research"):
         type_hint = None
-    llm = _get_recommendations_llm()
     type_instruction = (
         f' Only output items of type "{type_hint}". Ignore any other media types in the text.'
         if type_hint
@@ -188,8 +178,8 @@ Rules:
 - "url" leave empty unless you know a real link. "liked" default true. "note" leave empty for now.
 """
     try:
-        response = llm.invoke(prompt)
-        text_out = str(getattr(response, "content", response)).strip()
+        text_out = _call_gemini(prompt)
+        text_out = str(text_out).strip()
         if text_out.startswith("```"):
             text_out = text_out.split("```")[1]
             if text_out.startswith("json"):
@@ -378,8 +368,7 @@ def delete_consumed(item_id: str) -> bool:
 
 
 def _extract_session_data(transcript: str) -> dict:
-    """Use OpenRouter LLM to extract summary and facts from transcript."""
-    llm = _get_llm()
+    """Use Gemini LLM to extract summary and facts from transcript."""
     prompt = f"""You are a journal analyst. Extract structured data from this journal session transcript.
 
 Transcript:
@@ -397,23 +386,36 @@ Rules:
 - summary: exactly 3 sentences, capture emotions and themes
 - facts: list of hard, verifiable facts about the user (job, relationships, preferences, life events). Empty list if none.
 """
-    response = llm.invoke(prompt)
-    text = response.content.strip()
+    text = _call_gemini(prompt)
+    text = (text or "").strip()
+    if not text:
+        # Fall back to empty summary/facts if LLM unavailable
+        return {"summary": "", "facts": []}
     # Strip markdown code blocks if present
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
-    return json.loads(text)
+    text = text.strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        print("[backend] _extract_session_data JSON error:", e)
+        return {"summary": "", "facts": []}
+    if not isinstance(data, dict):
+        return {"summary": "", "facts": []}
+    # Ensure keys exist
+    data.setdefault("summary", "")
+    data.setdefault("facts", [])
+    return data
 
 
 def save_session_data(session_id: str, transcript: str) -> None:
     """
-    Extract summary + facts from transcript via OpenRouter, embed via Voyage, save to ChromaDB.
+    Extract summary + facts from transcript via OpenRouter, embed via Gemini embeddings, save to ChromaDB.
     """
     _ensure_collections()
     client = _get_chroma()
-    voyage = _get_voyage()
 
     data = _extract_session_data(transcript)
     summary = data.get("summary", "")
@@ -424,11 +426,7 @@ def save_session_data(session_id: str, transcript: str) -> None:
     # Episodic: add summary with metadata
     if summary:
         ep_col = client.get_collection(COLLECTION_EPISODIC)
-        summary_emb = voyage.embed(
-            [summary],
-            model=os.getenv("VOYAGE_MODEL", "voyage-3"),
-            input_type="document",
-        ).embeddings[0]
+        summary_emb = _embed_texts([summary])[0]
         ep_id = f"{session_id}_ep_{ts.replace(':', '-').replace('.', '-')}"
         ep_col.add(
             ids=[ep_id],
@@ -440,11 +438,7 @@ def save_session_data(session_id: str, transcript: str) -> None:
     # Gist: add each fact
     if facts:
         gist_col = client.get_collection(COLLECTION_GIST)
-        fact_embs = voyage.embed(
-            facts,
-            model=os.getenv("VOYAGE_MODEL", "voyage-3"),
-            input_type="document",
-        ).embeddings
+        fact_embs = _embed_texts(facts)
         ts_safe = ts.replace(":", "-").replace(".", "-")
         gist_col.add(
             ids=[f"{session_id}_gist_{i}_{ts_safe}" for i in range(len(facts))],
@@ -463,9 +457,7 @@ def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 
         return "None."
     _ensure_collections()
     client = _get_chroma()
-    voyage = _get_voyage()
-    model = os.getenv("VOYAGE_MODEL", "voyage-3")
-    query_emb = voyage.embed([query.strip()], model=model, input_type="document").embeddings[0]
+    query_emb = _embed_texts([query.strip()])[0]
 
     parts = []
     try:
@@ -540,7 +532,6 @@ def generate_memory_mermaid(gist_facts: list[str], episodic_summaries: list[str]
     Empty
     Start journaling to see facts and themes here"""
 
-    llm = _get_llm()
     facts_blob = "\n".join(f"- {f}" for f in (gist_facts or [])[:50])
     summaries_blob = "\n".join(f"- {s}" for s in (episodic_summaries or [])[:30])
 
@@ -559,8 +550,8 @@ Instructions:
 - Use simple labels; avoid long sentences. Use parentheses for the root: root((My journal)).
 - Maximum 30–40 nodes total to keep the diagram clean."""
 
-    response = llm.invoke(prompt)
-    code = response.content.strip()
+    code = _call_gemini(prompt)
+    code = (code or "").strip()
     if code.startswith("```"):
         lines = code.split("\n")
         if lines[0].startswith("```"):
@@ -600,7 +591,6 @@ def _parse_recommendation_json(text: str, default: list) -> list:
 
 def _books_agent(facts_blob: str, summaries_blob: str, consumed: str) -> list:
     """Dedicated agent for book recommendations only."""
-    llm = _get_recommendations_llm()
     prompt = f"""You are a book curator. Based on this person's journal-derived memory and what they have already read, suggest 3–5 books they might find helpful or comforting.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
@@ -613,8 +603,8 @@ JOURNAL SESSION SUMMARIES:
 
 Rules: Do NOT suggest books they have already consumed. For each book give title, author, and a short "reason" (one sentence) tied to their life or journal themes. No URLs.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "..."}}, ...]"""
-    response = llm.invoke(prompt)
-    return _parse_recommendation_json(response.content, [])
+    text = _call_gemini(prompt)
+    return _parse_recommendation_json(text, [])
 
 
 LISTEN_NOTES_BASE = "https://listen-api.listennotes.com/api/v2"
@@ -656,7 +646,6 @@ def _podcasts_agent(facts_blob: str, summaries_blob: str, consumed: str) -> list
     """Dedicated podcast agent: uses Listen Notes API for real episode links when key is set."""
     api_key = (os.getenv("LISTENNOTES_API_KEY") or "").strip()
     if api_key:
-        llm = _get_recommendations_llm()
         prompt = f"""Based on this person's journal-derived memory and what they have already listened to, suggest 2–3 short search queries (topics or themes) to find relevant podcast episodes. Examples: "mindfulness sleep", "anxiety therapy", "Huberman Lab sleep".
 
 FACTS AND THEMES FROM THEIR JOURNALS:
@@ -669,8 +658,7 @@ JOURNAL SESSION SUMMARIES:
 
 Return ONLY a JSON array of 2–3 short search query strings, no markdown. Example: ["mindfulness and sleep", "therapy for anxiety"]"""
         try:
-            response = llm.invoke(prompt)
-            text = response.content.strip()
+            text = _call_gemini(prompt)
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):
@@ -702,7 +690,6 @@ Return ONLY a JSON array of 2–3 short search query strings, no markdown. Examp
                 break
         if out:
             return out
-    llm = _get_recommendations_llm()
     prompt = f"""You are a podcast curator. Based on this person's journal-derived memory and what they have already listened to, suggest 3–5 specific podcast episodes (show + episode).
 
 FACTS AND THEMES FROM THEIR JOURNALS:
@@ -715,13 +702,12 @@ JOURNAL SESSION SUMMARIES:
 
 Rules: Use "author" for the show name and "title" for the episode. Provide direct "url" (Spotify or Apple Podcasts episode link) when you know it; otherwise leave "url" empty. Do NOT suggest items they have already consumed. For each give a short "reason" (one sentence).
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    response = llm.invoke(prompt)
-    return _parse_recommendation_json(response.content, [])
+    text = _call_gemini(prompt)
+    return _parse_recommendation_json(text, [])
 
 
 def _articles_agent(facts_blob: str, summaries_blob: str, consumed: str) -> list:
     """Dedicated agent for article recommendations only. Article URLs must work (non-negotiable)."""
-    llm = _get_recommendations_llm()
     prompt = f"""You are an article curator. Based on this person's journal-derived memory and what they have already read, suggest 3–5 news articles or long-reads.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
@@ -734,13 +720,12 @@ JOURNAL SESSION SUMMARIES:
 
 CRITICAL: Every article MUST have a "url" that is a real, working link to the actual article page—no 404s. Use only URLs you are certain exist (exact paths from nytimes.com, theatlantic.com, healthline.com, bbc.com, nature.com, apa.org, etc.). Do NOT guess or construct URLs. If you cannot provide a verified working URL for an article, do NOT include it. For each give title, author/source, reason, and url.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    response = llm.invoke(prompt)
-    return _parse_recommendation_json(response.content, [])
+    text = _call_gemini(prompt)
+    return _parse_recommendation_json(text, [])
 
 
 def _research_agent(facts_blob: str, summaries_blob: str, consumed: str) -> list:
     """Dedicated agent for research paper recommendations only."""
-    llm = _get_recommendations_llm()
     prompt = f"""You are a research curator. Based on this person's journal-derived memory and what they have already read, suggest 3–5 academic or scientific research papers (peer-reviewed articles, studies, or review papers) they might find relevant or helpful.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
@@ -753,8 +738,8 @@ JOURNAL SESSION SUMMARIES:
 
 Rules: Do NOT suggest papers they have already consumed. For each paper give: "title" (paper title), "author" (lead author or author list, or journal name and year), "reason" (one sentence on why it fits their interests), and "url" (working link to the paper—DOI link like https://doi.org/10.1234/... or publisher link to the abstract/full text). Only include papers where you can provide a real, working url (doi.org, PubMed, PMC, journal websites). Do not guess URLs.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    response = llm.invoke(prompt)
-    return _parse_recommendation_json(response.content, [])
+    text = _call_gemini(prompt)
+    return _parse_recommendation_json(text, [])
 
 
 def generate_recommendations() -> dict:

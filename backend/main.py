@@ -38,6 +38,7 @@ from library import (
     update_consumed,
     wipe_memory,
 )
+from google import genai
 
 # In-memory session store (minimal for 1hr sprint; replace with Redis/DB later)
 sessions: dict[str, list] = {}
@@ -55,12 +56,16 @@ def get_or_create_session(session_id: Optional[str]) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Avoid proxy 403s: send API calls (Gemini, Listen Notes) direct, not via system proxy
+    for v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ.pop(v, None)
+    os.environ["NO_PROXY"] = "*"
     # Startup: log whether env is loaded (no secrets)
-    key = os.getenv("OPENROUTER_API_KEY")
+    key = os.getenv("GEMINI_API_KEY")
     if key and key.strip():
-        print("[backend] OPENROUTER_API_KEY is set (ready for /chat)")
+        print("[backend] GEMINI_API_KEY is set (ready for /chat and LLM ops)")
     else:
-        print("[backend] WARNING: OPENROUTER_API_KEY is missing. Set it in .env at project root and restart.")
+        print("[backend] WARNING: GEMINI_API_KEY is missing. Set it in .env at project root and restart.")
     yield
     # Cleanup if needed
     pass
@@ -278,28 +283,23 @@ async def infer_entry_date(req: InferEntryDateRequest):
     Use an LLM to infer the best-guess date/time when a journal entry was written.
     Returns ISO 8601 string or null if unclear.
     """
-    key = os.getenv("OPENROUTER_API_KEY")
+    key = os.getenv("GEMINI_API_KEY")
     if not key or not key.strip():
         return InferEntryDateResponse(date=None)
     try:
-        from langchain_openai import ChatOpenAI
-        from langchain_core.messages import HumanMessage, SystemMessage
-        llm = ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=key,
-            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
-            temperature=0,
-        )
+        client = genai.Client(api_key=key)
+        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash")
         # Truncate very long text to avoid token limits
         text = (req.text or "")[:8000].strip()
         if not text:
             return InferEntryDateResponse(date=None)
-        messages = [
-            SystemMessage(content=INFER_DATE_SYSTEM),
-            HumanMessage(content=text),
-        ]
-        result = await asyncio.to_thread(llm.invoke, messages)
-        raw = getattr(result, "content", str(result))
+        prompt = INFER_DATE_SYSTEM + "\n\nEntry:\n" + text
+
+        def _call():
+            return client.models.generate_content(model=model, contents=prompt)
+
+        result = await asyncio.to_thread(_call)
+        raw = getattr(result, "text", "")
         if isinstance(raw, list):
             raw = " ".join(c.get("text", str(c)) for c in raw if isinstance(c, dict))
         raw = (raw or "").strip()

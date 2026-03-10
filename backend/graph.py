@@ -13,7 +13,7 @@ except ImportError:
     from typing_extensions import NotRequired
 
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from langgraph.graph import StateGraph, END
@@ -31,18 +31,41 @@ class JournalState(TypedDict):
 
 
 def _get_llm():
+    """Return a lightweight wrapper around Gemini Flash 3.1 with an .invoke(messages) API."""
     import os
-    from langchain_openai import ChatOpenAI
-    key = os.getenv("OPENROUTER_API_KEY")
+    from google import genai
+
+    key = os.getenv("GEMINI_API_KEY")
     if not key:
-        raise ValueError("OPENROUTER_API_KEY is required")
-    return ChatOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=key,
-        model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
-        # Slightly lower temperature for more focused, specific suggestions.
-        temperature=0.4,
-    )
+        raise ValueError("GEMINI_API_KEY is required")
+    client = genai.Client(api_key=key)
+    model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash")
+
+    class _GeminiWrapper:
+        def __init__(self, client: genai.Client, model: str):
+            self._client = client
+            self._model = model
+
+        def invoke(self, messages: list[BaseMessage]):
+            # Flatten LangChain messages into a simple chat transcript prompt.
+            parts: list[str] = []
+            for m in messages:
+                role = "User" if isinstance(m, HumanMessage) else "Assistant"
+                content = getattr(m, "content", str(m))
+                if isinstance(content, list):
+                    content = " ".join(
+                        c.get("text", str(c)) for c in content if isinstance(c, dict)
+                    )
+                parts.append(f"{role}: {content}")
+            prompt = "\n\n".join(parts)
+            result = self._client.models.generate_content(
+                model=self._model,
+                contents=prompt,
+            )
+            text = getattr(result, "text", "") or ""
+            return AIMessage(content=text.strip())
+
+    return _GeminiWrapper(client, model)
 
 
 def _last_user_text(messages: list) -> str:
