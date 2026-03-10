@@ -29,10 +29,13 @@ from library import (
     COLLECTION_GIST,
     _get_chroma,
     add_consumed,
+    delete_consumed,
     generate_memory_mermaid,
     generate_recommendations,
     get_memory_for_visualization,
+    list_consumed,
     save_session_data,
+    update_consumed,
     wipe_memory,
 )
 
@@ -145,6 +148,21 @@ class ConsumedRequest(BaseModel):
 
 class ConsumedResponse(BaseModel):
     ok: bool
+
+
+class LibraryNoteRequest(BaseModel):
+    text: str
+    type: Optional[str] = None  # "book" | "podcast" | "article" | "research" to restrict to one category
+
+
+class LibraryNoteResponse(BaseModel):
+    ok: bool
+    items_added: int
+
+
+class LibraryItemUpdate(BaseModel):
+    date_completed: Optional[str] = None
+    note: Optional[str] = None
 
 
 class MemoryDiagramResponse(BaseModel):
@@ -323,14 +341,22 @@ async def memory_stats():
     )
 
 
+RECOMMENDATIONS_TIMEOUT_SEC = 120
+
 @app.get("/recommendations", response_model=RecommendationsResponse)
 async def get_recommendations():
     """
     Generate personalized book, podcast, and article recommendations from journal memory
-    and what the user has already consumed/liked.
+    and what the user has already consumed/liked. May take 30–90s; runs with a timeout to avoid connection resets.
     """
     try:
-        data = await asyncio.to_thread(generate_recommendations)
+        data = await asyncio.wait_for(
+            asyncio.to_thread(generate_recommendations),
+            timeout=RECOMMENDATIONS_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        print("[backend] /recommendations timed out after", RECOMMENDATIONS_TIMEOUT_SEC, "s")
+        return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[])
     except Exception as e:
         print("[backend] /recommendations error:", e)
         return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[])
@@ -363,6 +389,67 @@ async def mark_consumed(req: ConsumedRequest):
     except Exception as e:
         print("[backend] /recommendations/consumed error:", e)
         return ConsumedResponse(ok=False)
+
+
+@app.get("/library")
+async def get_library():
+    """
+    Return consumed items grouped by type for the Library UI.
+    """
+    try:
+        data = await asyncio.to_thread(list_consumed)
+        return data
+    except Exception as e:
+        print("[backend] GET /library error:", e)
+        return {"books": [], "podcasts": [], "articles": [], "research": []}
+
+
+@app.patch("/library/{item_id}")
+async def update_library_item(item_id: str, req: LibraryItemUpdate):
+    """
+    Update date_completed and/or note for a library item (Chroma id).
+    """
+    try:
+        ok = await asyncio.to_thread(
+            update_consumed,
+            item_id,
+            date_completed=req.date_completed,
+            note=req.note,
+        )
+        return {"ok": ok}
+    except Exception as e:
+        print("[backend] PATCH /library error:", e)
+        return {"ok": False}
+
+
+@app.delete("/library/{item_id}")
+async def delete_library_item(item_id: str):
+    """
+    Remove a library item from the consumed collection.
+    """
+    try:
+        ok = await asyncio.to_thread(delete_consumed, item_id)
+        return {"ok": ok}
+    except Exception as e:
+        print("[backend] DELETE /library error:", e)
+        return {"ok": False}
+
+
+@app.post("/library-notes", response_model=LibraryNoteResponse)
+async def library_notes(req: LibraryNoteRequest):
+    """
+    Library helper endpoint: user can paste titles or notes about books, podcasts,
+    articles, or research they've read. An agent organizes this into structured
+    consumed items to improve future recommendations.
+    """
+    try:
+        from library import process_library_note
+
+        count = await asyncio.to_thread(process_library_note, req.text, req.type)
+        return LibraryNoteResponse(ok=count > 0, items_added=count)
+    except Exception as e:
+        print("[backend] /library-notes error:", e)
+        return LibraryNoteResponse(ok=False, items_added=0)
 
 
 @app.post("/memory-wipe")

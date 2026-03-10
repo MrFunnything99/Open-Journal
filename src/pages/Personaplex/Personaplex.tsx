@@ -67,6 +67,7 @@ const INTRUSIVENESS_LABELS: Record<number, string> = {
 const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Rachel
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
 const RECOMMENDATIONS_CACHE_KEY = "openjournal-recommendations-cache";
+const LIBRARY_CACHE_KEY = "openjournal-library-cache";
 
 /** Fallback when /api/voices is unavailable (e.g. API server not running) */
 const FALLBACK_VOICES: VoiceOption[] = [
@@ -122,6 +123,63 @@ export const Personaplex = () => {
   const [recommendationsLoading, setRecommendationsLoading] = useState(false);
   const [consumedIds, setConsumedIds] = useState<Set<string>>(new Set());
   const [removingKeys, setRemovingKeys] = useState<Set<string>>(new Set());
+  const [showLibrary, setShowLibrary] = useState(false);
+  const [libraryExpandedCategory, setLibraryExpandedCategory] = useState<"book" | "podcast" | "article" | "research" | null>(null);
+  const [libraryDraftText, setLibraryDraftText] = useState("");
+  const [librarySubmitting, setLibrarySubmitting] = useState(false);
+  type LibraryItem = { id: string; title: string; author?: string; date_completed?: string; note?: string };
+  const [libraryItems, setLibraryItems] = useState<{ books: LibraryItem[]; podcasts: LibraryItem[]; articles: LibraryItem[]; research: LibraryItem[] }>({
+    books: [], podcasts: [], articles: [], research: [],
+  });
+  const [libraryEditingId, setLibraryEditingId] = useState<string | null>(null);
+  const [libraryEditDate, setLibraryEditDate] = useState("");
+  const [libraryEditNote, setLibraryEditNote] = useState("");
+  const [libraryUpdateSaving, setLibraryUpdateSaving] = useState(false);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const fetchLibrary = useCallback((showCachedFirst = false): Promise<void> => {
+    if (showCachedFirst) {
+      try {
+        const cached = localStorage.getItem(LIBRARY_CACHE_KEY);
+        if (cached) {
+          const parsed = JSON.parse(cached) as { books?: unknown; podcasts?: unknown; articles?: unknown; research?: unknown };
+          if (parsed && typeof parsed === "object") {
+            setLibraryItems({
+              books: Array.isArray(parsed.books) ? parsed.books as LibraryItem[] : [],
+              podcasts: Array.isArray(parsed.podcasts) ? parsed.podcasts as LibraryItem[] : [],
+              articles: Array.isArray(parsed.articles) ? parsed.articles as LibraryItem[] : [],
+              research: Array.isArray(parsed.research) ? parsed.research as LibraryItem[] : [],
+            });
+          }
+        }
+      } catch {
+        /* ignore cache parse errors */
+      }
+    }
+    return fetch(`${BACKEND_URL}/library`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load library"))))
+      .then((data: { books?: LibraryItem[]; podcasts?: LibraryItem[]; articles?: LibraryItem[]; research?: LibraryItem[] }) => {
+        const next = {
+          books: Array.isArray(data.books) ? data.books : [],
+          podcasts: Array.isArray(data.podcasts) ? data.podcasts : [],
+          articles: Array.isArray(data.articles) ? data.articles : [],
+          research: Array.isArray(data.research) ? data.research : [],
+        };
+        setLibraryItems(next);
+        try {
+          localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(next));
+        } catch {
+          /* ignore */
+        }
+      })
+      .catch(() => {
+        if (!showCachedFirst) setLibraryItems({ books: [], podcasts: [], articles: [], research: [] });
+      });
+  }, []);
+  useEffect(() => {
+    if (!showLibrary) return;
+    setLibraryLoading(true);
+    fetchLibrary(true).finally(() => setLibraryLoading(false));
+  }, [showLibrary, fetchLibrary]);
 
   const {
     entries,
@@ -187,7 +245,9 @@ export const Personaplex = () => {
               research: parsed.research ?? [],
             });
           setRecommendationsLoading(true);
-          fetch(`${BACKEND_URL}/recommendations`)
+          const ac = new AbortController();
+          const timeoutId = setTimeout(() => ac.abort(), 125000);
+          fetch(`${BACKEND_URL}/recommendations`, { signal: ac.signal })
             .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
             .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
               const next = {
@@ -200,7 +260,10 @@ export const Personaplex = () => {
               localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
             })
             .catch(() => {})
-            .finally(() => setRecommendationsLoading(false));
+            .finally(() => {
+              clearTimeout(timeoutId);
+              setRecommendationsLoading(false);
+            });
           return;
         }
       }
@@ -208,7 +271,9 @@ export const Personaplex = () => {
       /* ignore cache parse errors */
     }
     setRecommendationsLoading(true);
-    fetch(`${BACKEND_URL}/recommendations`)
+    const ac = new AbortController();
+    const timeoutId = setTimeout(() => ac.abort(), 125000);
+    fetch(`${BACKEND_URL}/recommendations`, { signal: ac.signal })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
       .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
         const next = {
@@ -225,7 +290,10 @@ export const Personaplex = () => {
         }
       })
       .catch(() => setRecommendations({ books: [], podcasts: [], articles: [], research: [] }))
-      .finally(() => setRecommendationsLoading(false));
+      .finally(() => {
+        clearTimeout(timeoutId);
+        setRecommendationsLoading(false);
+      });
   }, []);
 
   useEffect(() => {
@@ -269,13 +337,18 @@ export const Personaplex = () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           type,
-          title: item.title,
-          author: item.author,
-          url: item.url,
+          title: item.title ?? "",
+          author: item.author ?? undefined,
+          url: item.url ?? undefined,
           liked: true,
         }),
       })
-        .then((r) => r.ok && r.json())
+        .then(async (r) => {
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(typeof data?.detail === "string" ? data.detail : "Failed to save.");
+          if (data && data.ok === false) throw new Error("Failed to save.");
+          return data;
+        })
         .then(() => {
           setConsumedIds((prev) => new Set(prev).add(key));
           setToastMessage(type === "book" || type === "article" || type === "research" ? "Marked as read." : type === "podcast" ? "Marked as listened." : "Marked as read.");
@@ -297,7 +370,10 @@ export const Personaplex = () => {
             });
           }, removeAfter);
         })
-        .catch(() => setToastMessage("Failed to save."));
+        .catch((err) => {
+          setToastMessage(err?.message === "Failed to save." ? "Failed to save." : "Could not mark as read. Try again.");
+          setTimeout(() => setToastMessage(null), 4000);
+        });
     },
     [consumedIds]
   );
@@ -1079,18 +1155,300 @@ export const Personaplex = () => {
                 Based on your journal memory and what you’ve already read or listened to. Mark items as read/listened so future suggestions get better.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => fetchRecommendations(false)}
-                  disabled={recommendationsLoading}
-                  className="flex-shrink-0 px-3 py-2 rounded-lg bg-slate-700/50 text-slate-400 text-sm font-medium hover:bg-slate-600/50 disabled:opacity-50 transition-colors"
-                >
-                  {recommendationsLoading ? "Updating…" : "Refresh recommendations"}
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => fetchRecommendations(false)}
+                    disabled={recommendationsLoading}
+                    className="px-3 py-2 rounded-lg bg-slate-700/50 text-slate-400 text-sm font-medium hover:bg-slate-600/50 disabled:opacity-50 transition-colors"
+                  >
+                    {recommendationsLoading ? "Updating…" : "Refresh recommendations"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowLibrary((prev) => !prev)}
+                    className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors border ${
+                      showLibrary
+                        ? "bg-violet-600/80 text-white border-violet-500"
+                        : "bg-slate-900/40 text-slate-300 border-slate-600 hover:bg-slate-800/60"
+                    }`}
+                  >
+                    Library
+                  </button>
+                </div>
               </div>
               <div className="flex-1 min-h-0 overflow-auto">
-              {recommendationsLoading && !recommendations.books.length && !recommendations.podcasts.length && !recommendations.articles.length && !recommendations.research.length ? (
-                <p className="text-slate-500 text-sm">Loading recommendations…</p>
+              {showLibrary ? (
+                <div className="space-y-2 pb-4">
+                  <h3 className="text-base font-medium text-slate-300 uppercase tracking-wider">
+                    My Library
+                  </h3>
+                  <p className="text-xs text-slate-500 mb-4">
+                    Add titles per category. Use the + next to each to paste a list; an agent will organize them for better recommendations.
+                  </p>
+                  {libraryLoading && libraryItems.books.length === 0 && libraryItems.podcasts.length === 0 && libraryItems.articles.length === 0 && libraryItems.research.length === 0 ? (
+                    <p className="text-slate-500 text-sm py-4">Loading library…</p>
+                  ) : null}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    {(["book", "podcast", "article", "research"] as const).map((cat) => {
+                      const key = cat === "book" ? "books" : cat === "podcast" ? "podcasts" : cat === "article" ? "articles" : "research";
+                      const items = libraryItems[key] ?? [];
+                      const sectionTitle = cat === "book" ? "Books" : cat === "podcast" ? "Podcasts" : cat === "article" ? "News & articles" : "Research papers";
+                      return (
+                        <section
+                          key={cat}
+                          className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex flex-col"
+                        >
+                          <div className="flex items-center justify-between gap-2 mb-3">
+                            <h4 className="text-sm font-medium text-slate-400 uppercase tracking-wider">
+                              {sectionTitle}
+                            </h4>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setLibraryExpandedCategory((prev) => (prev === cat ? null : cat));
+                                if (libraryExpandedCategory !== cat) setLibraryDraftText("");
+                              }}
+                              className="p-1.5 rounded-lg bg-emerald-600/90 hover:bg-emerald-500 text-white transition-colors"
+                              aria-label={`Add ${cat}`}
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                              </svg>
+                            </button>
+                          </div>
+                          <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
+                            {items.length === 0 && libraryExpandedCategory !== cat ? (
+                              <p className="text-slate-500 text-xs">No items yet. Use + to add.</p>
+                            ) : (
+                              items.map((entry, i) => (
+                                <div
+                                  key={entry.id || `${key}-${i}-${entry.title}`}
+                                  className="rounded-lg bg-slate-800/50 border border-slate-700/50 cursor-pointer hover:border-slate-600 transition-colors"
+                                >
+                                  <button
+                                    type="button"
+                                    className="w-full text-left p-3"
+                                    onClick={() => {
+                                      setLibraryEditingId(entry.id);
+                                      setLibraryEditDate(entry.date_completed ?? "");
+                                      setLibraryEditNote(entry.note ?? "");
+                                    }}
+                                  >
+                                    <p className="text-slate-200 text-sm font-medium">{entry.title}</p>
+                                    {entry.author && <p className="text-slate-500 text-xs mt-0.5">{entry.author}</p>}
+                                    {entry.date_completed && (
+                                      <p className="text-[10px] text-slate-400 mt-1">Completed: {entry.date_completed}</p>
+                                    )}
+                                    <div className="mt-1.5 min-h-[1.25rem]">
+                                      {entry.note ? (
+                                        <p className="text-xs text-slate-400 line-clamp-2">{entry.note}</p>
+                                      ) : (
+                                        <p className="text-[10px] text-slate-500 italic">Add note…</p>
+                                      )}
+                                    </div>
+                                    <p className="text-[10px] text-slate-500 mt-1">Completed</p>
+                                  </button>
+                                </div>
+                              ))
+                            )}
+                          </div>
+                          {libraryExpandedCategory === cat ? (
+                            <div className="mt-3 pt-3 border-t border-slate-700/50 flex flex-col">
+                              <textarea
+                                value={libraryDraftText}
+                                onChange={(e) => setLibraryDraftText(e.target.value)}
+                                rows={3}
+                                placeholder={
+                                  cat === "book"
+                                    ? "Paste book titles, one per line\n e.g. Dune, Frank Herbert\n The Body Keeps the Score"
+                                    : cat === "podcast"
+                                      ? "Paste podcast or episode names\n e.g. Huberman Lab – Sleep"
+                                      : cat === "article"
+                                        ? "Paste article titles or URLs"
+                                        : "Paste paper titles or citations"
+                                }
+                                className="w-full px-3 py-2 rounded-lg bg-slate-950/70 border border-slate-700/70 text-slate-200 text-xs placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-y mb-2"
+                              />
+                              <div className="flex gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (!libraryDraftText.trim() || librarySubmitting) return;
+                                    setLibrarySubmitting(true);
+                                    const payload = libraryDraftText.trim();
+                                    fetch(`${BACKEND_URL}/library-notes`, {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ text: payload, type: cat }),
+                                    })
+                                      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Library update failed"))))
+                                      .then((data: { ok?: boolean; items_added?: number }) => {
+                                        const added = data?.items_added ?? 0;
+                                        setLibraryDraftText("");
+                                        setLibraryExpandedCategory(null);
+                                        if (added > 0) fetchLibrary();
+                                        setToastMessage(added > 0 ? `Added ${added} to ${sectionTitle}.` : "No items recognized; try clearer titles.");
+                                        setTimeout(() => setToastMessage(null), 4000);
+                                      })
+                                      .catch(() => {
+                                        setToastMessage("Library update failed.");
+                                        setTimeout(() => setToastMessage(null), 4000);
+                                      })
+                                      .finally(() => setLibrarySubmitting(false));
+                                  }}
+                                  disabled={librarySubmitting || !libraryDraftText.trim()}
+                                  className="px-3 py-1.5 rounded-lg bg-violet-600 text-white text-xs font-medium hover:bg-violet-500 disabled:opacity-50"
+                                >
+                                  {librarySubmitting ? "Adding…" : "Add"}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setLibraryExpandedCategory(null);
+                                    setLibraryDraftText("");
+                                  }}
+                                  className="px-3 py-1.5 rounded-lg bg-slate-700/60 text-slate-400 text-xs font-medium hover:bg-slate-600/60"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : null}
+                        </section>
+                      );
+                    })}
+                  </div>
+                  {/* Library item edit modal */}
+                  {libraryEditingId ? (() => {
+                    const editingEntry = [...libraryItems.books, ...libraryItems.podcasts, ...libraryItems.articles, ...libraryItems.research].find((e) => e.id === libraryEditingId);
+                    return (
+                      <div
+                        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="library-modal-title"
+                      >
+                        <div
+                          className="absolute inset-0 bg-black/60"
+                          onClick={() => {
+                            setLibraryEditingId(null);
+                            setLibraryEditDate("");
+                            setLibraryEditNote("");
+                          }}
+                        />
+                        <div className="relative bg-slate-900 border border-slate-700 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] flex flex-col">
+                          <div className="p-4 border-b border-slate-700">
+                            <h2 id="library-modal-title" className="text-slate-200 font-medium text-lg truncate">
+                              {editingEntry?.title ?? "Library item"}
+                            </h2>
+                          </div>
+                          <div className="p-4 flex-1 min-h-0 overflow-y-auto flex flex-col gap-4">
+                            <div>
+                              <label className="block text-xs text-slate-500 uppercase tracking-wider mb-2">Notes</label>
+                              <textarea
+                                value={libraryEditNote}
+                                onChange={(e) => setLibraryEditNote(e.target.value)}
+                                rows={10}
+                                placeholder="How you felt, what stood out — used for better recommendations."
+                                className="w-full px-3 py-2.5 rounded-lg bg-slate-950 border border-slate-700 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50 focus:border-teal-500/50 resize-y min-h-[200px]"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs text-slate-500 uppercase tracking-wider mb-2">Date completed</label>
+                              <input
+                                type="text"
+                                value={libraryEditDate}
+                                onChange={(e) => setLibraryEditDate(e.target.value)}
+                                placeholder="Year e.g. 2024 or 2024-06"
+                                className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50 focus:border-teal-500/50"
+                              />
+                            </div>
+                          </div>
+                          <div className="p-4 border-t border-slate-700 flex items-center justify-between gap-4">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (!libraryEditingId || libraryUpdateSaving) return;
+                                if (!confirm("Remove from library and mark as unread? It may be recommended again.")) return;
+                                setLibraryUpdateSaving(true);
+                                fetch(`${BACKEND_URL}/library/${encodeURIComponent(libraryEditingId)}`, { method: "DELETE" })
+                                  .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Delete failed"))))
+                                  .then((data: { ok?: boolean }) => {
+                                    if (data?.ok !== false) {
+                                      fetchLibrary();
+                                      setLibraryEditingId(null);
+                                      setLibraryEditDate("");
+                                      setLibraryEditNote("");
+                                      setToastMessage("Removed.");
+                                      setTimeout(() => setToastMessage(null), 2000);
+                                    }
+                                  })
+                                  .catch(() => {
+                                    setToastMessage("Failed to remove.");
+                                    setTimeout(() => setToastMessage(null), 3000);
+                                  })
+                                  .finally(() => setLibraryUpdateSaving(false));
+                              }}
+                              disabled={libraryUpdateSaving}
+                              className="text-red-400 hover:text-red-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-red-500/50 rounded px-2 py-1 disabled:opacity-50"
+                            >
+                              Delete / Mark unread
+                            </button>
+                            <div className="flex gap-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setLibraryEditingId(null);
+                                  setLibraryEditDate("");
+                                  setLibraryEditNote("");
+                                }}
+                                className="px-4 py-2 rounded-lg bg-slate-800/80 text-slate-300 text-sm font-medium hover:bg-slate-700/80 border border-slate-600 focus:outline-none focus:ring-2 focus:ring-slate-500/50"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (!libraryEditingId || libraryUpdateSaving) return;
+                                  setLibraryUpdateSaving(true);
+                                  fetch(`${BACKEND_URL}/library/${encodeURIComponent(libraryEditingId)}`, {
+                                    method: "PATCH",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({
+                                      date_completed: libraryEditDate.trim(),
+                                      note: libraryEditNote.trim(),
+                                    }),
+                                  })
+                                    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Update failed"))))
+                                    .then((data: { ok?: boolean }) => {
+                                      if (data?.ok !== false) {
+                                        fetchLibrary();
+                                        setLibraryEditingId(null);
+                                        setToastMessage("Saved.");
+                                        setTimeout(() => setToastMessage(null), 2000);
+                                      }
+                                    })
+                                    .catch(() => {
+                                      setToastMessage("Failed to save.");
+                                      setTimeout(() => setToastMessage(null), 3000);
+                                    })
+                                    .finally(() => setLibraryUpdateSaving(false));
+                                }}
+                                disabled={libraryUpdateSaving}
+                                className="px-4 py-2 rounded-lg bg-teal-600 text-white text-sm font-medium hover:bg-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50 disabled:opacity-50"
+                              >
+                                {libraryUpdateSaving ? "Saving…" : "Save"}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })() : null}
+                </div>
+              ) : recommendationsLoading && !recommendations.books.length && !recommendations.podcasts.length && !recommendations.articles.length && !recommendations.research.length ? (
+                <p className="text-slate-500 text-sm">Loading recommendations… This can take up to a minute.</p>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 pb-4">
                   {/* Books */}

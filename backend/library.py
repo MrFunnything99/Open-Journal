@@ -106,10 +106,13 @@ def add_consumed(
     author: str | None = None,
     url: str | None = None,
     liked: bool = True,
+    note: str | None = None,
+    date_completed: str | None = None,
 ) -> None:
     """
-    Record that the user has read/listened to a recommendation (book, podcast, article).
+    Record that the user has read/listened to a recommendation (book, podcast, article, research).
     Stored in Chroma for the recommendation agent to avoid re-suggesting and to learn preferences.
+    Optional note and date_completed (e.g. "2024" or "2024-06-15") are stored for the Library UI.
     """
     _ensure_collections()
     client = _get_chroma()
@@ -120,6 +123,10 @@ def add_consumed(
     if author:
         doc += f" by {author}"
     doc += f". Liked: {'yes' if liked else 'no'}."
+    if date_completed:
+        doc += f" Completed: {date_completed}."
+    if note:
+        doc += f" Note: {note}"
     emb = voyage.embed(
         [doc],
         model=os.getenv("VOYAGE_MODEL", "voyage-3"),
@@ -138,8 +145,84 @@ def add_consumed(
             "url": (url or "")[:500],
             "liked": liked,
             "timestamp": ts,
+            "note": (note or "")[:2000],
+            "date_completed": (date_completed or "")[:50],
         }],
     )
+
+
+def process_library_note(text: str, type_filter: str | None = None) -> int:
+    """
+    Agent that organizes freeform 'library' notes into structured consumed items.
+    If type_filter is set ("book" | "podcast" | "article" | "research"), only that type is extracted.
+    Returns the number of items added.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return 0
+    type_hint = (type_filter or "").strip().lower()
+    if type_hint not in ("book", "podcast", "article", "research"):
+        type_hint = None
+    llm = _get_recommendations_llm()
+    type_instruction = (
+        f' Only output items of type "{type_hint}". Ignore any other media types in the text.'
+        if type_hint
+        else ""
+    )
+    prompt = f"""You are a reading library organizer. The user will paste a list of titles or short notes (one per line or comma-separated).
+Your job is to turn this into a structured list of items for a recommendation system.{type_instruction}
+
+TEXT:
+---
+{cleaned}
+---
+
+Return ONLY valid JSON (no markdown, no comments) that is an array of objects:
+[
+  {{"type": "book" | "podcast" | "article" | "research", "title": "...", "author": "...", "url": "", "liked": true, "note": ""}},
+  ...
+]
+
+Rules:
+- Each line or item in the text should become one object. "title" is the work's title; "author" if obvious.
+- "url" leave empty unless you know a real link. "liked" default true. "note" leave empty for now.
+"""
+    try:
+        response = llm.invoke(prompt)
+        text_out = str(getattr(response, "content", response)).strip()
+        if text_out.startswith("```"):
+            text_out = text_out.split("```")[1]
+            if text_out.startswith("json"):
+                text_out = text_out[4:]
+        data = json.loads(text_out)
+    except Exception as e:
+        print("[backend] process_library_note parse error:", e)
+        return 0
+    if not isinstance(data, list):
+        return 0
+    added = 0
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        ctype = str(item.get("type", "")).lower()
+        if ctype not in ("book", "podcast", "article", "research"):
+            continue
+        if type_hint and ctype != type_hint:
+            continue
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+        author = (item.get("author") or "").strip() or None
+        url = (item.get("url") or "").strip() or None
+        liked = bool(item.get("liked", True))
+        note = (item.get("note") or "").strip() or None
+        try:
+            add_consumed(ctype, title, author=author, url=url, liked=liked, note=note)
+            added += 1
+        except Exception as e:
+            print("[backend] process_library_note add_consumed error:", e)
+            continue
+    return added
 
 
 def get_consumed_context(max_items: int = 80) -> str:
@@ -166,14 +249,132 @@ def get_consumed_context(max_items: int = 80) -> str:
             title = m.get("title", "?")
             author = m.get("author", "")
             liked = m.get("liked", True)
+            note = (m.get("note") or "").strip()
             line = f"- {t}: {title}"
             if author:
                 line += f" ({author})"
             line += " — liked" if liked else " — read/listened"
+            if note:
+                line += f". User reflection: {note}"
             lines.append(line)
-        return "What the user has already read or listened to (do not recommend these again; use their tastes to suggest similar things):\n" + "\n".join(lines)
+        return "What the user has already read or listened to (do not recommend these again; use their tastes and reflections below to suggest similar things):\n" + "\n".join(lines)
     except Exception:
         return "The user has not marked any recommendations as consumed yet."
+
+
+def _parse_date_completed(s: str) -> tuple[int, int, int]:
+    """Return (year, month, day) for sorting; (0,0,0) for empty so it sorts last."""
+    s = (s or "").strip()
+    if not s:
+        return (0, 0, 0)
+    parts = s.replace("-", " ").split()
+    y = m = d = 0
+    if len(parts) >= 1 and parts[0].isdigit():
+        y = int(parts[0])
+    if len(parts) >= 2 and parts[1].isdigit():
+        m = int(parts[1])
+    if len(parts) >= 3 and parts[2].isdigit():
+        d = int(parts[2])
+    return (y, m, d)
+
+
+def list_consumed(max_items: int = 200) -> dict[str, list[dict]]:
+    """
+    Return consumed items grouped by type for the Library UI, sorted by date_completed (newest first).
+    Each item: { "id", "title", "author", "date_completed", "note" }.
+    """
+    _ensure_collections()
+    client = _get_chroma()
+    out: dict[str, list[dict]] = {"books": [], "podcasts": [], "articles": [], "research": []}
+    try:
+        col = client.get_collection(COLLECTION_CONSUMED)
+        if col.count() == 0:
+            return out
+        # Chroma's include only accepts: documents, embeddings, metadatas, distances, uris, data (ids are returned by default)
+        res = col.get(
+            include=["metadatas"],
+            limit=min(max_items, col.count()),
+        )
+        raw_ids = res.get("ids") or []
+        # Chroma may return ids as flat list or list-of-lists
+        ids_list = []
+        for x in raw_ids:
+            if isinstance(x, list) and x:
+                ids_list.append(x[0])
+            elif isinstance(x, str):
+                ids_list.append(x)
+            else:
+                ids_list.append("")
+        metadatas = res.get("metadatas") or []
+        type_to_key = {"book": "books", "podcast": "podcasts", "article": "articles", "research": "research"}
+        for idx, m in enumerate(metadatas):
+            if not m:
+                continue
+            t = (m.get("type") or "article").lower()
+            key = type_to_key.get(t)
+            if not key:
+                continue
+            title = (m.get("title") or "?").strip()
+            if not title:
+                continue
+            doc_id = ids_list[idx] if idx < len(ids_list) else ""
+            author = (m.get("author") or "").strip()
+            date_completed = (m.get("date_completed") or "").strip()
+            note = (m.get("note") or "").strip()
+            out[key].append({
+                "id": doc_id,
+                "title": title,
+                "author": author,
+                "date_completed": date_completed,
+                "note": note,
+            })
+        for key in out:
+            out[key].sort(key=lambda x: _parse_date_completed(x.get("date_completed") or ""), reverse=True)
+        return out
+    except Exception as e:
+        print("[backend] list_consumed error:", e)
+        return out
+
+
+def update_consumed(item_id: str, *, date_completed: str | None = None, note: str | None = None) -> bool:
+    """
+    Update date_completed and/or note for a consumed item by Chroma id.
+    Returns True if updated, False if not found or error.
+    """
+    _ensure_collections()
+    client = _get_chroma()
+    try:
+        col = client.get_collection(COLLECTION_CONSUMED)
+        res = col.get(ids=[item_id], include=["metadatas"])
+        metadatas = (res.get("metadatas") or [])
+        if not metadatas:
+            return False
+        meta = dict(metadatas[0])
+        if date_completed is not None:
+            meta["date_completed"] = (date_completed or "")[:50]
+        if note is not None:
+            meta["note"] = (note or "")[:2000]
+        col.update(ids=[item_id], metadatas=[meta])
+        return True
+    except Exception as e:
+        print("[backend] update_consumed error:", e)
+        return False
+
+
+def delete_consumed(item_id: str) -> bool:
+    """
+    Remove a consumed item from Chroma by id.
+    Returns True if deleted, False if not found or error.
+    """
+    _ensure_collections()
+    client = _get_chroma()
+    try:
+        col = client.get_collection(COLLECTION_CONSUMED)
+        col.delete(ids=[item_id])
+        return True
+    except Exception as e:
+        print("[backend] delete_consumed error:", e)
+        return False
 
 
 def _extract_session_data(transcript: str) -> dict:
@@ -572,18 +773,28 @@ def generate_recommendations() -> dict:
     articles_list: list = []
     research_list: list = []
 
+    agent_timeout = 90  # seconds per agent so one hang doesn't block forever
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_books = executor.submit(_books_agent, facts_blob, summaries_blob, consumed)
         future_podcasts = executor.submit(_podcasts_agent, facts_blob, summaries_blob, consumed)
         future_articles = executor.submit(_articles_agent, facts_blob, summaries_blob, consumed)
         future_research = executor.submit(_research_agent, facts_blob, summaries_blob, consumed)
         try:
-            books_list = future_books.result()
-            podcasts_list = future_podcasts.result()
-            articles_list = future_articles.result()
-            research_list = future_research.result()
+            books_list = future_books.result(timeout=agent_timeout)
         except Exception as e:
-            print("[backend] recommendations agent error:", e)
+            print("[backend] recommendations books_agent error:", e)
+        try:
+            podcasts_list = future_podcasts.result(timeout=agent_timeout)
+        except Exception as e:
+            print("[backend] recommendations podcasts_agent error:", e)
+        try:
+            articles_list = future_articles.result(timeout=agent_timeout)
+        except Exception as e:
+            print("[backend] recommendations articles_agent error:", e)
+        try:
+            research_list = future_research.result(timeout=agent_timeout)
+        except Exception as e:
+            print("[backend] recommendations research_agent error:", e)
 
     return {
         "books": books_list if isinstance(books_list, list) else [],
