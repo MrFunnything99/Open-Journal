@@ -28,7 +28,9 @@ from library import (
     COLLECTION_EPISODIC,
     COLLECTION_GIST,
     _get_chroma,
+    add_consumed,
     generate_memory_mermaid,
+    generate_recommendations,
     get_memory_for_visualization,
     save_session_data,
     wipe_memory,
@@ -106,9 +108,43 @@ class IngestHistoryResponse(BaseModel):
     session_id: str
 
 
+class InferEntryDateRequest(BaseModel):
+    text: str
+
+
+class InferEntryDateResponse(BaseModel):
+    date: Optional[str] = None  # ISO 8601 or null if unclear
+
+
 class MemoryStats(BaseModel):
     gist_facts_count: int
     episodic_log_count: int
+
+
+class RecommendationItem(BaseModel):
+    title: str
+    author: str = ""
+    reason: str = ""
+    url: str = ""
+
+
+class RecommendationsResponse(BaseModel):
+    books: list[RecommendationItem]
+    podcasts: list[RecommendationItem]
+    articles: list[RecommendationItem]
+    research: list[RecommendationItem]
+
+
+class ConsumedRequest(BaseModel):
+    type: str  # "book" | "podcast" | "article"
+    title: str
+    author: Optional[str] = None
+    url: Optional[str] = None
+    liked: bool = True
+
+
+class ConsumedResponse(BaseModel):
+    ok: bool
 
 
 class MemoryDiagramResponse(BaseModel):
@@ -213,6 +249,66 @@ async def ingest_history(req: IngestHistoryRequest):
     return IngestHistoryResponse(ok=True, session_id=session_id)
 
 
+INFER_DATE_SYSTEM = """You are a date extractor. Given journal text, determine the single date and time when this journal entry was written.
+The text may mention multiple dates (e.g. past events, "yesterday", "last week"). Choose the date that best represents when the author wrote this entry (e.g. "It is currently January 5, 2026, 1:59 a.m.").
+Reply with ONLY a single line: either an ISO 8601 date-time in UTC (e.g. 2026-01-05T01:59:00.000Z), or the word NONE if you cannot determine it. No other text."""
+
+
+@app.post("/infer-entry-date", response_model=InferEntryDateResponse)
+async def infer_entry_date(req: InferEntryDateRequest):
+    """
+    Use an LLM to infer the best-guess date/time when a journal entry was written.
+    Returns ISO 8601 string or null if unclear.
+    """
+    key = os.getenv("OPENROUTER_API_KEY")
+    if not key or not key.strip():
+        return InferEntryDateResponse(date=None)
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage, SystemMessage
+        llm = ChatOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=key,
+            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            temperature=0,
+        )
+        # Truncate very long text to avoid token limits
+        text = (req.text or "")[:8000].strip()
+        if not text:
+            return InferEntryDateResponse(date=None)
+        messages = [
+            SystemMessage(content=INFER_DATE_SYSTEM),
+            HumanMessage(content=text),
+        ]
+        result = await asyncio.to_thread(llm.invoke, messages)
+        raw = getattr(result, "content", str(result))
+        if isinstance(raw, list):
+            raw = " ".join(c.get("text", str(c)) for c in raw if isinstance(c, dict))
+        raw = (raw or "").strip()
+        if not raw or raw.upper() == "NONE":
+            return InferEntryDateResponse(date=None)
+        # Try to parse as ISO; accept if it looks like ISO date
+        from datetime import datetime
+        iso = raw.split()[0].strip()
+        if not iso:
+            return InferEntryDateResponse(date=None)
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            return InferEntryDateResponse(date=dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(iso[:26], fmt)
+                return InferEntryDateResponse(date=dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+            except Exception:
+                continue
+        return InferEntryDateResponse(date=None)
+    except Exception as e:
+        print("[backend] /infer-entry-date error:", e)
+        return InferEntryDateResponse(date=None)
+
+
 @app.get("/memory-stats", response_model=MemoryStats)
 async def memory_stats():
     """
@@ -225,6 +321,48 @@ async def memory_stats():
         gist_facts_count=gist.count(),
         episodic_log_count=episodic.count(),
     )
+
+
+@app.get("/recommendations", response_model=RecommendationsResponse)
+async def get_recommendations():
+    """
+    Generate personalized book, podcast, and article recommendations from journal memory
+    and what the user has already consumed/liked.
+    """
+    try:
+        data = await asyncio.to_thread(generate_recommendations)
+    except Exception as e:
+        print("[backend] /recommendations error:", e)
+        return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[])
+    return RecommendationsResponse(
+        books=[RecommendationItem(**x) for x in data.get("books", [])],
+        podcasts=[RecommendationItem(**x) for x in data.get("podcasts", [])],
+        articles=[RecommendationItem(**x) for x in data.get("articles", [])],
+        research=[RecommendationItem(**x) for x in data.get("research", [])],
+    )
+
+
+@app.post("/recommendations/consumed", response_model=ConsumedResponse)
+async def mark_consumed(req: ConsumedRequest):
+    """
+    Record that the user has read/listened to a recommendation. Stored in Chroma
+    so future recommendations avoid repeats and better match their tastes.
+    """
+    content_type = (req.type or "article").lower()
+    if content_type not in ("book", "podcast", "article", "research"):
+        content_type = "article"
+    try:
+        add_consumed(
+            content_type=content_type,
+            title=req.title,
+            author=req.author,
+            url=req.url,
+            liked=req.liked,
+        )
+        return ConsumedResponse(ok=True)
+    except Exception as e:
+        print("[backend] /recommendations/consumed error:", e)
+        return ConsumedResponse(ok=False)
 
 
 @app.post("/memory-wipe")

@@ -66,6 +66,7 @@ const INTRUSIVENESS_LABELS: Record<number, string> = {
 
 const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Rachel
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
+const RECOMMENDATIONS_CACHE_KEY = "openjournal-recommendations-cache";
 
 /** Fallback when /api/voices is unavailable (e.g. API server not running) */
 const FALLBACK_VOICES: VoiceOption[] = [
@@ -109,13 +110,18 @@ export const Personaplex = () => {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
   const [interimTranscript, setInterimTranscript] = useState("");
-  const [view, setView] = useState<"session" | "history" | "memory">("session");
+  const [view, setView] = useState<"session" | "history" | "memory" | "recommendations">("session");
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [priorJournalText, setPriorJournalText] = useState("");
   const [isIngesting, setIsIngesting] = useState(false);
   const [memoryStats, setMemoryStats] = useState<{ gist_facts_count: number; episodic_log_count: number } | null>(null);
   const [isWipingMemory, setIsWipingMemory] = useState(false);
   const [showLiveTranscription, setShowLiveTranscription] = useState(true);
+  type RecItem = { title: string; author?: string; reason?: string; url?: string };
+  const [recommendations, setRecommendations] = useState<{ books: RecItem[]; podcasts: RecItem[]; articles: RecItem[]; research: RecItem[] }>({ books: [], podcasts: [], articles: [], research: [] });
+  const [recommendationsLoading, setRecommendationsLoading] = useState(false);
+  const [consumedIds, setConsumedIds] = useState<Set<string>>(new Set());
+  const [removingKeys, setRemovingKeys] = useState<Set<string>>(new Set());
 
   const {
     entries,
@@ -167,6 +173,134 @@ export const Personaplex = () => {
   useEffect(() => {
     if (view === "memory") fetchMemoryStats();
   }, [view, fetchMemoryStats]);
+
+  const fetchRecommendations = useCallback((showLoadingUnlessCached = false) => {
+    try {
+      const cached = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
+      if (cached && showLoadingUnlessCached) {
+        const parsed = JSON.parse(cached) as { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] };
+          if (parsed && (parsed.books?.length || parsed.podcasts?.length || parsed.articles?.length || parsed.research?.length)) {
+            setRecommendations({
+              books: parsed.books ?? [],
+              podcasts: parsed.podcasts ?? [],
+              articles: parsed.articles ?? [],
+              research: parsed.research ?? [],
+            });
+          setRecommendationsLoading(true);
+          fetch(`${BACKEND_URL}/recommendations`)
+            .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
+            .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
+              const next = {
+                books: data.books ?? [],
+                podcasts: data.podcasts ?? [],
+                articles: data.articles ?? [],
+                research: data.research ?? [],
+              };
+              setRecommendations(next);
+              localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
+            })
+            .catch(() => {})
+            .finally(() => setRecommendationsLoading(false));
+          return;
+        }
+      }
+    } catch {
+      /* ignore cache parse errors */
+    }
+    setRecommendationsLoading(true);
+    fetch(`${BACKEND_URL}/recommendations`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
+      .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
+        const next = {
+          books: data.books ?? [],
+          podcasts: data.podcasts ?? [],
+          articles: data.articles ?? [],
+          research: data.research ?? [],
+        };
+        setRecommendations(next);
+        try {
+          localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
+        } catch {
+          /* ignore */
+        }
+      })
+      .catch(() => setRecommendations({ books: [], podcasts: [], articles: [], research: [] }))
+      .finally(() => setRecommendationsLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (view === "recommendations") {
+      try {
+        const cached = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
+        if (cached) {
+          const parsed = JSON.parse(cached) as { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] };
+          if (parsed && Array.isArray(parsed.books) && Array.isArray(parsed.podcasts) && Array.isArray(parsed.articles)) {
+            setRecommendations({
+              books: parsed.books ?? [],
+              podcasts: parsed.podcasts ?? [],
+              articles: parsed.articles ?? [],
+              research: Array.isArray(parsed.research) ? parsed.research : [],
+            });
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+      fetchRecommendations(true);
+    }
+  }, [view, fetchRecommendations]);
+
+  useEffect(() => {
+    if (view === "recommendations" && (recommendations.books.length > 0 || recommendations.podcasts.length > 0 || recommendations.articles.length > 0 || recommendations.research.length > 0)) {
+      try {
+        localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(recommendations));
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [view, recommendations]);
+
+  const markConsumed = useCallback(
+    (type: "book" | "podcast" | "article" | "research", item: RecItem) => {
+      const key = `${type}:${item.title}`;
+      if (consumedIds.has(key)) return;
+      fetch(`${BACKEND_URL}/recommendations/consumed`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type,
+          title: item.title,
+          author: item.author,
+          url: item.url,
+          liked: true,
+        }),
+      })
+        .then((r) => r.ok && r.json())
+        .then(() => {
+          setConsumedIds((prev) => new Set(prev).add(key));
+          setToastMessage(type === "book" || type === "article" || type === "research" ? "Marked as read." : type === "podcast" ? "Marked as listened." : "Marked as read.");
+          setTimeout(() => setToastMessage(null), 2500);
+          setRemovingKeys((prev) => new Set(prev).add(key));
+          const removeAfter = 320;
+          setTimeout(() => {
+            setRecommendations((prev) => ({
+              ...prev,
+              books: type === "book" ? prev.books.filter((x) => x.title !== item.title) : prev.books,
+              podcasts: type === "podcast" ? prev.podcasts.filter((x) => x.title !== item.title) : prev.podcasts,
+              articles: type === "article" ? prev.articles.filter((x) => x.title !== item.title) : prev.articles,
+              research: type === "research" ? prev.research.filter((x) => x.title !== item.title) : prev.research,
+            }));
+            setRemovingKeys((prev) => {
+              const next = new Set(prev);
+              next.delete(key);
+              return next;
+            });
+          }, removeAfter);
+        })
+        .catch(() => setToastMessage("Failed to save."));
+    },
+    [consumedIds]
+  );
 
   const handleIngestPriorJournal = useCallback(() => {
     if (!priorJournalText.trim()) return;
@@ -359,7 +493,21 @@ export const Personaplex = () => {
               }
               if (!text) continue;
               imported += 1;
-              saveEntry([{ role: "user", text }]);
+              let inferredDate: string | undefined;
+              try {
+                const ir = await fetch(`${BACKEND_URL}/infer-entry-date`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ text }),
+                });
+                if (ir.ok) {
+                  const data = await ir.json();
+                  if (data?.date) inferredDate = data.date;
+                }
+              } catch {
+                /* use import time as fallback */
+              }
+              saveEntry([{ role: "user", text }], inferredDate);
               try {
                 const r = await fetch(`${BACKEND_URL}/ingest-history`, {
                   method: "POST",
@@ -436,7 +584,21 @@ export const Personaplex = () => {
           } else {
             const content = text.trim();
             if (!content) throw new Error("File is empty.");
-            saveEntry([{ role: "user", text: content }]);
+            let inferredDate: string | undefined;
+            try {
+              const ir = await fetch(`${BACKEND_URL}/infer-entry-date`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: content }),
+              });
+              if (ir.ok) {
+                const data = await ir.json();
+                if (data?.date) inferredDate = data.date;
+              }
+            } catch {
+              /* use import time as fallback */
+            }
+            saveEntry([{ role: "user", text: content }], inferredDate);
             try {
               await fetch(`${BACKEND_URL}/ingest-history`, {
                 method: "POST",
@@ -537,6 +699,19 @@ export const Personaplex = () => {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
             <span className="hidden sm:inline">Memory</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setView("recommendations")}
+            className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
+              view === "recommendations" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
+            }`}
+            title="Personalized recommendations"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 sm:h-5 sm:w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+            </svg>
+            <span className="hidden sm:inline">Recommendations</span>
           </button>
         </div>
       </header>
@@ -758,7 +933,7 @@ export const Personaplex = () => {
 
         <div
           className={`flex-1 flex flex-col min-h-0 overflow-y-auto transition-opacity duration-300 ${
-            view === "history" || view === "memory" ? "opacity-100" : "opacity-0 pointer-events-none absolute inset-0"
+            view === "history" || view === "memory" || view === "recommendations" ? "opacity-100" : "opacity-0 pointer-events-none absolute inset-0"
           }`}
         >
           {view === "history" && (
@@ -890,6 +1065,238 @@ export const Personaplex = () => {
                 <div className="flex-1 min-h-0 min-w-0 flex flex-col">
                   <MemoryDiagram onRefreshStats={fetchMemoryStats} />
                 </div>
+              </div>
+            </div>
+          )}
+          {view === "recommendations" && (
+            <div className="flex-1 flex flex-col min-h-0 p-4 md:p-6 overflow-hidden">
+              <div className="flex-shrink-0 flex flex-wrap items-center justify-between gap-3 mb-4">
+                <div>
+                  <h2 className="text-lg font-medium text-slate-300 uppercase tracking-wider">
+                    Recommendations
+                  </h2>
+                  <p className="text-sm text-slate-500 mt-0.5">
+                Based on your journal memory and what you’ve already read or listened to. Mark items as read/listened so future suggestions get better.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => fetchRecommendations(false)}
+                  disabled={recommendationsLoading}
+                  className="flex-shrink-0 px-3 py-2 rounded-lg bg-slate-700/50 text-slate-400 text-sm font-medium hover:bg-slate-600/50 disabled:opacity-50 transition-colors"
+                >
+                  {recommendationsLoading ? "Updating…" : "Refresh recommendations"}
+                </button>
+              </div>
+              <div className="flex-1 min-h-0 overflow-auto">
+              {recommendationsLoading && !recommendations.books.length && !recommendations.podcasts.length && !recommendations.articles.length && !recommendations.research.length ? (
+                <p className="text-slate-500 text-sm">Loading recommendations…</p>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 pb-4">
+                  {/* Books */}
+                  <section className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex flex-col">
+                    <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-3">Books</h3>
+                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
+                      {recommendations.books.length === 0 ? (
+                        <p className="text-slate-500 text-xs">No book suggestions right now.</p>
+                      ) : (
+                        recommendations.books.map((item, i) => {
+                          const cardKey = `book:${item.title}`;
+                          const isRemoving = removingKeys.has(cardKey);
+                          return (
+                            <div
+                              key={`book-${i}-${item.title}`}
+                              className={`rounded-lg bg-slate-800/50 p-3 border border-slate-700/50 transition-all duration-300 ease-out ${
+                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
+                              }`}
+                            >
+                              <a
+                                href={`https://www.amazon.com/s?k=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-slate-200 text-sm font-medium hover:text-violet-300 hover:underline cursor-pointer"
+                              >
+                                {item.title}
+                              </a>
+                              {item.author && <p className="text-slate-500 text-xs mt-0.5">{item.author}</p>}
+                              {item.reason && <p className="text-slate-400 text-xs mt-1">{item.reason}</p>}
+                              <button
+                                type="button"
+                                onClick={() => markConsumed("book", item)}
+                                disabled={consumedIds.has(cardKey)}
+                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-violet-600/80 hover:bg-violet-500/80 disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
+                              >
+                                {consumedIds.has(cardKey) ? "Marked as read" : "I've read this"}
+                              </button>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </section>
+                  {/* Podcasts */}
+                  <section className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex flex-col">
+                    <div className="flex flex-wrap items-baseline gap-2 mb-3">
+                      <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider">Podcasts</h3>
+                      <a
+                        href="https://www.listennotes.com/"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[10px] text-slate-500 hover:text-slate-400 transition-colors flex items-baseline gap-0.5"
+                        title="Podcast data by Listen Notes"
+                      >
+                        <span className="lowercase font-normal">powered by</span>
+                        <span className="uppercase font-semibold text-slate-400">LISTEN NOTES</span>
+                      </a>
+                    </div>
+                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
+                      {recommendations.podcasts.length === 0 ? (
+                        <p className="text-slate-500 text-xs">No podcast suggestions right now.</p>
+                      ) : (
+                        recommendations.podcasts.map((item, i) => {
+                          const cardKey = `podcast:${item.title}`;
+                          const isRemoving = removingKeys.has(cardKey);
+                          return (
+                            <div
+                              key={`podcast-${i}-${item.title}`}
+                              className={`rounded-lg bg-slate-800/50 p-3 border border-slate-700/50 transition-all duration-300 ease-out ${
+                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
+                              }`}
+                            >
+                              {item.author && (
+                                <p className="text-slate-500 text-xs font-medium">{item.author}</p>
+                              )}
+                              <a
+                                href={
+                                  item.url && (item.url.includes("spotify.com") || item.url.includes("podcasts.apple.com") || item.url.includes("listennotes.com"))
+                                    ? item.url
+                                    : `https://open.spotify.com/search/${encodeURIComponent([item.author, item.title].filter(Boolean).join(" "))}`
+                                }
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-slate-200 text-sm font-medium hover:text-violet-300 hover:underline cursor-pointer block"
+                              >
+                                {item.title}
+                              </a>
+                              {(!item.url || (!item.url.includes("spotify.com") && !item.url.includes("podcasts.apple.com") && !item.url.includes("listennotes.com"))) && (
+                                <p className="text-xs mt-0.5 flex gap-2 flex-wrap">
+                                  <a
+                                    href={`https://open.spotify.com/search/${encodeURIComponent([item.author, item.title].filter(Boolean).join(" "))}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-violet-400 hover:underline"
+                                  >
+                                    Spotify
+                                  </a>
+                                  <a
+                                    href={`https://podcasts.apple.com/us/search?term=${encodeURIComponent([item.author, item.title].filter(Boolean).join(" "))}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-violet-400 hover:underline"
+                                  >
+                                    Apple Podcasts
+                                  </a>
+                                </p>
+                              )}
+                              {item.reason && <p className="text-slate-400 text-xs mt-1">{item.reason}</p>}
+                              <button
+                                type="button"
+                                onClick={() => markConsumed("podcast", item)}
+                                disabled={consumedIds.has(cardKey)}
+                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-violet-600/80 hover:bg-violet-500/80 disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
+                              >
+                                {consumedIds.has(cardKey) ? "Marked as listened" : "I've listened to this"}
+                              </button>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </section>
+                  {/* Articles */}
+                  <section className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex flex-col">
+                    <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-3">News & articles</h3>
+                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
+                      {recommendations.articles.length === 0 ? (
+                        <p className="text-slate-500 text-xs">No article suggestions right now.</p>
+                      ) : (
+                        recommendations.articles.map((item, i) => {
+                          const cardKey = `article:${item.title}`;
+                          const isRemoving = removingKeys.has(cardKey);
+                          return (
+                            <div
+                              key={`article-${i}-${item.title}`}
+                              className={`rounded-lg bg-slate-800/50 p-3 border border-slate-700/50 transition-all duration-300 ease-out ${
+                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
+                              }`}
+                            >
+                              <a
+                                href={item.url && item.url.startsWith("http") ? item.url : `https://www.google.com/search?q=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-slate-200 text-sm font-medium hover:text-violet-300 hover:underline cursor-pointer"
+                              >
+                                {item.title}
+                              </a>
+                              {item.author && <p className="text-slate-500 text-xs mt-0.5">{item.author}</p>}
+                              {item.reason && <p className="text-slate-400 text-xs mt-1">{item.reason}</p>}
+                              <button
+                                type="button"
+                                onClick={() => markConsumed("article", item)}
+                                disabled={consumedIds.has(cardKey)}
+                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-violet-600/80 hover:bg-violet-500/80 disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
+                              >
+                                {consumedIds.has(cardKey) ? "Marked as read" : "I've read this"}
+                              </button>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </section>
+                  {/* Research papers */}
+                  <section className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex flex-col">
+                    <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-3">Research papers</h3>
+                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
+                      {recommendations.research.length === 0 ? (
+                        <p className="text-slate-500 text-xs">No research suggestions right now.</p>
+                      ) : (
+                        recommendations.research.map((item, i) => {
+                          const cardKey = `research:${item.title}`;
+                          const isRemoving = removingKeys.has(cardKey);
+                          return (
+                            <div
+                              key={`research-${i}-${item.title}`}
+                              className={`rounded-lg bg-slate-800/50 p-3 border border-slate-700/50 transition-all duration-300 ease-out ${
+                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
+                              }`}
+                            >
+                              <a
+                                href={item.url && item.url.startsWith("http") ? item.url : `https://www.google.com/search?q=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-slate-200 text-sm font-medium hover:text-violet-300 hover:underline cursor-pointer"
+                              >
+                                {item.title}
+                              </a>
+                              {item.author && <p className="text-slate-500 text-xs mt-0.5">{item.author}</p>}
+                              {item.reason && <p className="text-slate-400 text-xs mt-1">{item.reason}</p>}
+                              <button
+                                type="button"
+                                onClick={() => markConsumed("research", item)}
+                                disabled={consumedIds.has(cardKey)}
+                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-violet-600/80 hover:bg-violet-500/80 disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
+                              >
+                                {consumedIds.has(cardKey) ? "Marked as read" : "I've read this"}
+                              </button>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </section>
+                </div>
+              )}
               </div>
             </div>
           )}

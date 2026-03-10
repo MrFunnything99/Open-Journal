@@ -103,10 +103,13 @@ export const useJournalHistory = () => {
     saveToStorage(entries);
   }, [entries]);
 
-  const saveEntry = useCallback((transcript: ChatMessage[]) => {
+  const saveEntry = useCallback((transcript: ChatMessage[], dateOverride?: string) => {
     if (transcript.length === 0) return;
     const id = generateId();
-    const date = new Date().toISOString();
+    const date =
+      dateOverride && !Number.isNaN(Date.parse(dateOverride))
+        ? dateOverride
+        : new Date().toISOString();
     const preview = transcriptToPreview(transcript);
     const entry: JournalEntry = {
       id,
