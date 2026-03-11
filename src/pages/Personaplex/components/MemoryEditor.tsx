@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { MemoryDiagram } from "./MemoryDiagram";
+import { BrainPeopleView } from "./BrainPeopleView";
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
 
@@ -24,14 +24,14 @@ export type MemoryStatsState = {
   episodic_metadata_count?: number;
 } | null;
 
-export type MemoryViewTab = "time" | "person" | "topic" | "place";
+export type MemoryViewTab = "time" | "person" | "topic" | "place" | "activity" | "emotion";
 
 type Metadata = {
   people?: string[];
   topics?: string[];
-  mood?: number | null;
-  energy?: number | null;
   activities?: string[];
+  events?: string[];
+  emotions?: string[];
 };
 
 function parseMetadata(metadata_json: string | null | undefined): Metadata {
@@ -41,9 +41,9 @@ function parseMetadata(metadata_json: string | null | undefined): Metadata {
     return {
       people: Array.isArray(o.people) ? o.people.map(String) : [],
       topics: Array.isArray(o.topics) ? o.topics.map(String) : [],
-      mood: typeof o.mood === "number" ? o.mood : null,
-      energy: typeof o.energy === "number" ? o.energy : null,
       activities: Array.isArray(o.activities) ? o.activities.map(String) : [],
+      events: Array.isArray(o.events) ? o.events.map(String) : [],
+      emotions: Array.isArray(o.emotions) ? o.emotions.map(String) : [],
     };
   } catch {
     return {};
@@ -121,6 +121,44 @@ export function MemoryEditor({
     const keys = Array.from(map.keys()).sort();
     return { keys, map };
   }, [summaries]);
+
+  const summariesByActivity = useMemo(() => {
+    const map = new Map<string, MemorySummary[]>();
+    for (const s of summaries) {
+      const meta = parseMetadata(s.metadata_json);
+      const activities = meta.activities?.length ? meta.activities : ["(No activity)"];
+      for (const a of activities) {
+        if (!map.has(a)) map.set(a, []);
+        map.get(a)!.push(s);
+      }
+    }
+    const keys = Array.from(map.keys()).sort();
+    return { keys, map };
+  }, [summaries]);
+
+  const summariesByEmotion = useMemo(() => {
+    const map = new Map<string, MemorySummary[]>();
+    for (const s of summaries) {
+      const meta = parseMetadata(s.metadata_json);
+      const emotions = meta.emotions?.length ? meta.emotions : ["(No emotion)"];
+      for (const e of emotions) {
+        if (!map.has(e)) map.set(e, []);
+        map.get(e)!.push(s);
+      }
+    }
+    const keys = Array.from(map.keys()).sort();
+    return { keys, map };
+  }, [summaries]);
+
+  const factsByDate = useMemo(() => {
+    const map = new Map<string, MemoryFact[]>();
+    for (const f of facts) {
+      const key = dateKey(f.timestamp);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(f);
+    }
+    return map;
+  }, [facts]);
 
   const summariesByTopic = useMemo(() => {
     const map = new Map<string, MemorySummary[]>();
@@ -271,7 +309,9 @@ export function MemoryEditor({
           className="text-left text-sm text-slate-200 flex-1 min-w-0"
           onClick={() => openEditSummary(s)}
         >
-          <span className="line-clamp-3">{s.document}</span>
+          <span className="text-xs uppercase tracking-wide text-slate-400">
+            Events & tags
+          </span>
         </button>
         <button
           type="button"
@@ -285,39 +325,46 @@ export function MemoryEditor({
       {(() => {
         const meta = parseMetadata(s.metadata_json);
         const hasMeta =
+          (meta.events?.length ?? 0) > 0 ||
           (meta.people?.length ?? 0) > 0 ||
           (meta.topics?.length ?? 0) > 0 ||
           (meta.activities?.length ?? 0) > 0 ||
-          meta.mood != null ||
-          meta.energy != null;
+          (meta.emotions?.length ?? 0) > 0;
         if (!hasMeta) return null;
         return (
-          <div className="flex flex-wrap gap-1.5 text-xs">
-            {meta.people?.map((p) => (
-              <span key={p} className="px-1.5 py-0.5 rounded bg-violet-900/40 text-violet-200">
-                {p}
-              </span>
-            ))}
-            {meta.topics?.map((t) => (
-              <span key={t} className="px-1.5 py-0.5 rounded bg-slate-700/60 text-slate-300">
-                {t}
-              </span>
-            ))}
-            {meta.mood != null && (
-              <span className="px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-200">
-                mood {meta.mood > 0 ? "+" : ""}{meta.mood}
-              </span>
+          <div className="space-y-1.5 text-xs text-slate-200">
+            {meta.events && meta.events.length > 0 && (
+              <div>
+                <span className="font-semibold text-slate-300">Events:</span>
+                <ul className="list-disc list-inside mt-0.5 space-y-0.5">
+                  {meta.events.map((e) => (
+                    <li key={e}>{e}</li>
+                  ))}
+                </ul>
+              </div>
             )}
-            {meta.energy != null && (
-              <span className="px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-200">
-                energy {meta.energy}
-              </span>
-            )}
-            {meta.activities?.map((a) => (
-              <span key={a} className="px-1.5 py-0.5 rounded bg-sky-900/40 text-sky-200">
-                {a}
-              </span>
-            ))}
+            <div className="flex flex-wrap gap-1.5">
+              {meta.people?.map((p) => (
+                <span key={p} className="px-1.5 py-0.5 rounded bg-violet-900/40 text-violet-200">
+                  {p}
+                </span>
+              ))}
+              {meta.activities?.map((a) => (
+                <span key={a} className="px-1.5 py-0.5 rounded bg-sky-900/40 text-sky-200">
+                  {a}
+                </span>
+              ))}
+              {meta.topics?.map((t) => (
+                <span key={t} className="px-1.5 py-0.5 rounded bg-slate-700/60 text-slate-300">
+                  {t}
+                </span>
+              ))}
+              {meta.emotions?.map((em) => (
+                <span key={em} className="px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-200">
+                  {em}
+                </span>
+              ))}
+            </div>
           </div>
         );
       })()}
@@ -350,17 +397,17 @@ export function MemoryEditor({
   return (
     <div className="flex-1 flex flex-col min-h-0 p-4 md:p-6 overflow-auto">
       <h2 className="text-lg font-medium text-slate-300 uppercase tracking-wider mb-4 flex-shrink-0">
-        Memory Editor
+        Brain
       </h2>
       <p className="text-sm text-slate-500 mb-4 flex-shrink-0">
         Inspect and correct what the system knows about you. Edits persist to the database.
       </p>
 
-      {/* Stats + Rebuild */}
+      {/* Stats */}
       <div className="flex flex-wrap items-center gap-4 mb-4 flex-shrink-0">
         <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4">
           <h3 className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">
-            Memory stats
+            Brain stats
           </h3>
           {stats !== null ? (
             <div className="space-y-1.5 text-sm text-slate-300">
@@ -403,36 +450,39 @@ export function MemoryEditor({
         </div>
       </div>
 
-      {/* Visual map */}
-      <div className="flex-1 min-h-[240px] flex flex-col mb-6">
-        <MemoryDiagram onRefreshStats={onRefreshStats} />
-      </div>
-
-      {/* Tabs */}
-      <div className="flex-shrink-0 mb-3">
-        <div className="flex gap-1 border-b border-slate-700/50">
-          {(
-            [
-              ["time", "By time"],
-              ["person", "By person"],
-              ["topic", "By topic"],
-              ["place", "By place"],
-            ] as const
-          ).map(([tab, label]) => (
-            <button
-              key={tab}
-              type="button"
-              onClick={() => setViewTab(tab)}
-              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
-                viewTab === tab
-                  ? "border-violet-500 text-violet-300"
-                  : "border-transparent text-slate-500 hover:text-slate-400"
-              }`}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+      {/* Brain navigation cards */}
+      <div className="mb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {(
+          [
+            ["time", "Timeline", "Browse memories by date."],
+            ["person", "People", "See who appears in your memories."],
+            ["topic", "Topics", "Explore themes across sessions."],
+            ["place", "Places", "Future: locations in your life."],
+            ["facts", "Facts", "Atomic facts the system stores about you."],
+            ["activity", "Activities", "What you tend to do over time."],
+            ["emotion", "Emotions", "How you tend to feel across activities."],
+          ] as const
+        ).map(([key, title, desc]) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() =>
+              setViewTab(
+                key === "facts"
+                  ? "time"
+                  : (key as Exclude<MemoryViewTab, "facts">)
+              )
+            }
+            className={`text-left rounded-xl bg-slate-900/60 border px-4 py-3 transition-colors ${
+              (key === "facts" ? viewTab === "time" : viewTab === key)
+                ? "border-violet-500/80 ring-1 ring-violet-500/60"
+                : "border-slate-700/70 hover:border-slate-500/80"
+            }`}
+          >
+            <div className="text-sm font-semibold text-slate-200 mb-1">{title}</div>
+            <div className="text-xs text-slate-500">{desc}</div>
+          </button>
+        ))}
       </div>
 
       {loading && facts.length === 0 && summaries.length === 0 ? (
@@ -450,6 +500,75 @@ export function MemoryEditor({
                     <h4 className="text-sm font-medium text-slate-400 mb-2">
                       {formatDate(key === "unknown" ? undefined : `${key}T12:00:00Z`)}
                     </h4>
+                    {(() => {
+                      const daySummaries = summariesByTime.map.get(key)!;
+                      const agg: Metadata = { events: [], people: [], activities: [], topics: [], emotions: [] };
+                      for (const s of daySummaries) {
+                        const m = parseMetadata(s.metadata_json);
+                        agg.events = [...new Set([...(agg.events ?? []), ...(m.events ?? [])])];
+                        agg.people = [...new Set([...(agg.people ?? []), ...(m.people ?? [])])];
+                        agg.activities = [...new Set([...(agg.activities ?? []), ...(m.activities ?? [])])];
+                        agg.topics = [...new Set([...(agg.topics ?? []), ...(m.topics ?? [])])];
+                        agg.emotions = [...new Set([...(agg.emotions ?? []), ...(m.emotions ?? [])])];
+                      }
+                      const dayFacts = factsByDate.get(key) ?? [];
+                      const hasAnything =
+                        (agg.events?.length ?? 0) > 0 ||
+                        (agg.people?.length ?? 0) > 0 ||
+                        (agg.activities?.length ?? 0) > 0 ||
+                        (agg.topics?.length ?? 0) > 0 ||
+                        (agg.emotions?.length ?? 0) > 0 ||
+                        dayFacts.length > 0;
+                      if (!hasAnything) return null;
+                      return (
+                        <div className="mb-2 rounded-lg bg-slate-900/60 border border-slate-700/60 p-3 text-xs text-slate-200 space-y-1.5">
+                          {agg.events && agg.events.length > 0 && (
+                            <div>
+                              <span className="font-semibold text-slate-300">Events:</span>
+                              <ul className="list-disc list-inside mt-0.5 space-y-0.5">
+                                {agg.events.map((e) => (
+                                  <li key={e}>{e}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {agg.people && agg.people.length > 0 && (
+                            <div>
+                              <span className="font-semibold text-slate-300">People:</span>{" "}
+                              {agg.people.join(", ")}
+                            </div>
+                          )}
+                          {agg.activities && agg.activities.length > 0 && (
+                            <div>
+                              <span className="font-semibold text-slate-300">Activities:</span>{" "}
+                              {agg.activities.join(", ")}
+                            </div>
+                          )}
+                          {agg.topics && agg.topics.length > 0 && (
+                            <div>
+                              <span className="font-semibold text-slate-300">Topics:</span>{" "}
+                              {agg.topics.join(", ")}
+                            </div>
+                          )}
+                          {agg.emotions && agg.emotions.length > 0 && (
+                            <div>
+                              <span className="font-semibold text-slate-300">Emotions:</span>{" "}
+                              {agg.emotions.join(", ")}
+                            </div>
+                          )}
+                          {dayFacts.length > 0 && (
+                            <div>
+                              <span className="font-semibold text-slate-300">Facts:</span>
+                              <ul className="list-disc list-inside mt-0.5 space-y-0.5">
+                                {dayFacts.map((f) => (
+                                  <li key={f.id}>{f.document}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                     <div className="space-y-2">
                       {summariesByTime.map.get(key)!.map(renderSummaryBlock)}
                     </div>
@@ -460,21 +579,7 @@ export function MemoryEditor({
           )}
 
           {viewTab === "person" && (
-            <div className="space-y-4">
-              <p className="text-xs text-slate-500">Summaries grouped by people mentioned.</p>
-              {summariesByPerson.keys.length === 0 ? (
-                <p className="text-slate-500 text-sm">No summaries with people yet.</p>
-              ) : (
-                summariesByPerson.keys.map((person) => (
-                  <div key={person}>
-                    <h4 className="text-sm font-medium text-violet-300 mb-2">{person}</h4>
-                    <div className="space-y-2">
-                      {summariesByPerson.map.get(person)!.map(renderSummaryBlock)}
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
+            <BrainPeopleView onToast={onToast} />
           )}
 
           {viewTab === "topic" && (
@@ -499,6 +604,44 @@ export function MemoryEditor({
             <p className="text-slate-500 text-sm py-4">
               By-place view is not implemented yet. You can add location metadata support later.
             </p>
+          )}
+
+          {viewTab === "activity" && (
+            <div className="space-y-4">
+              <p className="text-xs text-slate-500">Summaries grouped by activities.</p>
+              {summariesByActivity.keys.length === 0 ? (
+                <p className="text-slate-500 text-sm">No activities detected yet.</p>
+              ) : (
+                summariesByActivity.keys.map((activity) => (
+                  <div key={activity}>
+                    <h4 className="text-sm font-medium text-sky-300 mb-2">{activity}</h4>
+                    <div className="space-y-2">
+                      {summariesByActivity.map.get(activity)!.map(renderSummaryBlock)}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {viewTab === "emotion" && (
+            <div className="space-y-4">
+              <p className="text-xs text-slate-500">
+                Summaries grouped by emotions. Edit individual entries to adjust events and tags.
+              </p>
+              {summariesByEmotion.keys.length === 0 ? (
+                <p className="text-slate-500 text-sm">No emotions stored yet.</p>
+              ) : (
+                summariesByEmotion.keys.map((emotionKey) => (
+                  <div key={emotionKey}>
+                    <h4 className="text-sm font-medium text-amber-300 mb-2">{emotionKey}</h4>
+                    <div className="space-y-2">
+                      {summariesByEmotion.map.get(emotionKey)!.map(renderSummaryBlock)}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
           )}
 
           {/* Facts section (all tabs) */}

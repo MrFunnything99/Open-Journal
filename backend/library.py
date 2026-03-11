@@ -297,8 +297,8 @@ def delete_consumed(item_id: str) -> bool:
 
 
 def _extract_session_data(transcript: str) -> dict:
-    """Use Gemini LLM to extract summary, facts, and structured metadata from transcript."""
-    prompt = f"""You are a journal analyst. Extract structured data from this journal session transcript.
+    """Use Gemini LLM to extract structured, factual memory from transcript."""
+    prompt = f"""You are a journal memory extractor. Given a journal session transcript, extract ONLY simple, factual, structured data.
 
 Transcript:
 ---
@@ -307,21 +307,24 @@ Transcript:
 
 Return ONLY valid JSON with this exact structure (no markdown, no extra text):
 {{
-  "summary": "A 3-sentence summary of the session: what was discussed, key themes, and emotions felt.",
-  "facts": ["Fact 1 about the user", "Fact 2 about the user", ...],
-  "metadata": {{
-    "people": ["Name1", "Name2"],
-    "topics": ["topic1", "topic2"],
-    "mood": -2,
-    "energy": 3,
-    "activities": ["activity1", "activity2"]
-  }}
+  "events": ["short description of an event or activity", ...],
+  "people": ["person 1", "person 2", ...],
+  "activities": ["activity 1", "activity 2", ...],
+  "topics": ["concrete topic 1", "concrete topic 2", ...],
+  "emotions": ["emotion 1", "emotion 2", ...],
+  "facts": ["short factual statement about the user", ...]
 }}
 
 Rules:
-- summary: exactly 3 sentences, capture emotions and themes
-- facts: list of hard, verifiable facts about the user (job, relationships, preferences, life events). Empty list if none.
-- metadata: for pattern analysis. people: list of people mentioned. topics: major discussion topics. mood: integer from -5 (very negative) to +5 (very positive). energy: integer from 1 (low) to 5 (high). activities: list of actions or activities described. Omit any field if unknown; use empty lists for people/topics/activities and null for mood/energy when unclear.
+- Use SHORT phrases, not paragraphs. Do NOT write narrative summaries.
+- events: concrete events or activities ("argument with dad", "job applications", "treadmill workout"), NOT abstract psychological labels.
+- people: names or simple references ("Dad", "Colin"). Do NOT invent people.
+- activities: simple activity labels ("reading", "journaling", "job search", "exercise").
+- topics: concrete topics ("therapy", "family conflict", "career"), NOT abstract ideas like "mental health dysregulation" or "emotional dysregulation".
+- emotions: plain emotion words tied to specific events ("anxious", "hopeful", "frustrated", "calm"). Do NOT convert emotions into numbers.
+- facts: hard, verifiable facts about the user (job, relationships, stable preferences, ongoing projects). Empty list if none.
+- If you are uncertain about something, OMIT it instead of guessing.
+- Avoid speculative interpretation and abstract psychology language.
 """
     text = _call_gemini(prompt)
     text = (text or "").strip()
@@ -339,24 +342,396 @@ Rules:
         return {"summary": "", "facts": [], "metadata": {}}
     if not isinstance(data, dict):
         return {"summary": "", "facts": [], "metadata": {}}
-    data.setdefault("summary", "")
-    data.setdefault("facts", [])
-    meta = data.get("metadata")
-    if not isinstance(meta, dict):
-        meta = {}
-    meta.setdefault("people", [])
-    meta.setdefault("topics", [])
-    meta.setdefault("mood", None)
-    meta.setdefault("energy", None)
-    meta.setdefault("activities", [])
-    if not isinstance(meta["people"], list):
-        meta["people"] = []
-    if not isinstance(meta["topics"], list):
-        meta["topics"] = []
-    if not isinstance(meta["activities"], list):
-        meta["activities"] = []
-    data["metadata"] = meta
-    return data
+    # Normalize top-level lists
+    events = data.get("events") or []
+    people = data.get("people") or []
+    activities = data.get("activities") or []
+    topics = data.get("topics") or []
+    emotions = data.get("emotions") or []
+    facts = data.get("facts") or []
+
+    if not isinstance(events, list):
+        events = []
+    if not isinstance(people, list):
+        people = []
+    if not isinstance(activities, list):
+        activities = []
+    if not isinstance(topics, list):
+        topics = []
+    if not isinstance(emotions, list):
+        emotions = []
+    if not isinstance(facts, list):
+        facts = []
+
+    # Build structured metadata object used elsewhere
+    metadata = {
+        "events": [str(x) for x in events if isinstance(x, (str, int, float)) and str(x).strip()],
+        "people": [str(x) for x in people if isinstance(x, (str, int, float)) and str(x).strip()],
+        "activities": [str(x) for x in activities if isinstance(x, (str, int, float)) and str(x).strip()],
+        "topics": [str(x) for x in topics if isinstance(x, (str, int, float)) and str(x).strip()],
+        "emotions": [str(x) for x in emotions if isinstance(x, (str, int, float)) and str(x).strip()],
+    }
+
+    # Derive a compact, non-narrative summary string for embeddings / RAG
+    segments: list[str] = []
+    if metadata["events"]:
+        segments.append("Events: " + "; ".join(metadata["events"]))
+    if metadata["people"]:
+        segments.append("People: " + ", ".join(metadata["people"]))
+    if metadata["activities"]:
+        segments.append("Activities: " + ", ".join(metadata["activities"]))
+    if metadata["topics"]:
+        segments.append("Topics: " + ", ".join(metadata["topics"]))
+    if metadata["emotions"]:
+        segments.append("Emotions: " + ", ".join(metadata["emotions"]))
+    summary_str = " | ".join(segments)
+
+    return {
+        "summary": summary_str,
+        "facts": [str(x) for x in facts if isinstance(x, (str, int, float)) and str(x).strip()],
+        "metadata": metadata,
+    }
+
+
+def _get_person_passages(person_name: str, max_passages: int = 40) -> list[str]:
+    """
+    Hybrid retrieval for a person: combine keyword and vector search over gist + episodic docs.
+    Returns a list of short passages for downstream agents.
+    """
+    import vec_store
+
+    _ensure_storage()
+    person = (person_name or "").strip()
+    if not person:
+        return []
+    person_l = person.lower()
+    passages: list[str] = []
+
+    # Keyword over gist facts
+    try:
+        for item in vec_store.list_gist_with_ids():
+            doc = (item.get("document") or "").strip()
+            if doc and person_l in doc.lower():
+                passages.append(doc)
+    except Exception:
+        pass
+
+    # Keyword + metadata over episodic summaries
+    try:
+        for item in vec_store.list_episodic_with_ids():
+            doc = (item.get("document") or "").strip()
+            if doc and person_l in doc.lower():
+                passages.append(doc)
+            meta_json = item.get("metadata_json")
+            if not meta_json:
+                continue
+            try:
+                meta = json.loads(meta_json)
+            except Exception:
+                continue
+            events = meta.get("events") or []
+            if isinstance(events, list):
+                for e in events:
+                    s = str(e)
+                    if s and person_l in s.lower():
+                        passages.append(s)
+    except Exception:
+        pass
+
+    # Vector search from gist + episodic
+    try:
+        emb = _embed_texts([person])[0]
+        for doc in vec_store.query_gist(emb, k=8):
+            if doc:
+                passages.append(doc)
+        for doc in vec_store.query_episodic(emb, k=8):
+            if doc:
+                passages.append(doc)
+    except Exception:
+        pass
+
+    # De-duplicate and trim
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in passages:
+        s = p.strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        unique.append(s)
+        if len(unique) >= max_passages:
+            break
+    return unique
+
+
+def run_relationship_summary_agent(person_id: int, person_name: str) -> str:
+    """RelationshipSummaryAgent: infer implied emotional tone toward a person.
+
+    Uses a simple cache so we don't re-call the LLM on every detail view.
+    """
+    import vec_store
+
+    _ensure_storage()
+    # If we already have a cached summary for this person, return it.
+    cached = vec_store.get_person_ai_summary(person_id)
+    if cached and (cached.get("summary") or "").strip():
+        return (cached.get("summary") or "").strip()
+
+    passages = _get_person_passages(person_name)
+    if not passages:
+        return ""
+    joined = "\n\n".join(f"- {p}" for p in passages)
+    prompt = f"""You are RelationshipSummaryAgent.
+
+You analyze how the user writes about other people in their journals.
+
+Analyze these journal passages mentioning {person_name}.
+
+Focus on:
+- emotional tone
+- patterns of interaction
+- admiration or conflict
+- trust or anxiety
+- attachment signals
+
+Write a concise summary (2–4 sentences) describing the user's implied feelings about this person.
+Use neutral, observational language. Do NOT invent events; only summarize what is implied.
+
+Passages:
+---
+{joined}
+---
+"""
+    text = _call_gemini(prompt)
+    text = (text or "").strip()
+    # Very light post-processing: cap at 4 sentences
+    if not text:
+        return ""
+    parts = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
+    if not parts:
+        return ""
+    summary = ". ".join(parts[:4])
+    if not summary.endswith("."):
+        summary += "."
+    try:
+        vec_store.set_person_ai_summary(person_id, summary)
+    except Exception as e:
+        print("[backend] run_relationship_summary_agent cache error:", e)
+    return summary
+
+
+def run_person_facts_agent(person_id: int, person_name: str) -> list[dict]:
+    """
+    PersonFactsAgent: extract stable factual statements about a person from journal passages.
+    Returns list of {id, fact_text, confidence, source_journal_id, created_at} after storing to DB.
+    """
+    import vec_store
+
+    _ensure_storage()
+    # If we already have stored facts for this person, return them without re-running the LLM.
+    try:
+        existing = vec_store.list_person_facts(person_id)
+    except Exception:
+        existing = []
+    if existing:
+        return existing
+
+    passages = _get_person_passages(person_name)
+    if not passages:
+        return []
+    joined = "\n\n".join(f"- {p}" for p in passages)
+    prompt = f"""You are PersonFactsAgent.
+
+The following passages are from a journal. The journal writer (the "user") often talks about themselves AND about other people. You must extract ONLY facts that describe **{person_name}** — the other person — NOT the journal writer.
+
+CRITICAL RULES:
+- Each fact must be ABOUT {person_name} (their age, job, school, hobbies, traits, projects, role in the user's life). The SUBJECT of the fact must be {person_name}.
+- Do NOT include any fact that describes the journal writer / user (e.g. "I work at X", "I go to UNCA", "I like hiking"). Those are facts about the user, not about {person_name}.
+- If the passage only describes what the user did or who the user is, leave it out. Only include facts that clearly describe {person_name} (e.g. "{person_name} works at Google", "{person_name} is in grad school", "My friend {person_name} is 25").
+- When in doubt, omit. Include only facts that unambiguously describe {person_name}.
+
+Focus on stable, factual information about {person_name}:
+- age, occupation, school
+- projects, hobbies, interests
+- role or relationship (e.g. coworker, roommate, sibling) only if it describes {person_name}
+
+Avoid emotional interpretation and speculation.
+
+Return ONLY valid JSON with this structure (no markdown, no extra text):
+{{
+  "facts": [
+    {{
+      "fact_text": "19-year-old UNCA student",
+      "confidence": 0.9,
+      "source_id": "summary:12"
+    }},
+    ...
+  ]
+}}
+
+Passages (from the user's journal; extract only facts about {person_name}, not about the user):
+---
+{joined}
+---
+"""
+    raw = _call_gemini(prompt)
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print("[backend] run_person_facts_agent JSON error:", e)
+        return []
+    facts = data.get("facts") or []
+    if not isinstance(facts, list):
+        return []
+    # Normalize minimal fields for storage
+    cleaned: list[dict] = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        text = (f.get("fact_text") or "").strip()
+        if not text:
+            continue
+        conf = f.get("confidence")
+        try:
+            conf_f = float(conf) if conf is not None else None
+        except (TypeError, ValueError):
+            conf_f = None
+        src = (f.get("source_id") or "").strip()
+        cleaned.append(
+            {
+                "fact_text": text,
+                "confidence": conf_f,
+                "source_id": src,
+            }
+        )
+    try:
+        vec_store.replace_person_facts(person_id, cleaned)
+    except Exception as e:
+        print("[backend] run_person_facts_agent store error:", e)
+    try:
+        return vec_store.list_person_facts(person_id)
+    except Exception:
+        return []
+
+
+def run_people_grouping_agent() -> None:
+    """
+    Use an LLM to propose social groups (e.g., UNC Charlotte, CPCC, Mentors) and
+    assign people to them, then store results in person_groups. This runs offline
+    and is triggered explicitly from the API, so it can be relatively heavy.
+    """
+    import vec_store
+
+    _ensure_storage()
+    try:
+        people = vec_store.list_people_with_groups()
+    except Exception as e:
+        print("[backend] run_people_grouping_agent people error:", e)
+        return
+    if not people:
+        return
+
+    # For richer descriptors, include any stored person facts.
+    person_facts: dict[int, list[str]] = {}
+    for p in people:
+        pid = p["id"]
+        try:
+            facts = vec_store.list_person_facts(pid)
+        except Exception:
+            facts = []
+        person_facts[pid] = [f.get("fact_text", "") for f in facts if f.get("fact_text")]
+
+    lines = []
+    for p in people:
+        pid = p["id"]
+        name = p["name"]
+        facts_blob = "; ".join(person_facts.get(pid, [])) or "(no extra facts)"
+        lines.append(f"- id: {pid}, name: {name}, details: {facts_blob}")
+    people_blob = "\n".join(lines)
+
+    prompt = f"""You are SocialGroupingAgent.
+
+You are given a list of people mentioned in a user's journal, with some factual descriptors.
+Your job is to organize them into meaningful social groups that will be used to draw a graph.
+
+Rules:
+- Create 3–15 groups that feel natural and interpretable to the user.
+- Typical group examples: universities or schools (e.g. "UNC Charlotte", "CPCC"), workplaces,
+  friend clusters, family, mentors/therapists, healthcare providers, clubs, etc.
+- Prefer SHORT, human-readable group names (1–3 words). Reuse existing names like university
+  or workplace names when obvious from the data.
+- People can belong to multiple groups (e.g. "Mentors" and "UNC Charlotte").
+- If you are unsure about a person, put them in a generic group like "Other" or "Misc".
+- Do NOT invent biographical facts; only infer groups that are clearly suggested by the descriptors.
+
+Return ONLY valid JSON with this structure (no markdown, no comments):
+{{
+  "groups": [
+    {{
+      "name": "UNC Charlotte",
+      "members": [1, 2, 3]
+    }},
+    {{
+      "name": "Mentors",
+      "members": [4, 5]
+    }}
+  ]
+}}
+
+People:
+{people_blob}
+"""
+    raw = _call_gemini(prompt)
+    raw = (raw or "").strip()
+    if not raw:
+        return
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print("[backend] run_people_grouping_agent JSON error:", e)
+        return
+    groups = data.get("groups") or []
+    if not isinstance(groups, list):
+        return
+
+    # Build mapping person_id -> set of group names, then write back via vec_store.set_person_groups.
+    assignments: dict[int, set[str]] = {}
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        gname = (g.get("name") or "").strip()
+        if not gname:
+            continue
+        members = g.get("members") or []
+        if not isinstance(members, list):
+            continue
+        for mid in members:
+            try:
+                pid = int(mid)
+            except (TypeError, ValueError):
+                continue
+            if pid not in assignments:
+                assignments[pid] = set()
+            assignments[pid].add(gname)
+
+    for pid, gset in assignments.items():
+        try:
+            vec_store.set_person_groups(pid, sorted(gset))
+        except Exception as e:
+            print("[backend] run_people_grouping_agent set_person_groups error:", e)
 
 
 def save_session_data(session_id: str, transcript: str) -> dict:
@@ -482,6 +857,55 @@ def list_memory_summaries() -> list[dict]:
     except Exception as e:
         print("[backend] list_memory_summaries error:", e)
         return []
+
+
+def get_person_events(person_name: str) -> list[dict]:
+    """
+    Return episodic events involving the given person name.
+    Derived from memory_episodic.metadata_json (events + people lists).
+    """
+    items = list_memory_summaries()
+    if not person_name or not person_name.strip():
+        return []
+    target = person_name.strip()
+    target_l = target.lower()
+    results: list[dict] = []
+    for item in items:
+        meta_json = item.get("metadata_json")
+        if not meta_json:
+            continue
+        try:
+            meta = json.loads(meta_json)
+        except Exception:
+            continue
+        people = meta.get("people") or []
+        if not isinstance(people, list) or target not in people:
+            continue
+        events = meta.get("events") or []
+        if not isinstance(events, list):
+            continue
+        # Keep only events that clearly mention this person's name to avoid random, unrelated actions.
+        clean_events: list[str] = []
+        for e in events:
+            if not isinstance(e, (str, int, float)):
+                continue
+            s = str(e).strip()
+            if not s:
+                continue
+            # Require the person's name to appear in the event text.
+            if target_l not in s.lower():
+                continue
+            clean_events.append(s)
+        if not clean_events:
+            continue
+        results.append(
+            {
+                "summary_id": item.get("id"),
+                "timestamp": item.get("timestamp") or "",
+                "events": clean_events,
+            }
+        )
+    return results
 
 
 def update_memory_fact(fact_id: int, document: str) -> bool:

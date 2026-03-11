@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -171,6 +172,63 @@ def _init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE memory_episodic ADD COLUMN metadata_json TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
+
+    # People / social graph tables for Brain -> People view
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS people (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS person_profiles (
+            id INTEGER PRIMARY KEY,
+            person_id INTEGER NOT NULL,
+            relationship_summary TEXT,
+            relationship_type TEXT,
+            closeness_label TEXT,
+            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS person_groups (
+            person_id INTEGER NOT NULL,
+            group_name TEXT NOT NULL,
+            PRIMARY KEY (person_id, group_name),
+            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS person_thoughts (
+            id INTEGER PRIMARY KEY,
+            person_id INTEGER NOT NULL,
+            date TEXT,
+            thought_text TEXT,
+            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS person_facts (
+            id INTEGER PRIMARY KEY,
+            person_id INTEGER NOT NULL,
+            fact_text TEXT NOT NULL,
+            confidence REAL,
+            source_journal_id TEXT,
+            created_at TEXT,
+            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS person_ai_summaries (
+            person_id INTEGER PRIMARY KEY,
+            summary TEXT,
+            updated_at TEXT,
+            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+        )
+    """)
 
     conn.commit()
 
@@ -439,6 +497,238 @@ def episodic_metadata_count() -> int:
     except sqlite3.OperationalError:
         return 0
 
+
+def create_person(name: str) -> int:
+    """Create a person row (if not exists) and return id."""
+    conn = _get_conn()
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        "INSERT OR IGNORE INTO people (name, created_at) VALUES (?, ?)",
+        (name.strip(), now),
+    )
+    row = conn.execute("SELECT id FROM people WHERE name = ?", (name.strip(),)).fetchone()
+    return row[0] if row else 0
+
+
+def update_person(person_id: int, name: str) -> bool:
+    """Rename a person."""
+    conn = _get_conn()
+    cur = conn.execute("SELECT id FROM people WHERE id = ?", (person_id,))
+    if not cur.fetchone():
+        return False
+    conn.execute("UPDATE people SET name = ? WHERE id = ?", (name.strip(), person_id))
+    conn.commit()
+    return True
+
+
+def list_people_with_groups() -> list[dict]:
+    """Return all people with their groups."""
+    conn = _get_conn()
+    rows = conn.execute("SELECT id, name, created_at FROM people ORDER BY name COLLATE NOCASE").fetchall()
+    groups_map: dict[int, list[str]] = {}
+    g_rows = conn.execute("SELECT person_id, group_name FROM person_groups").fetchall()
+    for r in g_rows:
+        groups_map.setdefault(r[0], []).append(r[1])
+    result: list[dict] = []
+    for r in rows:
+        pid = r[0]
+        result.append(
+            {
+                "id": pid,
+                "name": r[1] or "",
+                "created_at": r[2] or "",
+                "groups": groups_map.get(pid, []),
+            }
+        )
+    return result
+
+
+def get_person_profile(person_id: int) -> dict | None:
+    """Return profile for a person, or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT relationship_summary, relationship_type, closeness_label FROM person_profiles WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "relationship_summary": row[0] or "",
+        "relationship_type": row[1] or "",
+        "closeness_label": row[2] or "",
+    }
+
+
+def upsert_person_profile(
+    person_id: int,
+    relationship_summary: str,
+    relationship_type: str | None,
+    closeness_label: str | None,
+) -> None:
+    """Insert or update a person's profile."""
+    conn = _get_conn()
+    cur = conn.execute("SELECT id FROM person_profiles WHERE person_id = ?", (person_id,))
+    if cur.fetchone():
+        conn.execute(
+            """
+            UPDATE person_profiles
+            SET relationship_summary = ?, relationship_type = ?, closeness_label = ?
+            WHERE person_id = ?
+            """,
+            (relationship_summary, relationship_type, closeness_label, person_id),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO person_profiles (person_id, relationship_summary, relationship_type, closeness_label)
+            VALUES (?, ?, ?, ?)
+            """,
+            (person_id, relationship_summary, relationship_type, closeness_label),
+        )
+    conn.commit()
+
+
+def get_person_ai_summary(person_id: int) -> dict | None:
+    """Return cached AI relationship summary for a person, or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT summary, updated_at FROM person_ai_summaries WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {"summary": row[0] or "", "updated_at": row[1] or ""}
+
+
+def set_person_ai_summary(person_id: int, summary: str) -> None:
+    """Insert or update cached AI relationship summary for a person."""
+    conn = _get_conn()
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        """
+        INSERT INTO person_ai_summaries (person_id, summary, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(person_id) DO UPDATE SET
+            summary = excluded.summary,
+            updated_at = excluded.updated_at
+        """,
+        (person_id, summary, now),
+    )
+    conn.commit()
+
+
+def get_person_groups(person_id: int) -> list[str]:
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT group_name FROM person_groups WHERE person_id = ? ORDER BY group_name COLLATE NOCASE",
+        (person_id,),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def set_person_groups(person_id: int, groups: list[str]) -> None:
+    """Replace a person's groups with the given list."""
+    conn = _get_conn()
+    conn.execute("DELETE FROM person_groups WHERE person_id = ?", (person_id,))
+    cleaned = {g.strip() for g in groups if g and g.strip()}
+    for g in cleaned:
+        conn.execute(
+            "INSERT INTO person_groups (person_id, group_name) VALUES (?, ?)",
+            (person_id, g),
+        )
+    conn.commit()
+
+
+def list_person_thoughts(person_id: int) -> list[dict]:
+    """Return all thoughts for a person ordered by date descending."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT id, date, thought_text FROM person_thoughts WHERE person_id = ? ORDER BY COALESCE(date, '') DESC, id DESC",
+        (person_id,),
+    ).fetchall()
+    return [{"id": r[0], "date": r[1] or "", "thought_text": r[2] or ""} for r in rows]
+
+
+def add_person_thought(person_id: int, date: str | None, text: str) -> int:
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO person_thoughts (person_id, date, thought_text) VALUES (?, ?, ?)",
+        (person_id, date, text.strip()),
+    )
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    conn.commit()
+    return int(row[0]) if row else 0
+
+
+def update_person_thought(thought_id: int, date: str | None, text: str) -> bool:
+    conn = _get_conn()
+    cur = conn.execute("SELECT id FROM person_thoughts WHERE id = ?", (thought_id,))
+    if not cur.fetchone():
+        return False
+    conn.execute(
+        "UPDATE person_thoughts SET date = ?, thought_text = ? WHERE id = ?",
+        (date, text.strip(), thought_id),
+    )
+    conn.commit()
+    return True
+
+
+def delete_person_thought(thought_id: int) -> bool:
+    conn = _get_conn()
+    cur = conn.execute("SELECT id FROM person_thoughts WHERE id = ?", (thought_id,))
+    if not cur.fetchone():
+        return False
+    conn.execute("DELETE FROM person_thoughts WHERE id = ?", (thought_id,))
+    conn.commit()
+    return True
+
+
+def list_person_facts(person_id: int) -> list[dict]:
+    """Return stored person facts for a person, newest first."""
+    conn = _get_conn()
+    rows = conn.execute(
+        """
+        SELECT id, fact_text, confidence, source_journal_id, created_at
+        FROM person_facts
+        WHERE person_id = ?
+        ORDER BY COALESCE(created_at, '') DESC, id DESC
+        """,
+        (person_id,),
+    ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "fact_text": r[1] or "",
+            "confidence": r[2],
+            "source_journal_id": r[3] or "",
+            "created_at": r[4] or "",
+        }
+        for r in rows
+    ]
+
+
+def replace_person_facts(person_id: int, facts: list[dict]) -> None:
+    """
+    Replace all person_facts for a person with the provided list.
+    Each fact dict should have keys: fact_text, confidence?, source_id?.
+    """
+    conn = _get_conn()
+    conn.execute("DELETE FROM person_facts WHERE person_id = ?", (person_id,))
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    for f in facts:
+        text = (f.get("fact_text") or "").strip()
+        if not text:
+            continue
+        conf = f.get("confidence")
+        src = f.get("source_id") or ""
+        conn.execute(
+            """
+            INSERT INTO person_facts (person_id, fact_text, confidence, source_journal_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (person_id, text, conf, src, now),
+        )
+    conn.commit()
 
 def add_consumed(
     item_id: str,
