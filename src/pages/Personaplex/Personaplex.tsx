@@ -50,7 +50,7 @@ import { Orb, OrbState } from "./components/Orb";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConnectButton } from "./components/ConnectButton";
 import { JournalGallery } from "./components/JournalGallery";
-import { MemoryDiagram } from "./components/MemoryDiagram";
+import { MemoryEditor } from "./components/MemoryEditor";
 
 /** Default journaling assistant prompt (base; personalization is always \"high\" / memory-connected) */
 const DEFAULT_PERSONAPLEX_PROMPT = `You are an empathetic and insightful conversational journaling assistant. Your goal is to provide a supportive space for the user to reflect on their thoughts, experiences, and emotions. Read the user's entries and respond naturally. Ask open-ended questions to encourage further exploration, but always let the user guide the direction and depth of the conversation. Avoid being overly prescriptive, giving unsolicited advice, or summarizing their thoughts unnecessarily. Just be a curious, active listener. Always facilitate conversation that gets the user exploring their thoughts and emotions. Try to keep responses brief and concise when possible to conserve tokens.`;
@@ -136,6 +136,25 @@ export const Personaplex = () => {
   const [libraryEditNote, setLibraryEditNote] = useState("");
   const [libraryUpdateSaving, setLibraryUpdateSaving] = useState(false);
   const [libraryLoading, setLibraryLoading] = useState(false);
+  const [memoryFacts, setMemoryFacts] = useState<{ id: number; document: string; session_id?: string; timestamp?: string }[]>([]);
+  const [memorySummaries, setMemorySummaries] = useState<{ id: number; document: string; session_id?: string; timestamp?: string; metadata_json?: string | null }[]>([]);
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const fetchMemoryList = useCallback(() => {
+    setMemoryLoading(true);
+    Promise.all([
+      fetch(`${BACKEND_URL}/memory/facts`).then((r) => (r.ok ? r.json() : { facts: [] })),
+      fetch(`${BACKEND_URL}/memory/summaries`).then((r) => (r.ok ? r.json() : { summaries: [] })),
+    ])
+      .then(([factsRes, summariesRes]) => {
+        setMemoryFacts(Array.isArray(factsRes.facts) ? factsRes.facts : []);
+        setMemorySummaries(Array.isArray(summariesRes.summaries) ? summariesRes.summaries : []);
+      })
+      .catch(() => {
+        setMemoryFacts([]);
+        setMemorySummaries([]);
+      })
+      .finally(() => setMemoryLoading(false));
+  }, []);
   const fetchLibrary = useCallback((showCachedFirst = false): Promise<void> => {
     if (showCachedFirst) {
       try {
@@ -229,8 +248,11 @@ export const Personaplex = () => {
   }, []);
 
   useEffect(() => {
-    if (view === "memory") fetchMemoryStats();
-  }, [view, fetchMemoryStats]);
+    if (view === "memory") {
+      fetchMemoryStats();
+      fetchMemoryList();
+    }
+  }, [view, fetchMemoryStats, fetchMemoryList]);
 
   const fetchRecommendations = useCallback((showLoadingUnlessCached = false) => {
     try {
@@ -389,8 +411,14 @@ export const Personaplex = () => {
     })
       .then((r) => {
         if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d.detail ?? "Ingest failed")));
+        return r.json();
       })
-      .then(() => {
+      .then((data) => {
+        if (data && data.ok === false) {
+          setToastMessage("Failed to add to memory. Check backend logs.");
+          setTimeout(() => setToastMessage(null), 4000);
+          return;
+        }
         setPriorJournalText("");
         saveEntry([{ role: "user", text: textToIngest }]);
         setToastMessage("Journal added to memory and saved to History.");
@@ -676,13 +704,14 @@ export const Personaplex = () => {
             }
             saveEntry([{ role: "user", text: content }], inferredDate);
             try {
-              await fetch(`${BACKEND_URL}/ingest-history`, {
+              const ingestRes = await fetch(`${BACKEND_URL}/ingest-history`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ text: content }),
               });
+              const data = ingestRes.ok ? await ingestRes.json().catch(() => ({})) : { ok: false };
               fetchMemoryStats();
-              setToastMessage("Imported journal and synced to memory.");
+              setToastMessage(data?.ok === false ? "Imported journal, but syncing to memory failed." : "Imported journal and synced to memory.");
             } catch {
               setToastMessage("Imported journal, but syncing to memory failed.");
             }
@@ -1076,7 +1105,7 @@ export const Personaplex = () => {
                     disabled={!priorJournalText.trim() || isIngesting}
                     className="px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
                   >
-                    {isIngesting ? "Adding…" : "Add to memory"}
+                    {isIngesting ? "Adding… (may take a minute)" : "Add to memory"}
                   </button>
                 </div>
               </div>
@@ -1094,55 +1123,20 @@ export const Personaplex = () => {
             </>
           )}
           {view === "memory" && (
-            <div className="flex-1 flex flex-col min-h-0 p-4 md:p-6 overflow-auto">
-              <h2 className="text-lg font-medium text-slate-300 uppercase tracking-wider mb-4 flex-shrink-0">
-                Memory visualization
-              </h2>
-              <div className="flex flex-col lg:flex-row gap-4 flex-1 min-h-0">
-                <div className="flex-shrink-0">
-                  <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-6 max-w-md">
-                    <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
-                      Memory stats
-                    </h3>
-                    <p className="text-xs text-slate-500 mb-4">
-                      Vector DB counts. The AI uses this memory when personalization is above 0%.
-                    </p>
-                    {memoryStats !== null ? (
-                      <div className="space-y-3 text-sm text-slate-300">
-                        <p>
-                          Gist facts: <span className="font-medium text-violet-300">{memoryStats.gist_facts_count}</span>
-                        </p>
-                        <p>
-                          Episodic summaries: <span className="font-medium text-violet-300">{memoryStats.episodic_log_count}</span>
-                        </p>
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={fetchMemoryStats}
-                            className="px-3 py-1.5 rounded-lg bg-slate-700/50 text-slate-400 text-xs font-medium hover:bg-slate-600/50 transition-colors"
-                          >
-                            Refresh
-                          </button>
-                          <button
-                            type="button"
-                            onClick={handleWipeMemory}
-                            disabled={isWipingMemory}
-                            className="px-3 py-1.5 rounded-lg bg-red-900/40 text-red-300 text-xs font-medium hover:bg-red-800/50 disabled:opacity-50 transition-colors"
-                          >
-                            {isWipingMemory ? "Wiping…" : "Wipe memory"}
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <p className="text-xs text-slate-500">Backend not reached. Start the Python backend and try again.</p>
-                    )}
-                  </div>
-                </div>
-                <div className="flex-1 min-h-0 min-w-0 flex flex-col">
-                  <MemoryDiagram onRefreshStats={fetchMemoryStats} />
-                </div>
-              </div>
-            </div>
+            <MemoryEditor
+              facts={memoryFacts}
+              summaries={memorySummaries}
+              stats={memoryStats}
+              loading={memoryLoading}
+              onRefresh={fetchMemoryList}
+              onRefreshStats={fetchMemoryStats}
+              onToast={(msg) => {
+                setToastMessage(msg);
+                setTimeout(() => setToastMessage(null), 2000);
+              }}
+              onWipeMemory={handleWipeMemory}
+              isWipingMemory={isWipingMemory}
+            />
           )}
           {view === "recommendations" && (
             <div className="flex-1 flex flex-col min-h-0 p-4 md:p-6 overflow-hidden">

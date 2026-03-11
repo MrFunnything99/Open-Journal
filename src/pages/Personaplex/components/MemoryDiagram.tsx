@@ -114,7 +114,7 @@ export function MemoryDiagram({ onRefreshStats }: MemoryDiagramProps) {
           disabled={status === "loading"}
           className="px-3 py-1.5 rounded-lg bg-slate-700/50 text-slate-400 text-xs font-medium hover:bg-slate-600/50 disabled:opacity-50 transition-colors"
         >
-          {status === "loading" ? "Generating…" : "Refresh"}
+          {status === "loading" ? "Generating…" : "Rebuild visualization"}
         </button>
       </div>
       <div className="flex-1 min-h-[280px] overflow-auto p-4 flex items-center justify-center">

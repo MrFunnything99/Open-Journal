@@ -176,6 +176,8 @@ trace*.json
 pkg
 *.nsys-rep
 *.sqlite
+data/
+chroma_data/
 *.pem
 *.tgz
 *.mp3

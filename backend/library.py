@@ -1,5 +1,6 @@
 """
-ChromaDB library for Open-Journal: gist_facts (semantic) and episodic_log (episodic) memory.
+Library for Open-Journal: gist_facts (semantic) and episodic_log (episodic) memory,
+and consumed_content (library). Uses SQLite + sqlite-vec for vector storage.
 """
 from __future__ import annotations
 
@@ -10,27 +11,19 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-import chromadb
 from google import genai
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-# Paths
-CHROMA_PATH = Path(__file__).resolve().parent.parent / "chroma_data"
-COLLECTION_GIST = "gist_facts"
-COLLECTION_EPISODIC = "episodic_log"
-COLLECTION_CONSUMED = "consumed_content"
 
 # Clients (lazy init)
-_client: chromadb.PersistentClient | None = None
 _embeddings_client: genai.Client | None = None
 
 
-def _get_chroma() -> chromadb.PersistentClient:
-    global _client
-    if _client is None:
-        CHROMA_PATH.mkdir(parents=True, exist_ok=True)
-        _client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-    return _client
+def _ensure_storage() -> None:
+    """Ensure SQLite + sqlite-vec DB is initialized."""
+    import vec_store
+
+    vec_store.ensure_db()
 
 
 def _get_embeddings_client() -> genai.Client:
@@ -74,25 +67,12 @@ def _call_gemini(prompt: str) -> str:
         return ""
 
 
-def _ensure_collections():
-    """Create gist_facts, episodic_log, and consumed_content collections with cosine similarity."""
-    client = _get_chroma()
-    for name in [COLLECTION_GIST, COLLECTION_EPISODIC, COLLECTION_CONSUMED]:
-        try:
-            client.get_collection(name)
-        except Exception:
-            client.create_collection(name, metadata={"hnsw:space": "cosine"})
-
-
 def wipe_memory() -> None:
-    """Delete Chroma collections and recreate them empty (gist, episodic only; consumed_content kept)."""
-    client = _get_chroma()
-    for name in [COLLECTION_GIST, COLLECTION_EPISODIC]:
-        try:
-            client.delete_collection(name=name)
-        except Exception:
-            pass
-    _ensure_collections()
+    """Clear gist and episodic memory (consumed_content kept)."""
+    import vec_store
+
+    _ensure_storage()
+    vec_store.wipe_memory()
 
 
 def add_consumed(
@@ -107,11 +87,11 @@ def add_consumed(
 ) -> None:
     """
     Record that the user has read/listened to a recommendation (book, podcast, article, research).
-    Stored in Chroma for the recommendation agent to avoid re-suggesting and to learn preferences.
-    Optional note and date_completed (e.g. "2024" or "2024-06-15") are stored for the Library UI.
+    Stored in SQLite+sqlite-vec for the recommendation agent. Optional note and date_completed for Library UI.
     """
-    _ensure_collections()
-    client = _get_chroma()
+    import vec_store
+
+    _ensure_storage()
     ts = datetime.utcnow().isoformat() + "Z"
     ts_safe = ts.replace(":", "-").replace(".", "-")
     doc = f"User consumed {content_type}: {title}"
@@ -123,22 +103,19 @@ def add_consumed(
     if note:
         doc += f" Note: {note}"
     emb = _embed_texts([doc])[0]
-    col = client.get_collection(COLLECTION_CONSUMED)
     uid = f"consumed_{ts_safe}_{hash(title) % 10**8}"
-    col.add(
-        ids=[uid],
-        embeddings=[emb],
-        documents=[doc],
-        metadatas=[{
-            "type": content_type,
-            "title": title[:500],
-            "author": (author or "")[:300],
-            "url": (url or "")[:500],
-            "liked": liked,
-            "timestamp": ts,
-            "note": (note or "")[:2000],
-            "date_completed": (date_completed or "")[:50],
-        }],
+    vec_store.add_consumed(
+        uid,
+        doc,
+        emb,
+        type_=content_type,
+        title=title,
+        author=(author or "")[:300],
+        url=(url or "")[:500],
+        liked=liked,
+        timestamp=ts,
+        note=(note or "")[:2000],
+        date_completed=(date_completed or "")[:50],
     )
 
 
@@ -220,21 +197,15 @@ def get_consumed_context(max_items: int = 80) -> str:
     Return a single string describing what the user has consumed and liked,
     for injection into the recommendation agent prompt.
     """
-    _ensure_collections()
-    client = _get_chroma()
+    import vec_store
+
+    _ensure_storage()
     try:
-        col = client.get_collection(COLLECTION_CONSUMED)
-        if col.count() == 0:
+        rows = vec_store.get_consumed_context_rows(max_items=max_items)
+        if not rows:
             return "The user has not marked any books, podcasts, or articles as read/listened yet."
-        res = col.get(
-            include=["metadatas"],
-            limit=min(max_items, col.count()),
-        )
-        metadatas = res.get("metadatas") or []
         lines = []
-        for m in metadatas:
-            if not m:
-                continue
+        for m in rows:
             t = m.get("type", "item")
             title = m.get("title", "?")
             author = m.get("author", "")
@@ -273,50 +244,25 @@ def list_consumed(max_items: int = 200) -> dict[str, list[dict]]:
     Return consumed items grouped by type for the Library UI, sorted by date_completed (newest first).
     Each item: { "id", "title", "author", "date_completed", "note" }.
     """
-    _ensure_collections()
-    client = _get_chroma()
+    import vec_store
+
+    _ensure_storage()
     out: dict[str, list[dict]] = {"books": [], "podcasts": [], "articles": [], "research": []}
     try:
-        col = client.get_collection(COLLECTION_CONSUMED)
-        if col.count() == 0:
-            return out
-        # Chroma's include only accepts: documents, embeddings, metadatas, distances, uris, data (ids are returned by default)
-        res = col.get(
-            include=["metadatas"],
-            limit=min(max_items, col.count()),
-        )
-        raw_ids = res.get("ids") or []
-        # Chroma may return ids as flat list or list-of-lists
-        ids_list = []
-        for x in raw_ids:
-            if isinstance(x, list) and x:
-                ids_list.append(x[0])
-            elif isinstance(x, str):
-                ids_list.append(x)
-            else:
-                ids_list.append("")
-        metadatas = res.get("metadatas") or []
+        rows = vec_store.list_consumed_rows(max_items=max_items)
         type_to_key = {"book": "books", "podcast": "podcasts", "article": "articles", "research": "research"}
-        for idx, m in enumerate(metadatas):
-            if not m:
-                continue
-            t = (m.get("type") or "article").lower()
-            key = type_to_key.get(t)
+        for r in rows:
+            key = type_to_key.get(r["type"])
             if not key:
                 continue
-            title = (m.get("title") or "?").strip()
-            if not title:
+            if not (r.get("title") or "").strip():
                 continue
-            doc_id = ids_list[idx] if idx < len(ids_list) else ""
-            author = (m.get("author") or "").strip()
-            date_completed = (m.get("date_completed") or "").strip()
-            note = (m.get("note") or "").strip()
             out[key].append({
-                "id": doc_id,
-                "title": title,
-                "author": author,
-                "date_completed": date_completed,
-                "note": note,
+                "id": r.get("id", ""),
+                "title": r.get("title", "?"),
+                "author": r.get("author", ""),
+                "date_completed": r.get("date_completed", ""),
+                "note": r.get("note", ""),
             })
         for key in out:
             out[key].sort(key=lambda x: _parse_date_completed(x.get("date_completed") or ""), reverse=True)
@@ -327,48 +273,31 @@ def list_consumed(max_items: int = 200) -> dict[str, list[dict]]:
 
 
 def update_consumed(item_id: str, *, date_completed: str | None = None, note: str | None = None) -> bool:
-    """
-    Update date_completed and/or note for a consumed item by Chroma id.
-    Returns True if updated, False if not found or error.
-    """
-    _ensure_collections()
-    client = _get_chroma()
+    """Update date_completed and/or note for a consumed item. Returns True if updated."""
+    import vec_store
+
+    _ensure_storage()
     try:
-        col = client.get_collection(COLLECTION_CONSUMED)
-        res = col.get(ids=[item_id], include=["metadatas"])
-        metadatas = (res.get("metadatas") or [])
-        if not metadatas:
-            return False
-        meta = dict(metadatas[0])
-        if date_completed is not None:
-            meta["date_completed"] = (date_completed or "")[:50]
-        if note is not None:
-            meta["note"] = (note or "")[:2000]
-        col.update(ids=[item_id], metadatas=[meta])
-        return True
+        return vec_store.update_consumed(item_id, date_completed=date_completed, note=note)
     except Exception as e:
         print("[backend] update_consumed error:", e)
         return False
 
 
 def delete_consumed(item_id: str) -> bool:
-    """
-    Remove a consumed item from Chroma by id.
-    Returns True if deleted, False if not found or error.
-    """
-    _ensure_collections()
-    client = _get_chroma()
+    """Remove a consumed item by id. Returns True if deleted."""
+    import vec_store
+
+    _ensure_storage()
     try:
-        col = client.get_collection(COLLECTION_CONSUMED)
-        col.delete(ids=[item_id])
-        return True
+        return vec_store.delete_consumed(item_id)
     except Exception as e:
         print("[backend] delete_consumed error:", e)
         return False
 
 
 def _extract_session_data(transcript: str) -> dict:
-    """Use Gemini LLM to extract summary and facts from transcript."""
+    """Use Gemini LLM to extract summary, facts, and structured metadata from transcript."""
     prompt = f"""You are a journal analyst. Extract structured data from this journal session transcript.
 
 Transcript:
@@ -379,19 +308,25 @@ Transcript:
 Return ONLY valid JSON with this exact structure (no markdown, no extra text):
 {{
   "summary": "A 3-sentence summary of the session: what was discussed, key themes, and emotions felt.",
-  "facts": ["Fact 1 about the user", "Fact 2 about the user", ...]
+  "facts": ["Fact 1 about the user", "Fact 2 about the user", ...],
+  "metadata": {{
+    "people": ["Name1", "Name2"],
+    "topics": ["topic1", "topic2"],
+    "mood": -2,
+    "energy": 3,
+    "activities": ["activity1", "activity2"]
+  }}
 }}
 
 Rules:
 - summary: exactly 3 sentences, capture emotions and themes
 - facts: list of hard, verifiable facts about the user (job, relationships, preferences, life events). Empty list if none.
+- metadata: for pattern analysis. people: list of people mentioned. topics: major discussion topics. mood: integer from -5 (very negative) to +5 (very positive). energy: integer from 1 (low) to 5 (high). activities: list of actions or activities described. Omit any field if unknown; use empty lists for people/topics/activities and null for mood/energy when unclear.
 """
     text = _call_gemini(prompt)
     text = (text or "").strip()
     if not text:
-        # Fall back to empty summary/facts if LLM unavailable
-        return {"summary": "", "facts": []}
-    # Strip markdown code blocks if present
+        return {"summary": "", "facts": [], "metadata": {}}
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
@@ -401,88 +336,97 @@ Rules:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         print("[backend] _extract_session_data JSON error:", e)
-        return {"summary": "", "facts": []}
+        return {"summary": "", "facts": [], "metadata": {}}
     if not isinstance(data, dict):
-        return {"summary": "", "facts": []}
-    # Ensure keys exist
+        return {"summary": "", "facts": [], "metadata": {}}
     data.setdefault("summary", "")
     data.setdefault("facts", [])
+    meta = data.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.setdefault("people", [])
+    meta.setdefault("topics", [])
+    meta.setdefault("mood", None)
+    meta.setdefault("energy", None)
+    meta.setdefault("activities", [])
+    if not isinstance(meta["people"], list):
+        meta["people"] = []
+    if not isinstance(meta["topics"], list):
+        meta["topics"] = []
+    if not isinstance(meta["activities"], list):
+        meta["activities"] = []
+    data["metadata"] = meta
     return data
 
 
-def save_session_data(session_id: str, transcript: str) -> None:
+def save_session_data(session_id: str, transcript: str) -> dict:
     """
-    Extract summary + facts from transcript via OpenRouter, embed via Gemini embeddings, save to ChromaDB.
+    Extract summary + facts + metadata from transcript via Gemini, embed via Gemini, save to SQLite+sqlite-vec.
+    Returns {"summary": str, "facts": list[str]} for callers (e.g. LightRAG feed).
+    Episodic row also stores metadata_json for future time-series / pattern analysis; metadata is not embedded.
     """
-    _ensure_collections()
-    client = _get_chroma()
+    import vec_store
 
+    _ensure_storage()
     data = _extract_session_data(transcript)
     summary = data.get("summary", "")
     facts = data.get("facts", [])
+    metadata = data.get("metadata") or {}
 
     ts = datetime.utcnow().isoformat() + "Z"
 
-    # Episodic: add summary with metadata
     if summary:
-        ep_col = client.get_collection(COLLECTION_EPISODIC)
         summary_emb = _embed_texts([summary])[0]
-        ep_id = f"{session_id}_ep_{ts.replace(':', '-').replace('.', '-')}"
-        ep_col.add(
-            ids=[ep_id],
-            embeddings=[summary_emb],
-            documents=[summary],
-            metadatas=[{"session_id": session_id, "timestamp": ts}],
-        )
+        metadata_json = json.dumps(metadata) if metadata else None
+        vec_store.add_episodic(session_id, ts, summary, summary_emb, metadata_json=metadata_json)
 
-    # Gist: add each fact
+    # Deduplicate facts: if a new fact is very similar to an existing one, update it instead of inserting
+    GIST_SIMILARITY_THRESHOLD = 0.85  # cosine similarity above this => update existing fact
     if facts:
-        gist_col = client.get_collection(COLLECTION_GIST)
         fact_embs = _embed_texts(facts)
-        ts_safe = ts.replace(":", "-").replace(".", "-")
-        gist_col.add(
-            ids=[f"{session_id}_gist_{i}_{ts_safe}" for i in range(len(facts))],
-            embeddings=fact_embs,
-            documents=facts,
-            metadatas=[{"session_id": session_id, "timestamp": ts} for _ in facts],
-        )
+        n_existing = vec_store.gist_count()
+        for fact in facts:
+            emb = fact_embs[facts.index(fact)]
+            if n_existing > 0:
+                nearest = vec_store.query_gist_nearest(emb, k=1)
+                if nearest:
+                    _doc_id, existing_doc, distance = nearest[0]
+                    similarity = 1.0 - distance
+                    if similarity >= GIST_SIMILARITY_THRESHOLD:
+                        # Only update if the new fact has more content (avoids regression to weaker facts)
+                        if len(fact) > len(existing_doc):
+                            vec_store.update_gist(_doc_id, fact, emb)
+                        continue
+            vec_store.add_gist(session_id, ts, fact, emb)
+            n_existing += 1
+
+    return {"summary": summary, "facts": facts}
 
 
 def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 5) -> str:
     """
-    Embed the query, retrieve relevant gist facts and episodic summaries from Chroma,
+    Embed the query, retrieve relevant gist facts and episodic summaries from SQLite+sqlite-vec,
     and return a single string for injection into the interviewer's context.
     """
+    import vec_store
+
     if not query or not query.strip():
         return "None."
-    _ensure_collections()
-    client = _get_chroma()
+    _ensure_storage()
     query_emb = _embed_texts([query.strip()])[0]
 
     parts = []
     try:
-        gist_col = client.get_collection(COLLECTION_GIST)
-        if gist_col.count() > 0:
-            gist_res = gist_col.query(
-                query_embeddings=[query_emb],
-                n_results=min(top_k_gist, gist_col.count()),
-                include=["documents"],
-            )
-            docs = (gist_res.get("documents") or [[]])[0] or []
+        if vec_store.gist_count() > 0:
+            docs = vec_store.query_gist(query_emb, min(top_k_gist, vec_store.gist_count()))
             if docs:
                 parts.append("Facts and details from the user's life and journals:\n" + "\n".join(f"- {d}" for d in docs))
     except Exception:
         pass
 
     try:
-        ep_col = client.get_collection(COLLECTION_EPISODIC)
-        if ep_col.count() > 0:
-            ep_res = ep_col.query(
-                query_embeddings=[query_emb],
-                n_results=min(top_k_episodic, ep_col.count()),
-                include=["documents"],
-            )
-            docs = (ep_res.get("documents") or [[]])[0] or []
+        if vec_store.episodic_count() > 0:
+            docs = vec_store.query_episodic(query_emb, min(top_k_episodic, vec_store.episodic_count()))
             if docs:
                 parts.append("Relevant journal summaries:\n" + "\n".join(f"- {d}" for d in docs))
     except Exception:
@@ -497,28 +441,118 @@ def get_memory_for_visualization() -> tuple[list[str], list[str]]:
     """
     Return (gist_facts, episodic_summaries) as lists of document strings for diagram generation.
     """
-    _ensure_collections()
-    client = _get_chroma()
+    import vec_store
+
+    _ensure_storage()
     gist_docs: list[str] = []
     episodic_docs: list[str] = []
 
     try:
-        gist_col = client.get_collection(COLLECTION_GIST)
-        if gist_col.count() > 0:
-            res = gist_col.get(include=["documents"])
-            gist_docs = list(res.get("documents") or [])
+        gist_docs = vec_store.get_all_gist()
     except Exception:
         pass
 
     try:
-        ep_col = client.get_collection(COLLECTION_EPISODIC)
-        if ep_col.count() > 0:
-            res = ep_col.get(include=["documents"])
-            episodic_docs = list(res.get("documents") or [])
+        episodic_docs = vec_store.get_all_episodic()
     except Exception:
         pass
 
     return (gist_docs, episodic_docs)
+
+
+def list_memory_facts() -> list[dict]:
+    """Return all gist facts with id, document, session_id, timestamp for Memory UI."""
+    import vec_store
+
+    _ensure_storage()
+    try:
+        return vec_store.list_gist_with_ids()
+    except Exception as e:
+        print("[backend] list_memory_facts error:", e)
+        return []
+
+
+def list_memory_summaries() -> list[dict]:
+    """Return all episodic summaries with id, document, session_id, timestamp for Memory UI."""
+    import vec_store
+
+    _ensure_storage()
+    try:
+        return vec_store.list_episodic_with_ids()
+    except Exception as e:
+        print("[backend] list_memory_summaries error:", e)
+        return []
+
+
+def update_memory_fact(fact_id: int, document: str) -> bool:
+    """Update a gist fact by id; re-embeds and updates vec store. Returns True if found."""
+    import vec_store
+
+    _ensure_storage()
+    if not document or not document.strip():
+        return False
+    doc = document.strip()
+    emb = _embed_texts([doc])[0]
+    return vec_store.update_gist(fact_id, doc, emb)
+
+
+def update_memory_summary(
+    summary_id: int, document: str, metadata: dict | None = None
+) -> bool:
+    """Update an episodic summary by id; re-embeds and updates vec store. Optionally update metadata_json."""
+    import vec_store
+
+    _ensure_storage()
+    if not document or not document.strip():
+        return False
+    doc = document.strip()
+    emb = _embed_texts([doc])[0]
+    metadata_json = json.dumps(metadata) if metadata is not None else None
+    return vec_store.update_episodic(summary_id, doc, emb, metadata_json=metadata_json)
+
+
+def delete_memory_fact(fact_id: int) -> bool:
+    """Delete a gist fact by id. Returns True if found and deleted."""
+    import vec_store
+
+    _ensure_storage()
+    return vec_store.delete_gist(fact_id)
+
+
+def delete_memory_summary(summary_id: int) -> bool:
+    """Delete an episodic summary by id. Returns True if found and deleted."""
+    import vec_store
+
+    _ensure_storage()
+    return vec_store.delete_episodic(summary_id)
+
+
+def add_memory_fact(document: str, session_id: str | None = None) -> int | None:
+    """Add a single user-created fact; returns new id or None on failure."""
+    import vec_store
+
+    _ensure_storage()
+    if not document or not document.strip():
+        return None
+    doc = document.strip()
+    sid = session_id or "user"
+    ts = datetime.utcnow().isoformat() + "Z"
+    emb = _embed_texts([doc])[0]
+    return vec_store.add_gist(sid, ts, doc, emb)
+
+
+def add_memory_summary(document: str, session_id: str | None = None) -> int | None:
+    """Add a single user-created summary; returns new id or None on failure."""
+    import vec_store
+
+    _ensure_storage()
+    if not document or not document.strip():
+        return None
+    doc = document.strip()
+    sid = session_id or "user"
+    ts = datetime.utcnow().isoformat() + "Z"
+    emb = _embed_texts([doc])[0]
+    return vec_store.add_episodic(sid, ts, doc, emb)
 
 
 def generate_memory_mermaid(gist_facts: list[str], episodic_summaries: list[str]) -> str:

@@ -28,6 +28,9 @@ class JournalState(TypedDict):
     personalization: float
     intrusiveness: NotRequired[float]
     retrieval_log: NotRequired[str]
+    last_transcript: NotRequired[str]
+    last_summary: NotRequired[str]
+    last_facts: NotRequired[list]
 
 
 def _get_llm():
@@ -82,7 +85,7 @@ def _last_user_text(messages: list) -> str:
 def interviewer_node(state: JournalState) -> JournalState:
     """
     Respond with empathy. When personalization > 0, retrieve relevant context from
-    Chroma (gist_facts + episodic_log) and inject it so the model can personalize.
+    the vector store (gist_facts + episodic_log) and inject it so the model can personalize.
     """
     llm = _get_llm()
     personalization = max(0.0, min(1.0, state.get("personalization", 1.0)))
@@ -135,11 +138,16 @@ def interviewer_node(state: JournalState) -> JournalState:
 
 
 def librarian_node(state: JournalState) -> JournalState:
-    """Background worker: extract, embed, save to ChromaDB."""
+    """Background worker: extract, embed, save to SQLite+sqlite-vec (and optionally LightRAG)."""
     session_id = state.get("session_id", "default")
     transcript = _messages_to_transcript(state["messages"])
-    save_session_data(session_id, transcript)
-    return {"messages": []}
+    extracted = save_session_data(session_id, transcript)
+    return {
+        "messages": [],
+        "last_transcript": transcript,
+        "last_summary": extracted.get("summary", ""),
+        "last_facts": extracted.get("facts", []),
+    }
 
 
 def _messages_to_transcript(messages: list[BaseMessage]) -> str:

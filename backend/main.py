@@ -25,17 +25,22 @@ for name in (".env", ".env.local"):
 from graph import build_graph, build_librarian_graph, JournalState
 from langchain_core.messages import HumanMessage
 from library import (
-    COLLECTION_EPISODIC,
-    COLLECTION_GIST,
-    _get_chroma,
     add_consumed,
+    add_memory_fact,
+    add_memory_summary,
     delete_consumed,
+    delete_memory_fact,
+    delete_memory_summary,
     generate_memory_mermaid,
     generate_recommendations,
     get_memory_for_visualization,
     list_consumed,
+    list_memory_facts,
+    list_memory_summaries,
     save_session_data,
     update_consumed,
+    update_memory_fact,
+    update_memory_summary,
     wipe_memory,
 )
 from google import genai
@@ -72,12 +77,22 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Open-Journal Backend", lifespan=lifespan)
+# Explicit origins so CORS works with credentials; "*" cannot be used when credentials=True
+_extra_origins = [s.strip() for s in os.getenv("CORS_ORIGINS", "").split(",") if s.strip()]
+_cors_origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    *_extra_origins,
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 chat_graph = build_graph()
@@ -124,9 +139,35 @@ class InferEntryDateResponse(BaseModel):
     date: Optional[str] = None  # ISO 8601 or null if unclear
 
 
+class MemoryItem(BaseModel):
+    id: int
+    document: str
+    session_id: str = ""
+    timestamp: str = ""
+    metadata_json: Optional[str] = None  # episodic only; JSON string for people, topics, mood, energy, activities
+
+
+class MemoryFactUpdate(BaseModel):
+    document: str
+
+
+class MemorySummaryUpdate(BaseModel):
+    document: str
+    metadata: Optional[dict] = None  # optional; updates metadata_json (people, topics, mood, energy, activities)
+
+
+class MemoryFactCreate(BaseModel):
+    document: str
+
+
+class MemorySummaryCreate(BaseModel):
+    document: str
+
+
 class MemoryStats(BaseModel):
     gist_facts_count: int
     episodic_log_count: int
+    episodic_metadata_count: int = 0  # summaries with metadata (people, topics, etc.)
 
 
 class RecommendationItem(BaseModel):
@@ -247,7 +288,7 @@ async def chat(req: ChatRequest):
 
 @app.post("/end-session", response_model=EndSessionResponse)
 async def end_session(req: EndSessionRequest):
-    """Trigger Librarian: extract, embed, save to ChromaDB."""
+    """Trigger Librarian: extract, embed, save to SQLite+sqlite-vec (and LightRAG when enabled)."""
     session_id = get_or_create_session(req.session_id)
     messages = sessions.get(session_id, [])
 
@@ -256,7 +297,26 @@ async def end_session(req: EndSessionRequest):
         "session_id": session_id,
         "personalization": 1.0,
     }
-    librarian_graph.invoke(state)
+    state = await asyncio.to_thread(librarian_graph.invoke, state)
+    # Feed LightRAG in background so response returns fast
+    summary = state.get("last_summary") or ""
+    facts = state.get("last_facts") or []
+    if summary or facts:
+        parts = []
+        if summary:
+            parts.append(f"Summary: {summary}")
+        if facts:
+            parts.append("Facts: " + "; ".join(facts))
+        doc = "\n\n".join(parts)
+
+        async def _bg_lightrag():
+            try:
+                from lightrag_bridge import insert_text as lightrag_insert
+                await lightrag_insert(doc)
+            except Exception as e:
+                print("[backend] LightRAG insert after end_session:", e)
+
+        asyncio.create_task(_bg_lightrag())
 
     return EndSessionResponse(ok=True, session_id=session_id)
 
@@ -264,12 +324,41 @@ async def end_session(req: EndSessionRequest):
 @app.post("/ingest-history", response_model=IngestHistoryResponse)
 async def ingest_history(req: IngestHistoryRequest):
     """
-    Ingest a prior journal text directly into Chroma memory.
-    Treats `text` as a single-session transcript.
+    Ingest a prior journal text into SQLite+sqlite-vec and LightRAG.
+    Treats `text` as a single-session transcript. LightRAG gets same summary+facts as vec_store.
+    Returns 200 always (so CORS headers are sent); ok=False on failure.
     """
     session_id = req.session_id or f"import-{uuid.uuid4()}"
-    save_session_data(session_id, req.text)
-    return IngestHistoryResponse(ok=True, session_id=session_id)
+    try:
+        text = (req.text or "").strip()
+        if not text:
+            return IngestHistoryResponse(ok=True, session_id=session_id)
+        extracted = await asyncio.to_thread(save_session_data, session_id, text)
+        summary = extracted.get("summary") or ""
+        facts = extracted.get("facts") or []
+        if summary or facts:
+            parts = []
+            if summary:
+                parts.append(f"Summary: {summary}")
+            if facts:
+                parts.append("Facts: " + "; ".join(facts))
+            doc = "\n\n".join(parts)
+
+            async def _bg_lightrag():
+                try:
+                    from lightrag_bridge import insert_text as lightrag_insert
+                    await lightrag_insert(doc)
+                except Exception as e:
+                    print("[backend] LightRAG insert after ingest:", e)
+
+            asyncio.create_task(_bg_lightrag())
+
+        return IngestHistoryResponse(ok=True, session_id=session_id)
+    except Exception as e:
+        import traceback
+        print("[backend] ingest_history error:", e)
+        traceback.print_exc()
+        return IngestHistoryResponse(ok=False, session_id=session_id)
 
 
 INFER_DATE_SYSTEM = """You are a date extractor. Given journal text, determine the single date and time when this journal entry was written.
@@ -330,15 +419,106 @@ async def infer_entry_date(req: InferEntryDateRequest):
 @app.get("/memory-stats", response_model=MemoryStats)
 async def memory_stats():
     """
-    Lightweight stats endpoint to verify Chroma is populated.
+    Lightweight stats endpoint to verify vector store is populated.
     """
-    client = _get_chroma()
-    gist = client.get_collection(COLLECTION_GIST)
-    episodic = client.get_collection(COLLECTION_EPISODIC)
+    import vec_store
+
+    vec_store.ensure_db()
     return MemoryStats(
-        gist_facts_count=gist.count(),
-        episodic_log_count=episodic.count(),
+        gist_facts_count=vec_store.gist_count(),
+        episodic_log_count=vec_store.episodic_count(),
+        episodic_metadata_count=vec_store.episodic_metadata_count(),
     )
+
+
+@app.get("/memory/facts")
+async def get_memory_facts():
+    """List all gist facts with ids for Memory UI (view/edit/delete)."""
+    try:
+        items = await asyncio.to_thread(list_memory_facts)
+        return {"facts": [MemoryItem(**x) for x in items]}
+    except Exception as e:
+        print("[backend] GET /memory/facts error:", e)
+        return {"facts": []}
+
+
+@app.get("/memory/summaries")
+async def get_memory_summaries():
+    """List all episodic summaries with ids for Memory UI."""
+    try:
+        items = await asyncio.to_thread(list_memory_summaries)
+        return {"summaries": [MemoryItem(**x) for x in items]}
+    except Exception as e:
+        print("[backend] GET /memory/summaries error:", e)
+        return {"summaries": []}
+
+
+@app.patch("/memory/facts/{fact_id}")
+async def update_memory_fact_route(fact_id: int, req: MemoryFactUpdate):
+    """Update a gist fact by id; re-embeds and updates store."""
+    try:
+        ok = await asyncio.to_thread(update_memory_fact, fact_id, req.document)
+        return {"ok": ok}
+    except Exception as e:
+        print("[backend] PATCH /memory/facts error:", e)
+        return {"ok": False}
+
+
+@app.patch("/memory/summaries/{summary_id}")
+async def update_memory_summary_route(summary_id: int, req: MemorySummaryUpdate):
+    """Update an episodic summary by id; re-embeds and updates store. Optionally update metadata_json."""
+    try:
+        ok = await asyncio.to_thread(
+            update_memory_summary, summary_id, req.document, req.metadata
+        )
+        return {"ok": ok}
+    except Exception as e:
+        print("[backend] PATCH /memory/summaries error:", e)
+        return {"ok": False}
+
+
+@app.delete("/memory/facts/{fact_id}")
+async def delete_memory_fact_route(fact_id: int):
+    """Delete a gist fact by id."""
+    try:
+        ok = await asyncio.to_thread(delete_memory_fact, fact_id)
+        return {"ok": ok}
+    except Exception as e:
+        print("[backend] DELETE /memory/facts error:", e)
+        return {"ok": False}
+
+
+@app.delete("/memory/summaries/{summary_id}")
+async def delete_memory_summary_route(summary_id: int):
+    """Delete an episodic summary by id."""
+    try:
+        ok = await asyncio.to_thread(delete_memory_summary, summary_id)
+        return {"ok": ok}
+    except Exception as e:
+        print("[backend] DELETE /memory/summaries error:", e)
+        return {"ok": False}
+
+
+@app.post("/memory/facts")
+async def create_memory_fact(req: MemoryFactCreate):
+    """Add a user-created fact; returns new id."""
+    try:
+        fid = await asyncio.to_thread(add_memory_fact, req.document)
+        return {"ok": fid is not None, "id": fid}
+    except Exception as e:
+        print("[backend] POST /memory/facts error:", e)
+        return {"ok": False, "id": None}
+
+
+@app.post("/memory/summaries")
+async def create_memory_summary(req: MemorySummaryCreate):
+    """Add a user-created summary; returns new id."""
+    try:
+        sid = await asyncio.to_thread(add_memory_summary, req.document)
+        return {"ok": sid is not None, "id": sid}
+    except Exception as e:
+        print("[backend] POST /memory/summaries error:", e)
+        return {"ok": False, "id": None}
 
 
 RECOMMENDATIONS_TIMEOUT_SEC = 120
@@ -371,7 +551,7 @@ async def get_recommendations():
 @app.post("/recommendations/consumed", response_model=ConsumedResponse)
 async def mark_consumed(req: ConsumedRequest):
     """
-    Record that the user has read/listened to a recommendation. Stored in Chroma
+    Record that the user has read/listened to a recommendation. Stored in the vector store
     so future recommendations avoid repeats and better match their tastes.
     """
     content_type = (req.type or "article").lower()
@@ -407,7 +587,7 @@ async def get_library():
 @app.patch("/library/{item_id}")
 async def update_library_item(item_id: str, req: LibraryItemUpdate):
     """
-    Update date_completed and/or note for a library item (Chroma id).
+    Update date_completed and/or note for a library item by id.
     """
     try:
         ok = await asyncio.to_thread(
@@ -452,10 +632,27 @@ async def library_notes(req: LibraryNoteRequest):
         return LibraryNoteResponse(ok=False, items_added=0)
 
 
+@app.get("/lightrag-context")
+async def lightrag_context(q: str = "", mode: str = "hybrid"):
+    """
+    Optional RAG context from LightRAG (knowledge-graph + vector). Use when LightRAG is enabled.
+    Query param: q=... (required), mode=local|global|hybrid|naive|mix (default hybrid).
+    """
+    if not (q or "").strip():
+        return {"context": ""}
+    try:
+        from lightrag_bridge import query_for_context
+        context = await query_for_context(q.strip(), mode=mode)
+        return {"context": context}
+    except Exception as e:
+        print("[backend] /lightrag-context error:", e)
+        return {"context": ""}
+
+
 @app.post("/memory-wipe")
 async def memory_wipe():
     """
-    Wipe all data from the vector DB (gist_facts and episodic_log). Collections are recreated empty.
+    Wipe gist and episodic memory (SQLite+sqlite-vec). Consumed library is kept.
     """
     wipe_memory()
     return {"ok": True, "message": "Memory wiped."}

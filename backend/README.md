@@ -1,6 +1,6 @@
 # Open-Journal Python Backend
 
-Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with ChromaDB memory.
+Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** for vector memory and **LightRAG** for knowledge-graph RAG.
 
 ## Setup (1-time)
 
@@ -20,10 +20,15 @@ cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install 
 
 ## Environment
 
-Copy `.env.example` to `.env` in the project root and add:
+Copy `.env.example` to `.env` in the project root and set:
 
-- `OPENROUTER_API_KEY` – from https://openrouter.ai/keys
-- `VOYAGE_API_KEY` – from https://dash.voyageai.com/
+- `GEMINI_API_KEY` – for embeddings and chat (required)
+- `GEMINI_CHAT_MODEL` – e.g. `gemini-1.5-flash` (optional)
+- `GEMINI_EMBEDDING_MODEL` – e.g. `gemini-embedding-2-preview` (optional)
+- `EMBEDDING_DIM` – vector size, default `768` (optional)
+- `LIGHTRAG_ENABLED` – set to `false` to disable LightRAG indexing (optional)
+
+On macOS, the system Python SQLite may not support extensions; install `pysqlite3` so sqlite-vec works (`pip install pysqlite3`).
 
 ## Run
 
@@ -45,5 +50,6 @@ Copy `.env.example` to `.env` in the project root and add:
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/chat` | Send user text, get Interviewer response |
-| POST | `/end-session` | Trigger Librarian to extract & save to ChromaDB |
+| POST | `/end-session` | Trigger Librarian to extract & save to SQLite+sqlite-vec and LightRAG |
+| GET | `/lightrag-context?q=...` | Optional RAG context from LightRAG (hybrid/local/global) |
 | GET | `/health` | Health check |
