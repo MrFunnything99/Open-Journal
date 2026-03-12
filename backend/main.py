@@ -4,12 +4,14 @@ FastAPI backend for Open-Journal: /chat and /end-session.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict
-import json
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -32,13 +34,16 @@ from library import (
     delete_consumed,
     delete_memory_fact,
     delete_memory_summary,
+    generate_day_summary,
     generate_memory_mermaid,
     generate_recommendations,
+    get_memory_for_date,
     get_memory_for_visualization,
     get_person_events,
     list_consumed,
     list_memory_facts,
     list_memory_summaries,
+    run_library_interview,
     run_person_facts_agent,
     run_relationship_summary_agent,
     run_people_grouping_agent,
@@ -52,8 +57,10 @@ from google import genai
 
 # In-memory session store (minimal for 1hr sprint; replace with Redis/DB later)
 sessions: dict[str, list] = {}
+library_interview_sessions: dict[str, list] = {}  # session_id -> list of {role, content}
 
 CHAT_INVOKE_TIMEOUT_SEC = 60
+LIBRARY_INTERVIEW_TIMEOUT_SEC = 45
 
 
 def get_or_create_session(session_id: Optional[str]) -> str:
@@ -109,12 +116,14 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     personalization: Optional[float] = None
     intrusiveness: Optional[float] = None
+    mode: Optional[str] = None  # "journal" (default) | "recommendations"
 
 
 class ChatResponse(BaseModel):
     response: str
     session_id: str
     retrieval_log: Optional[str] = None
+    notes_saved: Optional[List[Dict[str, str]]] = None  # [{"item_id": "...", "note": "..."}]
 
 
 class EndSessionRequest(BaseModel):
@@ -124,6 +133,25 @@ class EndSessionRequest(BaseModel):
 class EndSessionResponse(BaseModel):
     ok: bool
     session_id: str
+
+
+class LibraryInterviewItem(BaseModel):
+    id: str
+    title: str
+    author: Optional[str] = None
+    note: Optional[str] = None
+
+
+class LibraryInterviewRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    library_snapshot: Optional[List[LibraryInterviewItem]] = None
+
+
+class LibraryInterviewResponse(BaseModel):
+    response: str
+    session_id: str
+    notes_saved: Optional[List[Dict[str, str]]] = None  # [{"item_id": "...", "note": "..."}]
 
 
 class IngestHistoryRequest(BaseModel):
@@ -138,6 +166,7 @@ class IngestHistoryResponse(BaseModel):
 
 class InferEntryDateRequest(BaseModel):
     text: str
+    filename: Optional[str] = None  # optional; used only when text doesn't provide a date
 
 
 class InferEntryDateResponse(BaseModel):
@@ -308,30 +337,69 @@ async def memory_diagram():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """User sends text; Interviewer responds. State updated in memory."""
+    """User sends text; Interviewer responds. State updated in memory. mode=recommendations uses library interview (books, notes)."""
     session_id = get_or_create_session(req.session_id)
-    messages = sessions[session_id]
+    mode = (req.mode or "journal").strip().lower()
+    if mode not in ("journal", "recommendations"):
+        mode = "journal"
 
-    # Clamp personalization between 0 and 1.0, default to 1.0 if missing.
+    if mode == "recommendations":
+        # Library interview: ask about books, save short notes. Uses library_interview_sessions.
+        _get_or_create_library_interview_session(session_id)
+        messages = library_interview_sessions[session_id]
+        try:
+            library_data = await asyncio.to_thread(list_consumed)
+            books = library_data.get("books") or []
+            library_items = [
+                {"id": b.get("id", ""), "title": b.get("title", "?"), "author": b.get("author") or "", "note": (b.get("note") or "").strip() or None}
+                for b in books
+            ]
+        except Exception as e:
+            print("[backend] /chat recommendations list_consumed error:", e)
+            library_items = []
+        user_message = (req.text or "").strip()
+        if not user_message:
+            user_message = "Start"
+        try:
+            reply, notes_saved = await asyncio.wait_for(
+                asyncio.to_thread(run_library_interview, list(messages), library_items, user_message),
+                timeout=LIBRARY_INTERVIEW_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            return ChatResponse(
+                response="That took a bit long—try again in a moment.",
+                session_id=session_id,
+            )
+        except Exception as e:
+            print("[backend] /chat recommendations error:", e)
+            return ChatResponse(
+                response="Something went wrong. Please try again.",
+                session_id=session_id,
+            )
+        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "assistant", "content": reply})
+        library_interview_sessions[session_id] = messages
+        return ChatResponse(
+            response=reply,
+            session_id=session_id,
+            notes_saved=notes_saved if notes_saved else None,
+        )
+
+    # Default: journal interview (existing flow)
+    messages = sessions[session_id]
     personalization = req.personalization if req.personalization is not None else 1.0
     try:
         personalization = float(personalization)
     except (TypeError, ValueError):
         personalization = 1.0
     personalization = max(0.0, min(1.0, personalization))
-
-    # Clamp intrusiveness between 0 and 1.0, default to 0.5 if missing.
     intrusiveness = req.intrusiveness if req.intrusiveness is not None else 0.5
     try:
         intrusiveness = float(intrusiveness)
     except (TypeError, ValueError):
         intrusiveness = 0.5
     intrusiveness = max(0.0, min(1.0, intrusiveness))
-
-    # Append user message
     messages.append(HumanMessage(content=req.text))
-
-    # Run Interviewer in a thread so we don't block the event loop; timeout to avoid hanging
     state: JournalState = {
         "messages": list(messages),
         "session_id": session_id,
@@ -351,11 +419,7 @@ async def chat(req: ChatRequest):
             status_code=504,
             detail=f"Chat took longer than {CHAT_INVOKE_TIMEOUT_SEC}s (LLM or memory slow). Try again or lower personalization.",
         )
-
-    # Persist updated messages
     sessions[session_id] = list(result["messages"])
-
-    # Last message is the assistant reply
     last = result["messages"][-1]
     response_text = getattr(last, "content", str(last))
     if isinstance(response_text, list):
@@ -363,8 +427,76 @@ async def chat(req: ChatRequest):
             c.get("text", str(c)) for c in response_text if isinstance(c, dict)
         )
     retrieval_log = result.get("retrieval_log")
-
     return ChatResponse(response=response_text, session_id=session_id, retrieval_log=retrieval_log)
+
+
+def _get_or_create_library_interview_session(session_id: Optional[str]) -> str:
+    if not session_id:
+        session_id = str(uuid.uuid4())
+    if session_id not in library_interview_sessions:
+        library_interview_sessions[session_id] = []
+    return session_id
+
+
+@app.post("/library-interview", response_model=LibraryInterviewResponse)
+async def library_interview(req: LibraryInterviewRequest):
+    """
+    One turn of the library interview: user message + optional library snapshot.
+    Agent asks about books and may save short notes; notes_saved lists any updates.
+    """
+    session_id = _get_or_create_library_interview_session(req.session_id)
+    messages = library_interview_sessions[session_id]
+
+    library_items = []
+    if req.library_snapshot:
+        for it in req.library_snapshot:
+            library_items.append({
+                "id": it.id,
+                "title": it.title or "?",
+                "author": (it.author or "").strip() or None,
+                "note": (it.note or "").strip() or None,
+            })
+
+    user_message = (req.message or "").strip()
+    if not user_message and not library_items:
+        return LibraryInterviewResponse(
+            response="Add some books to your library first, then we can chat about them.",
+            session_id=session_id,
+        )
+    if not user_message:
+        user_message = "Start"
+
+    try:
+        reply, notes_saved = await asyncio.wait_for(
+            asyncio.to_thread(
+                run_library_interview,
+                list(messages),
+                library_items,
+                user_message,
+            ),
+            timeout=LIBRARY_INTERVIEW_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        return LibraryInterviewResponse(
+            response="That took a bit long—try again in a moment.",
+            session_id=session_id,
+        )
+    except Exception as e:
+        print("[backend] /library-interview error:", e)
+        return LibraryInterviewResponse(
+            response="Something went wrong. Please try again.",
+            session_id=session_id,
+        )
+
+    messages.append({"role": "user", "content": user_message})
+    messages.append({"role": "assistant", "content": reply})
+    library_interview_sessions[session_id] = messages
+
+    return LibraryInterviewResponse(
+        response=reply,
+        session_id=session_id,
+        notes_saved=notes_saved if notes_saved else None,
+    )
 
 
 @app.post("/end-session", response_model=EndSessionResponse)
@@ -442,9 +574,80 @@ async def ingest_history(req: IngestHistoryRequest):
         return IngestHistoryResponse(ok=False, session_id=session_id)
 
 
-INFER_DATE_SYSTEM = """You are a date extractor. Given journal text, determine the single date and time when this journal entry was written.
-The text may mention multiple dates (e.g. past events, "yesterday", "last week"). Choose the date that best represents when the author wrote this entry (e.g. "It is currently January 5, 2026, 1:59 a.m.").
-Reply with ONLY a single line: either an ISO 8601 date-time in UTC (e.g. 2026-01-05T01:59:00.000Z), or the word NONE if you cannot determine it. No other text."""
+def _parse_date_from_entry_text(text: str) -> Optional[str]:
+    """Extract an explicit date from the entry text (absolute precedence). Prefer start of text (when the entry was written)."""
+    if not text or not text.strip():
+        return None
+    # Look in first 500 chars for a clear written date (header/timestamp)
+    head = text.strip()[:500]
+    # MM/DD/YYYY or M/D/YYYY (e.g. "12/18/2025 at 5:47am" or "12/18/2025:")
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", head)
+    if m:
+        mo, d, y = m.group(1), m.group(2), m.group(3)
+        try:
+            dt = datetime(int(y), int(mo), int(d), 12, 0, 0)
+            return dt.strftime("%Y-%m-%dT12:00:00.000Z")
+        except ValueError:
+            pass
+    # YYYY-MM-DD
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", head)
+    if m:
+        y, mo, d = m.group(1), m.group(2), m.group(3)
+        try:
+            dt = datetime(int(y), int(mo), int(d), 12, 0, 0)
+            return dt.strftime("%Y-%m-%dT12:00:00.000Z")
+        except ValueError:
+            pass
+    # MM-DD-YYYY
+    m = re.search(r"\b(\d{1,2})-(\d{1,2})-(\d{4})\b", head)
+    if m:
+        mo, d, y = m.group(1), m.group(2), m.group(3)
+        try:
+            dt = datetime(int(y), int(mo), int(d), 12, 0, 0)
+            return dt.strftime("%Y-%m-%dT12:00:00.000Z")
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_date_from_filename(filename: str) -> Optional[str]:
+    """Try to extract a date from a filename (e.g. 2025-03-01.txt, journal_mar5_2024). Returns ISO 8601 or None."""
+    base = Path(filename).stem
+    # YYYY-MM-DD or YYYY_MM_DD
+    m = re.search(r"(\d{4})[-_](\d{2})[-_](\d{2})", base)
+    if m:
+        y, mo, d = m.group(1), m.group(2), m.group(3)
+        try:
+            dt = datetime(int(y), int(mo), int(d), 12, 0, 0)
+            return dt.strftime("%Y-%m-%dT12:00:00.000Z")
+        except ValueError:
+            pass
+    # MM-DD-YYYY or MM_DD_YYYY (US style)
+    m = re.search(r"(\d{1,2})[-_](\d{1,2})[-_](\d{4})", base)
+    if m:
+        mo, d, y = m.group(1), m.group(2), m.group(3)
+        try:
+            dt = datetime(int(y), int(mo), int(d), 12, 0, 0)
+            return dt.strftime("%Y-%m-%dT12:00:00.000Z")
+        except ValueError:
+            pass
+    # YYYYMMDD
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", base)
+    if m:
+        y, mo, d = m.group(1), m.group(2), m.group(3)
+        try:
+            dt = datetime(int(y), int(mo), int(d), 12, 0, 0)
+            return dt.strftime("%Y-%m-%dT12:00:00.000Z")
+        except ValueError:
+            pass
+    return None
+
+
+INFER_DATE_SYSTEM = """You are a date extractor. Determine the single date when this journal entry was written.
+
+CRITICAL: What is written in the entry has absolute precedence. Use the exact day, month, and year as written in the entry (e.g. if it says 12/18/2025, output 2025-12-18—do not change the year). The filename must be ignored whenever the entry text contains any date or time; only use the filename when the entry text contains no date at all.
+
+Reply with ONLY a single line: either an ISO 8601 date in UTC (e.g. 2025-12-18T12:00:00.000Z), or the word NONE if you cannot determine a date from the entry. No other text."""
 
 
 @app.post("/infer-entry-date", response_model=InferEntryDateResponse)
@@ -463,7 +666,14 @@ async def infer_entry_date(req: InferEntryDateRequest):
         text = (req.text or "")[:8000].strip()
         if not text:
             return InferEntryDateResponse(date=None)
+        # Written text has absolute precedence: if the entry contains an explicit date, use it and do not use filename or LLM
+        from_entry = _parse_date_from_entry_text(text)
+        if from_entry:
+            return InferEntryDateResponse(date=from_entry)
+        filename = (req.filename or "").strip() or None
         prompt = INFER_DATE_SYSTEM + "\n\nEntry:\n" + text
+        if filename:
+            prompt += f'\n\nOnly if the entry above has no date: file name is "{filename}". Otherwise ignore the filename.'
 
         def _call():
             return client.models.generate_content(model=model, contents=prompt)
@@ -474,9 +684,13 @@ async def infer_entry_date(req: InferEntryDateRequest):
             raw = " ".join(c.get("text", str(c)) for c in raw if isinstance(c, dict))
         raw = (raw or "").strip()
         if not raw or raw.upper() == "NONE":
+            # Fallback: try to parse date from filename when text gave no date
+            if filename:
+                parsed = _parse_date_from_filename(filename)
+                if parsed:
+                    return InferEntryDateResponse(date=parsed)
             return InferEntryDateResponse(date=None)
         # Try to parse as ISO; accept if it looks like ISO date
-        from datetime import datetime
         iso = raw.split()[0].strip()
         if not iso:
             return InferEntryDateResponse(date=None)
@@ -839,6 +1053,46 @@ async def get_recommendations():
         articles=[RecommendationItem(**x) for x in data.get("articles", [])],
         research=[RecommendationItem(**x) for x in data.get("research", [])],
     )
+
+
+class CalendarDayRequest(BaseModel):
+    date: str  # YYYY-MM-DD
+    raw_transcript: Optional[str] = None
+
+
+class CalendarDayResponse(BaseModel):
+    summary: str
+    has_journal: bool
+
+
+@app.post("/calendar-day-summary", response_model=CalendarDayResponse)
+async def calendar_day_summary(req: CalendarDayRequest):
+    """
+    For a given date, combine raw journal transcript (if any) with DB memory for that day
+    and return an AI-generated day summary/highlights.
+    """
+    date_iso = (req.date or "").strip()[:10]
+    if not date_iso or len(date_iso) < 10:
+        return CalendarDayResponse(summary="Please provide a valid date (YYYY-MM-DD).", has_journal=False)
+    try:
+        episodic, gist = await asyncio.to_thread(get_memory_for_date, date_iso)
+        summary = await asyncio.to_thread(
+            generate_day_summary,
+            date_iso,
+            (req.raw_transcript or "").strip() or None,
+            episodic,
+            gist,
+        )
+        return CalendarDayResponse(
+            summary=summary,
+            has_journal=bool((req.raw_transcript or "").strip()),
+        )
+    except Exception as e:
+        print("[backend] /calendar-day-summary error:", e)
+        return CalendarDayResponse(
+            summary="Could not generate summary for this day.",
+            has_journal=bool((req.raw_transcript or "").strip()),
+        )
 
 
 @app.post("/recommendations/consumed", response_model=ConsumedResponse)

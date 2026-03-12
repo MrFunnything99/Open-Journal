@@ -14,15 +14,21 @@ export type VoiceSettings = {
   speed?: number;
 };
 
+export type SessionMode = "journal" | "recommendations";
+
 export type UsePersonaplexSessionOptions = {
   systemPrompt: string;
   selectedVoiceId: string;
   manualMode?: boolean;
   personalization: number;
   intrusiveness?: number;
+  /** "journal" = regular interview; "recommendations" = talk about your books, save notes */
+  sessionMode?: SessionMode;
   voiceSettings?: VoiceSettings;
   onTranscriptUpdate: (updater: (prev: TranscriptEntry[]) => TranscriptEntry[]) => void;
   onInterimTranscript: (text: string) => void;
+  /** Called when the agent saves a note in recommendations mode */
+  onNotesSaved?: (notes: { item_id: string; note: string }[]) => void;
   /** If true, show live partial transcription while the user is speaking (desktop flow). If false, only show text after the turn is committed. */
   showLiveTranscription?: boolean;
 };
@@ -38,29 +44,37 @@ async function fetchInterviewerQuestion(
   text: string,
   sessionId: string | null,
   personalization: number,
-  intrusiveness: number
-): Promise<{ question: string; sessionId: string; retrievalLog?: string }> {
+  intrusiveness: number,
+  mode: "journal" | "recommendations"
+): Promise<{ question: string; sessionId: string; retrievalLog?: string; notesSaved?: { item_id: string; note: string }[] }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), CHAT_FETCH_TIMEOUT_MS);
   const res = await fetch(`${BACKEND_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, session_id: sessionId, personalization, intrusiveness }),
+    body: JSON.stringify({
+      text,
+      session_id: sessionId,
+      personalization,
+      intrusiveness,
+      mode,
+    }),
     signal: controller.signal,
   });
   clearTimeout(timeoutId);
 
   const rawText = await res.text();
-  let data: { error?: string; detail?: string; response?: string; session_id?: string; retrieval_log?: string } = {};
+  let data: {
+    error?: string;
+    detail?: string;
+    response?: string;
+    session_id?: string;
+    retrieval_log?: string;
+    notes_saved?: { item_id: string; note: string }[];
+  } = {};
   if (rawText.trim()) {
     try {
-      data = JSON.parse(rawText) as {
-        error?: string;
-        detail?: string;
-        response?: string;
-        session_id?: string;
-        retrieval_log?: string;
-      };
+      data = JSON.parse(rawText) as typeof data;
     } catch {
       const snippet = rawText.slice(0, 80).replace(/\s+/g, " ");
       throw new Error(
@@ -90,6 +104,7 @@ async function fetchInterviewerQuestion(
     question: data.response,
     sessionId: data.session_id,
     retrievalLog: typeof data.retrieval_log === "string" ? data.retrieval_log : undefined,
+    notesSaved: Array.isArray(data.notes_saved) ? data.notes_saved : undefined,
   };
 }
 
@@ -231,9 +246,11 @@ export const usePersonaplexSession = ({
   manualMode = false,
   personalization,
   intrusiveness = 0.5,
+  sessionMode = "journal",
   voiceSettings,
   onTranscriptUpdate,
   onInterimTranscript,
+  onNotesSaved,
   showLiveTranscription = true,
 }: UsePersonaplexSessionOptions) => {
   const [status, setStatus] = useState<PersonaplexConnectionStatus>("disconnected");
@@ -292,14 +309,16 @@ export const usePersonaplexSession = ({
 
       try {
         log("Fetching /chat...");
-        const { question, sessionId, retrievalLog } = await fetchInterviewerQuestion(
+        const { question, sessionId, retrievalLog, notesSaved } = await fetchInterviewerQuestion(
           userText,
           backendSessionIdRef.current,
           personalization,
-          intrusiveness
+          intrusiveness,
+          sessionMode
         );
         log("Got response, speaking...");
         backendSessionIdRef.current = sessionId;
+        if (notesSaved?.length && onNotesSaved) onNotesSaved(notesSaved);
         const nextWithAi: TranscriptEntry[] = [...nextWithUser, { role: "ai", text: question, ...(retrievalLog != null ? { retrievalLog } : {}) }];
         transcriptRef.current = nextWithAi;
         onTranscriptUpdate(() => nextWithAi);
@@ -327,7 +346,7 @@ export const usePersonaplexSession = ({
         setIsProcessing(false);
       }
     },
-    [personalization, intrusiveness, onTranscriptUpdate, onInterimTranscript]
+    [personalization, intrusiveness, sessionMode, onTranscriptUpdate, onInterimTranscript, onNotesSaved]
   );
 
   const speakWithVoiceApi = useCallback(

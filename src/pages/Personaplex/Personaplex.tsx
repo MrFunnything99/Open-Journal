@@ -86,6 +86,7 @@ export const Personaplex = () => {
   // Personalization is always \"high\": the agent should actively connect past memories and journals to the current conversation when relevant.
   const personalization = 1;
   const [intrusiveness, setIntrusiveness] = useState(0.5);
+  const [sessionMode, setSessionMode] = useState<"journal" | "recommendations">("journal");
   const [voices, setVoices] = useState<VoiceOption[]>(FALLBACK_VOICES);
   const [selectedVoiceId, setSelectedVoiceId] = useState(DEFAULT_VOICE_ID);
   // Fixed voice settings: slightly expressive, 20% stability, speed 1.2x.
@@ -111,7 +112,7 @@ export const Personaplex = () => {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
   const [interimTranscript, setInterimTranscript] = useState("");
-  const [view, setView] = useState<"session" | "history" | "memory" | "recommendations">("session");
+  const [view, setView] = useState<"session" | "history" | "memory" | "recommendations" | "calendar">("session");
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [priorJournalText, setPriorJournalText] = useState("");
   const [isIngesting, setIsIngesting] = useState(false);
@@ -136,6 +137,18 @@ export const Personaplex = () => {
   const [libraryEditNote, setLibraryEditNote] = useState("");
   const [libraryUpdateSaving, setLibraryUpdateSaving] = useState(false);
   const [libraryLoading, setLibraryLoading] = useState(false);
+  const [showLibraryInterview, setShowLibraryInterview] = useState(false);
+  const [libraryInterviewMessages, setLibraryInterviewMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
+  const [libraryInterviewSessionId, setLibraryInterviewSessionId] = useState<string | null>(null);
+  const [libraryInterviewLoading, setLibraryInterviewLoading] = useState(false);
+  const [libraryInterviewInput, setLibraryInterviewInput] = useState("");
+  const [calendarMonth, setCalendarMonth] = useState(() => {
+    const d = new Date();
+    return { year: d.getFullYear(), month: d.getMonth() };
+  });
+  const [calendarSelectedDate, setCalendarSelectedDate] = useState<string | null>(null);
+  const [calendarDaySummary, setCalendarDaySummary] = useState<string | null>(null);
+  const [calendarDaySummaryLoading, setCalendarDaySummaryLoading] = useState(false);
   const [memoryFacts, setMemoryFacts] = useState<{ id: number; document: string; session_id?: string; timestamp?: string }[]>([]);
   const [memorySummaries, setMemorySummaries] = useState<{ id: number; document: string; session_id?: string; timestamp?: string; metadata_json?: string | null }[]>([]);
   const [memoryLoading, setMemoryLoading] = useState(false);
@@ -199,6 +212,44 @@ export const Personaplex = () => {
     setLibraryLoading(true);
     fetchLibrary(true).finally(() => setLibraryLoading(false));
   }, [showLibrary, fetchLibrary]);
+
+  const sendLibraryInterviewMessage = useCallback(
+    (msg: string) => {
+      if (!msg.trim() || libraryInterviewLoading) return;
+      setLibraryInterviewMessages((prev) => [...prev, { role: "user", content: msg.trim() }]);
+      setLibraryInterviewInput("");
+      setLibraryInterviewLoading(true);
+      const snapshot = libraryItems.books.map((b) => ({ id: b.id, title: b.title, author: b.author ?? undefined, note: b.note ?? undefined }));
+      fetch(`${BACKEND_URL}/library-interview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: msg.trim(),
+          session_id: libraryInterviewSessionId ?? undefined,
+          library_snapshot: snapshot,
+        }),
+      })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Interview failed"))))
+        .then((data: { response?: string; session_id?: string; notes_saved?: { item_id: string; note: string }[] }) => {
+          setLibraryInterviewSessionId(data.session_id ?? null);
+          setLibraryInterviewMessages((prev) => [...prev, { role: "assistant", content: data.response ?? "" }]);
+          if (data.notes_saved?.length) {
+            fetchLibrary();
+            const first = data.notes_saved[0];
+            const title = libraryItems.books.find((b) => b.id === first.item_id)?.title ?? "a book";
+            setToastMessage(`Note saved for ${title}.`);
+            setTimeout(() => setToastMessage(null), 3000);
+          }
+        })
+        .catch(() => {
+          setLibraryInterviewMessages((prev) => [...prev, { role: "assistant", content: "Something went wrong. Please try again." }]);
+          setToastMessage("Interview request failed.");
+          setTimeout(() => setToastMessage(null), 3000);
+        })
+        .finally(() => setLibraryInterviewLoading(false));
+    },
+    [libraryInterviewLoading, libraryInterviewSessionId, libraryItems.books, fetchLibrary]
+  );
 
   const {
     entries,
@@ -473,6 +524,7 @@ export const Personaplex = () => {
     manualMode: true,
     personalization,
     intrusiveness,
+    sessionMode,
     voiceSettings,
     onTranscriptUpdate: useCallback((updater) => {
       setTranscript((prev) => {
@@ -481,6 +533,16 @@ export const Personaplex = () => {
       });
     }, []),
     onInterimTranscript: setInterimTranscript,
+    onNotesSaved: useCallback(
+      (notes: { item_id: string; note: string }[]) => {
+        fetchLibrary();
+        if (notes.length) {
+          setToastMessage(notes.length === 1 ? "Note saved." : `Saved ${notes.length} notes.`);
+          setTimeout(() => setToastMessage(null), 3000);
+        }
+      },
+      [fetchLibrary]
+    ),
     showLiveTranscription,
   });
 
@@ -602,7 +664,7 @@ export const Personaplex = () => {
                 const ir = await fetch(`${BACKEND_URL}/infer-entry-date`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ text }),
+                  body: JSON.stringify({ text, filename: file.name }),
                 });
                 if (ir.ok) {
                   const data = await ir.json();
@@ -693,7 +755,7 @@ export const Personaplex = () => {
               const ir = await fetch(`${BACKEND_URL}/infer-entry-date`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: content }),
+                body: JSON.stringify({ text: content, filename: file.name }),
               });
               if (ir.ok) {
                 const data = await ir.json();
@@ -818,6 +880,19 @@ export const Personaplex = () => {
             </svg>
             <span className="hidden sm:inline">Recommendations</span>
           </button>
+          <button
+            type="button"
+            onClick={() => setView("calendar")}
+            className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
+              view === "calendar" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
+            }`}
+            title="Calendar — day highlights"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 sm:h-5 sm:w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+            <span className="hidden sm:inline">Calendar</span>
+          </button>
         </div>
       </header>
 
@@ -845,6 +920,27 @@ export const Personaplex = () => {
                 Settings
               </h2>
               <div>
+                <label htmlFor="personaplex-session-mode" className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1.5">
+                  Session mode
+                </label>
+                <select
+                  id="personaplex-session-mode"
+                  value={sessionMode}
+                  onChange={(e) => setSessionMode(e.target.value as "journal" | "recommendations")}
+                  disabled={isConnected}
+                  className="w-full px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
+                  aria-label="Interview mode: journal or recommendations"
+                >
+                  <option value="journal">Regular interview (journal entries)</option>
+                  <option value="recommendations">Recommendations (talk about your books)</option>
+                </select>
+                {sessionMode === "recommendations" && (
+                  <p className="text-xs text-slate-500 mt-1">
+                    Same speech-to-text; agent asks about your library and saves short notes for better recommendations.
+                  </p>
+                )}
+              </div>
+              <div className="mt-3">
                 <label htmlFor="personaplex-voice" className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1.5">
                   Voice
                 </label>
@@ -1038,7 +1134,7 @@ export const Personaplex = () => {
 
         <div
           className={`flex-1 flex flex-col min-h-0 overflow-y-auto transition-opacity duration-300 ${
-            view === "history" || view === "memory" || view === "recommendations" ? "opacity-100" : "opacity-0 pointer-events-none absolute inset-0"
+            view === "history" || view === "memory" || view === "recommendations" || view === "calendar" ? "opacity-100" : "opacity-0 pointer-events-none absolute inset-0"
           }`}
         >
           {view === "history" && (
@@ -1138,6 +1234,120 @@ export const Personaplex = () => {
               isWipingMemory={isWipingMemory}
             />
           )}
+          {view === "calendar" && (
+            <div className="flex-1 flex flex-col min-h-0 p-4 md:p-6 overflow-hidden">
+              <h2 className="text-lg font-medium text-slate-300 uppercase tracking-wider mb-2">
+                Calendar
+              </h2>
+              <p className="text-sm text-slate-500 mb-4">
+                Click a date to see an AI summary of that day (raw journal + memory DB).
+              </p>
+              <div className="flex flex-col sm:flex-row gap-6 flex-1 min-h-0">
+                <div className="flex-shrink-0">
+                  <div className="flex items-center justify-between gap-4 mb-3">
+                    <button
+                      type="button"
+                      onClick={() => setCalendarMonth((prev) => {
+                        const d = new Date(prev.year, prev.month - 1, 1);
+                        return { year: d.getFullYear(), month: d.getMonth() };
+                      })}
+                      className="p-2 rounded-lg bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
+                      aria-label="Previous month"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+                    </button>
+                    <span className="text-slate-200 font-medium">
+                      {new Date(calendarMonth.year, calendarMonth.month, 1).toLocaleString("default", { month: "long", year: "numeric" })}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setCalendarMonth((prev) => {
+                        const d = new Date(prev.year, prev.month + 1, 1);
+                        return { year: d.getFullYear(), month: d.getMonth() };
+                      })}
+                      className="p-2 rounded-lg bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
+                      aria-label="Next month"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-7 gap-1 text-center">
+                    {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => (
+                      <div key={day} className="text-xs text-slate-500 font-medium py-1">{day}</div>
+                    ))}
+                    {(() => {
+                      const first = new Date(calendarMonth.year, calendarMonth.month, 1);
+                      const last = new Date(calendarMonth.year, calendarMonth.month + 1, 0);
+                      const startPad = first.getDay();
+                      const daysInMonth = last.getDate();
+                      const cells: (number | null)[] = [];
+                      for (let i = 0; i < startPad; i++) cells.push(null);
+                      for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+                      const dateStr = (d: number) => `${calendarMonth.year}-${String(calendarMonth.month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+                      const hasEntry = (d: number) => entries.some((e) => (e.date || "").startsWith(dateStr(d)));
+                      return cells.map((d, i) => (
+                        <div key={i}>
+                          {d === null ? (
+                            <div className="w-9 h-9" />
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const date = dateStr(d);
+                                setCalendarSelectedDate(date);
+                                setCalendarDaySummary(null);
+                                setCalendarDaySummaryLoading(true);
+                                const dayEntries = entries.filter((e) => (e.date || "").startsWith(date));
+                                const rawTranscript = dayEntries.length
+                                  ? dayEntries.map((e) => e.fullTranscript.map((m) => `${m.role}: ${m.text}`).join("\n")).join("\n\n")
+                                  : "";
+                                fetch(`${BACKEND_URL}/calendar-day-summary`, {
+                                  method: "POST",
+                                  headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify({ date, raw_transcript: rawTranscript }),
+                                })
+                                  .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed"))))
+                                  .then((data: { summary?: string }) => {
+                                    setCalendarDaySummary(data.summary ?? "");
+                                  })
+                                  .catch(() => setCalendarDaySummary("Could not load summary."))
+                                  .finally(() => setCalendarDaySummaryLoading(false));
+                              }}
+                              className={`w-9 h-9 rounded-lg text-sm font-medium transition-colors ${
+                                calendarSelectedDate === dateStr(d)
+                                  ? "bg-violet-600 text-white"
+                                  : hasEntry(d)
+                                    ? "bg-slate-700/80 text-slate-200 hover:bg-slate-600/80"
+                                    : "text-slate-400 hover:bg-slate-700/50"
+                              }`}
+                            >
+                              {d}
+                            </button>
+                          )}
+                        </div>
+                      ));
+                    })()}
+                  </div>
+                </div>
+                <div className="flex-1 min-h-0 rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex flex-col">
+                  {calendarSelectedDate ? (
+                    <>
+                      <h3 className="text-slate-300 font-medium mb-2">
+                        {new Date(calendarSelectedDate + "T12:00:00").toLocaleDateString("default", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}
+                      </h3>
+                      {calendarDaySummaryLoading ? (
+                        <p className="text-slate-500 text-sm">Analyzing journal and memory…</p>
+                      ) : calendarDaySummary ? (
+                        <p className="text-slate-200 text-sm whitespace-pre-wrap flex-1 overflow-y-auto">{calendarDaySummary}</p>
+                      ) : null}
+                    </>
+                  ) : (
+                    <p className="text-slate-500 text-sm">Click a date to see the day summary.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
           {view === "recommendations" && (
             <div className="flex-1 flex flex-col min-h-0 p-4 md:p-6 overflow-hidden">
               <div className="flex-shrink-0 flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -1193,24 +1403,88 @@ export const Personaplex = () => {
                           key={cat}
                           className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex flex-col"
                         >
-                          <div className="flex items-center justify-between gap-2 mb-3">
+                          <div className="relative z-10 flex items-center justify-between gap-2 mb-3 flex-shrink-0">
                             <h4 className="text-sm font-medium text-slate-400 uppercase tracking-wider">
                               {sectionTitle}
                             </h4>
                             <button
                               type="button"
-                              onClick={() => {
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                e.preventDefault();
                                 setLibraryExpandedCategory((prev) => (prev === cat ? null : cat));
-                                if (libraryExpandedCategory !== cat) setLibraryDraftText("");
+                                setLibraryDraftText("");
+                                setLibrarySubmitting(false);
                               }}
-                              className="p-1.5 rounded-lg bg-emerald-600/90 hover:bg-emerald-500 text-white transition-colors"
+                              className="p-1.5 rounded-lg bg-emerald-600/90 hover:bg-emerald-500 text-white transition-colors shrink-0"
                               aria-label={`Add ${cat}`}
                             >
-                              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
                               </svg>
                             </button>
                           </div>
+                          {libraryExpandedCategory === cat ? (
+                            <div className="mb-3 flex-shrink-0 flex flex-col">
+                              <textarea
+                                value={libraryDraftText}
+                                onChange={(e) => setLibraryDraftText(e.target.value)}
+                                rows={3}
+                                placeholder={
+                                  cat === "book"
+                                    ? "Paste book titles, one per line\n e.g. dune\n body keeps the score"
+                                    : cat === "podcast"
+                                      ? "Paste podcast or episode names\n e.g. Huberman Lab – Sleep"
+                                      : cat === "article"
+                                        ? "Paste article titles or URLs"
+                                        : "Paste paper titles or citations"
+                                }
+                                className="w-full px-3 py-2 rounded-lg bg-slate-950/70 border border-slate-700/70 text-slate-200 text-xs placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-y mb-2"
+                              />
+                              <div className="flex gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (!libraryDraftText.trim() || librarySubmitting) return;
+                                    setLibrarySubmitting(true);
+                                    const payload = libraryDraftText.trim();
+                                    fetch(`${BACKEND_URL}/library-notes`, {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ text: payload, type: cat }),
+                                    })
+                                      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Library update failed"))))
+                                      .then((data: { ok?: boolean; items_added?: number }) => {
+                                        const added = data?.items_added ?? 0;
+                                        setLibraryDraftText("");
+                                        if (added > 0) fetchLibrary();
+                                        setToastMessage(added > 0 ? `Added ${added} to ${sectionTitle}.` : "No items recognized; try clearer titles.");
+                                        setTimeout(() => setToastMessage(null), 4000);
+                                      })
+                                      .catch(() => {
+                                        setToastMessage("Library update failed.");
+                                        setTimeout(() => setToastMessage(null), 4000);
+                                      })
+                                      .finally(() => setLibrarySubmitting(false));
+                                  }}
+                                  disabled={librarySubmitting || !libraryDraftText.trim()}
+                                  className="px-3 py-1.5 rounded-lg bg-violet-600 text-white text-xs font-medium hover:bg-violet-500 disabled:opacity-50"
+                                >
+                                  {librarySubmitting ? "Adding…" : "Add"}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setLibraryExpandedCategory(null);
+                                    setLibraryDraftText("");
+                                  }}
+                                  className="px-3 py-1.5 rounded-lg bg-slate-700/60 text-slate-400 text-xs font-medium hover:bg-slate-600/60"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : null}
                           <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
                             {items.length === 0 && libraryExpandedCategory !== cat ? (
                               <p className="text-slate-500 text-xs">No items yet. Use + to add.</p>
@@ -1247,68 +1521,6 @@ export const Personaplex = () => {
                               ))
                             )}
                           </div>
-                          {libraryExpandedCategory === cat ? (
-                            <div className="mt-3 pt-3 border-t border-slate-700/50 flex flex-col">
-                              <textarea
-                                value={libraryDraftText}
-                                onChange={(e) => setLibraryDraftText(e.target.value)}
-                                rows={3}
-                                placeholder={
-                                  cat === "book"
-                                    ? "Paste book titles, one per line\n e.g. Dune, Frank Herbert\n The Body Keeps the Score"
-                                    : cat === "podcast"
-                                      ? "Paste podcast or episode names\n e.g. Huberman Lab – Sleep"
-                                      : cat === "article"
-                                        ? "Paste article titles or URLs"
-                                        : "Paste paper titles or citations"
-                                }
-                                className="w-full px-3 py-2 rounded-lg bg-slate-950/70 border border-slate-700/70 text-slate-200 text-xs placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-y mb-2"
-                              />
-                              <div className="flex gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    if (!libraryDraftText.trim() || librarySubmitting) return;
-                                    setLibrarySubmitting(true);
-                                    const payload = libraryDraftText.trim();
-                                    fetch(`${BACKEND_URL}/library-notes`, {
-                                      method: "POST",
-                                      headers: { "Content-Type": "application/json" },
-                                      body: JSON.stringify({ text: payload, type: cat }),
-                                    })
-                                      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Library update failed"))))
-                                      .then((data: { ok?: boolean; items_added?: number }) => {
-                                        const added = data?.items_added ?? 0;
-                                        setLibraryDraftText("");
-                                        setLibraryExpandedCategory(null);
-                                        if (added > 0) fetchLibrary();
-                                        setToastMessage(added > 0 ? `Added ${added} to ${sectionTitle}.` : "No items recognized; try clearer titles.");
-                                        setTimeout(() => setToastMessage(null), 4000);
-                                      })
-                                      .catch(() => {
-                                        setToastMessage("Library update failed.");
-                                        setTimeout(() => setToastMessage(null), 4000);
-                                      })
-                                      .finally(() => setLibrarySubmitting(false));
-                                  }}
-                                  disabled={librarySubmitting || !libraryDraftText.trim()}
-                                  className="px-3 py-1.5 rounded-lg bg-violet-600 text-white text-xs font-medium hover:bg-violet-500 disabled:opacity-50"
-                                >
-                                  {librarySubmitting ? "Adding…" : "Add"}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setLibraryExpandedCategory(null);
-                                    setLibraryDraftText("");
-                                  }}
-                                  className="px-3 py-1.5 rounded-lg bg-slate-700/60 text-slate-400 text-xs font-medium hover:bg-slate-600/60"
-                                >
-                                  Cancel
-                                </button>
-                              </div>
-                            </div>
-                          ) : null}
                         </section>
                       );
                     })}
@@ -1650,6 +1862,94 @@ export const Personaplex = () => {
                 </div>
               )}
               </div>
+              {/* Library interview modal */}
+              {showLibraryInterview && (
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center p-4"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="library-interview-title"
+                >
+                  <div
+                    className="absolute inset-0 bg-black/60"
+                    onClick={() => setShowLibraryInterview(false)}
+                  />
+                  <div className="relative bg-slate-900 border border-slate-700 rounded-xl shadow-xl max-w-lg w-full max-h-[85vh] flex flex-col">
+                    <div className="p-4 border-b border-slate-700 flex items-center justify-between gap-2 flex-shrink-0">
+                      <h2 id="library-interview-title" className="text-slate-200 font-medium text-lg">
+                        Interview about your books
+                      </h2>
+                      <button
+                        type="button"
+                        onClick={() => setShowLibraryInterview(false)}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-700/60 transition-colors"
+                        aria-label="Close"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                    <p className="px-4 pb-2 text-xs text-slate-500 flex-shrink-0">
+                      Chat about what you liked (or didn’t) — we’ll save short notes to improve recommendations. No hallucination; notes are brief and factual.
+                    </p>
+                    <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+                      {libraryInterviewMessages.length === 0 && !libraryInterviewLoading && (
+                        <p className="text-slate-500 text-sm">Say &quot;Start&quot; or &quot;Hi&quot; to begin. The agent will ask about your books one by one.</p>
+                      )}
+                      {libraryInterviewMessages.map((m, i) => (
+                        <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+                          <div
+                            className={`max-w-[90%] rounded-lg px-3 py-2 text-sm ${
+                              m.role === "user"
+                                ? "bg-violet-600/30 text-violet-100"
+                                : "bg-slate-800/80 text-slate-200 border border-slate-700/50"
+                            }`}
+                          >
+                            <span className="font-medium text-slate-400 text-xs block mb-0.5">{m.role === "user" ? "You" : "Agent"}</span>
+                            {m.content}
+                          </div>
+                        </div>
+                      ))}
+                      {libraryInterviewLoading && (
+                        <div className="flex justify-start">
+                          <div className="rounded-lg px-3 py-2 text-sm bg-slate-800/80 text-slate-400 border border-slate-700/50">
+                            Thinking…
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    <div className="p-4 border-t border-slate-700 flex gap-2 flex-shrink-0">
+                      <input
+                        type="text"
+                        value={libraryInterviewInput}
+                        onChange={(e) => setLibraryInterviewInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && !e.shiftKey) {
+                            e.preventDefault();
+                            const msg = libraryInterviewInput.trim();
+                            if (msg && !libraryInterviewLoading) sendLibraryInterviewMessage(msg);
+                          }
+                        }}
+                        placeholder="Type your reply…"
+                        className="flex-1 min-w-0 px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-500/50"
+                        disabled={libraryInterviewLoading}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const msg = libraryInterviewInput.trim();
+                          if (msg && !libraryInterviewLoading) sendLibraryInterviewMessage(msg);
+                        }}
+                        disabled={libraryInterviewLoading || !libraryInterviewInput.trim()}
+                        className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-amber-500/50"
+                      >
+                        Send
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

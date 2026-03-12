@@ -400,6 +400,51 @@ def list_episodic_with_ids() -> list[dict]:
     ]
 
 
+def get_episodic_for_date(date_iso: str) -> list[dict]:
+    """Return episodic summaries whose timestamp falls on the given date (YYYY-MM-DD)."""
+    if not date_iso or len(date_iso) < 10:
+        return []
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic WHERE date(timestamp) = ? ORDER BY timestamp DESC",
+            (date_iso[:10],),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        all_rows = conn.execute(
+            "SELECT id, document, session_id, timestamp FROM memory_episodic ORDER BY id DESC"
+        ).fetchall()
+        out = []
+        for r in all_rows:
+            ts = (r[3] or "")[:10]
+            if ts == date_iso[:10]:
+                out.append({"id": r[0], "document": r[1] or "", "session_id": r[2] or "", "timestamp": r[3] or "", "metadata_json": None})
+        return out
+    return [
+        {"id": r[0], "document": r[1] or "", "session_id": r[2] or "", "timestamp": r[3] or "", "metadata_json": r[4] if len(r) > 4 else None}
+        for r in rows
+    ]
+
+
+def get_gist_for_date(date_iso: str) -> list[dict]:
+    """Return gist facts whose timestamp falls on the given date (YYYY-MM-DD)."""
+    if not date_iso or len(date_iso) < 10:
+        return []
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, document, session_id, timestamp FROM memory_facts WHERE date(timestamp) = ? ORDER BY timestamp DESC",
+            (date_iso[:10],),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+        for r in conn.execute("SELECT id, document, session_id, timestamp FROM memory_facts ORDER BY id DESC").fetchall():
+            ts = r[3] or ""
+            if ts.startswith(date_iso[:10]):
+                rows.append(r)
+    return [{"id": r[0], "document": r[1] or "", "session_id": r[2] or "", "timestamp": r[3] or ""} for r in rows]
+
+
 def update_gist(fact_id: int, document: str, embedding: list[float]) -> bool:
     """Update gist fact by id; rewrites vec_gist row with new embedding. Returns True if found."""
     conn = _get_conn()

@@ -87,7 +87,7 @@ export function MemoryEditor({
   onWipeMemory,
   isWipingMemory = false,
 }: MemoryEditorProps) {
-  const [viewTab, setViewTab] = useState<MemoryViewTab>("time");
+  const [viewTab, setViewTab] = useState<MemoryViewTab>("person");
   const [editingFactId, setEditingFactId] = useState<number | null>(null);
   const [editingSummaryId, setEditingSummaryId] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
@@ -454,30 +454,30 @@ export function MemoryEditor({
       <div className="mb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
         {(
           [
-            ["time", "Timeline", "Browse memories by date."],
-            ["person", "People", "See who appears in your memories."],
-            ["topic", "Topics", "Explore themes across sessions."],
-            ["place", "Places", "Future: locations in your life."],
-            ["facts", "Facts", "Atomic facts the system stores about you."],
-            ["activity", "Activities", "What you tend to do over time."],
-            ["emotion", "Emotions", "How you tend to feel across activities."],
+            ["time", "Timeline", "Coming soon", true],
+            ["person", "People", "See who appears in your memories.", false],
+            ["topic", "Topics", "Coming soon", true],
+            ["place", "Places", "Coming soon", true],
+            ["facts", "Facts", "Coming soon", true],
+            ["activity", "Activities", "Coming soon", true],
+            ["emotion", "Emotions", "Coming soon", true],
           ] as const
-        ).map(([key, title, desc]) => (
+        ).map(([key, title, desc, comingSoon]) => (
           <button
             key={key}
             type="button"
-            onClick={() =>
-              setViewTab(
-                key === "facts"
-                  ? "time"
-                  : (key as Exclude<MemoryViewTab, "facts">)
-              )
-            }
+            onClick={() => {
+              if (comingSoon) {
+                onToast("Coming soon");
+                return;
+              }
+              setViewTab(key === "facts" ? "time" : (key as Exclude<MemoryViewTab, "facts">));
+            }}
             className={`text-left rounded-xl bg-slate-900/60 border px-4 py-3 transition-colors ${
-              (key === "facts" ? viewTab === "time" : viewTab === key)
+              !comingSoon && (key === "facts" ? viewTab === "time" : viewTab === key)
                 ? "border-violet-500/80 ring-1 ring-violet-500/60"
                 : "border-slate-700/70 hover:border-slate-500/80"
-            }`}
+            } ${comingSoon ? "opacity-80" : ""}`}
           >
             <div className="text-sm font-semibold text-slate-200 mb-1">{title}</div>
             <div className="text-xs text-slate-500">{desc}</div>

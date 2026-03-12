@@ -165,10 +165,14 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
     );
   }
 
+  const entriesByDate = [...entries].sort(
+    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+  );
+
   return (
     <>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5 p-6 overflow-y-auto">
-        {entries.map((entry) => (
+        {entriesByDate.map((entry) => (
           <div
             key={entry.id}
             className="group relative flex flex-col rounded-xl bg-slate-900/60 border border-slate-700/50 overflow-hidden hover:border-slate-600/60 transition-all cursor-pointer min-h-[220px] max-h-[280px]"

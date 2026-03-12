@@ -67,6 +67,84 @@ def _call_gemini(prompt: str) -> str:
         return ""
 
 
+def run_library_interview(
+    messages: list[dict],
+    library_items: list[dict],
+    new_user_message: str,
+) -> tuple[str, list[dict]]:
+    """
+    Run one turn of the library interview agent. Asks about books (and optionally other items);
+    when the user has given enough, the model may output SAVE_NOTE|item_id|note to save a short
+    factual note. Returns (assistant_reply_cleaned, notes_saved) where notes_saved is
+    [{"item_id": str, "note": str}, ...].
+    """
+
+    books_text = "\n".join(
+        f"- id={item.get('id', '')} | {item.get('title', '?')} | {item.get('author', '') or '(no author)'}"
+        + (f" | current_note: {item.get('note', '')[:100]}" if (item.get('note') or "").strip() else "")
+        for item in library_items
+    )
+    if not books_text.strip():
+        return "You don't have any books in your library yet. Add some with the + button, then we can talk about them.", []
+
+    system = f"""You are a warm, curious interviewer who loves talking about books. Your goal is to go through the user's library and capture what they liked (or didn't) about each book—short, factual notes only—so their recommendation system can do better. Make the conversation fun and stimulating, not a checklist.
+
+The user's library (each has an id; use it exactly when saving a note):
+{books_text}
+
+How to ask (vary your approach):
+- Use what you know: Draw on the book's themes, the author's style, genre, or cultural context to ask specific questions. For example: "Dune's politics and ecology are both huge—did one side pull you in more?" or "Van der Kolk gets pretty science-heavy in places—did that land for you or feel like a slog?" or "That one has a famously divisive ending—where did you land?"
+- Go beyond "how was it?": Ask about a particular character, scene, or idea; the ending; what surprised them; what they'd tell a friend; whether it lived up to the hype; how it compares to something else they've read or to the film/series if there is one.
+- Mix it up: Sometimes be playful or wry, sometimes thoughtful. You can reference the author's other work, the genre, or a common criticism and ask for their take. One question per turn—make it count.
+- Comparative questions are great: "How does that stack up to [another book they have]?" or "More of a page-turner or more of a slow burn?"
+
+Rules:
+- Ask about one book at a time (or compare two when it fits). One short, specific question or follow-up per message.
+- When the user has given you enough about a specific book (what they liked, didn't like, key takeaway), save it by outputting exactly one line: SAVE_NOTE|item_id|short note
+  - item_id must be the exact id from the list above.
+  - The note must be SHORT (one sentence or a few phrases), FACTUAL (only what the user said), and NO hallucination. Examples: "Loved the worldbuilding; found the ending rushed." or "Helpful for understanding trauma; heavy read."
+- You may output at most one SAVE_NOTE per message. After SAVE_NOTE, continue the conversation (e.g. ask about the next book or wrap up).
+- Do not invent or assume anything in the note. If the user only said "it was good", the note could be "User said they liked it." Keep it brief.
+- Tone: conversational, curious, occasionally fun or witty—never stiff or repetitive.
+"""
+
+    parts = [system, "\n\n--- Conversation ---\n"]
+    for m in messages:
+        role = "User" if (m.get("role") == "user") else "Assistant"
+        content = (m.get("content") or "").strip()
+        if content:
+            parts.append(f"{role}: {content}\n")
+    parts.append(f"User: {new_user_message.strip()}\n")
+    parts.append("Assistant:")
+
+    prompt = "\n".join(parts)
+    raw = _call_gemini(prompt)
+    if not raw:
+        return "I had a small hiccup. Want to try again?", []
+
+    notes_saved: list[dict] = []
+    out_lines: list[str] = []
+    for line in raw.split("\n"):
+        line_stripped = line.strip()
+        if line_stripped.startswith("SAVE_NOTE|"):
+            rest = line_stripped[len("SAVE_NOTE|") :]
+            pipe_count = rest.count("|")
+            if pipe_count >= 1:
+                idx = rest.index("|")
+                item_id = rest[:idx].strip()
+                note = rest[idx + 1 :].strip()
+                if item_id and note and len(note) <= 2000:
+                    try:
+                        update_consumed(item_id, note=note)
+                        notes_saved.append({"item_id": item_id, "note": note})
+                    except Exception as e:
+                        print("[backend] run_library_interview update_consumed error:", e)
+            continue
+        out_lines.append(line)
+    cleaned = "\n".join(out_lines).strip()
+    return cleaned if cleaned else "Anything else you want to add about your reading?", notes_saved
+
+
 def wipe_memory() -> None:
     """Clear gist and episodic memory (consumed_content kept)."""
     import vec_store
@@ -151,7 +229,8 @@ Return ONLY valid JSON (no markdown, no comments) that is an array of objects:
 ]
 
 Rules:
-- Each line or item in the text should become one object. "title" is the work's title; "author" if obvious.
+- Each line or item in the text should become one object.
+- **Title and author formatting (critical for books):** Use canonical, properly formatted titles and authors so recommenders are not confused. For books: look up the real title and author if the user typed casually (e.g. "dune" → title "Dune", author "Frank Herbert"; "body keeps the score" → title "The Body Keeps the Score", author "Bessel van der Kolk"). Use title case for titles and full author name(s). For podcasts/articles/research, use consistent title case and full names where applicable.
 - "url" leave empty unless you know a real link. "liked" default true. "note" leave empty for now.
 """
     try:
@@ -218,7 +297,11 @@ def get_consumed_context(max_items: int = 80) -> str:
             if note:
                 line += f". User reflection: {note}"
             lines.append(line)
-        return "What the user has already read or listened to (do not recommend these again; use their tastes and reflections below to suggest similar things):\n" + "\n".join(lines)
+        return (
+            "What the user has already consumed (books, podcasts, articles, research) and their reflections. "
+            "Do not recommend these same items again. Use their tastes and reflections from ALL categories to inform your suggestions—e.g. their notes on a research paper or podcast can shape book recommendations, and vice versa.\n"
+            + "\n".join(lines)
+        )
     except Exception:
         return "The user has not marked any recommendations as consumed yet."
 
@@ -835,6 +918,67 @@ def get_memory_for_visualization() -> tuple[list[str], list[str]]:
     return (gist_docs, episodic_docs)
 
 
+def get_memory_for_date(date_iso: str) -> tuple[list[dict], list[dict]]:
+    """Return (episodic_summaries, gist_facts) for the given date (YYYY-MM-DD)."""
+    import vec_store
+
+    _ensure_storage()
+    episodic: list[dict] = []
+    gist: list[dict] = []
+    try:
+        episodic = vec_store.get_episodic_for_date(date_iso)
+    except Exception as e:
+        print("[backend] get_episodic_for_date error:", e)
+    try:
+        gist = vec_store.get_gist_for_date(date_iso)
+    except Exception as e:
+        print("[backend] get_gist_for_date error:", e)
+    return (episodic, gist)
+
+
+def generate_day_summary(
+    date_iso: str,
+    raw_transcript: str | None,
+    episodic: list[dict],
+    gist: list[dict],
+) -> str:
+    """Use the LLM to produce a short summary/highlights for the day from raw journal and DB memory."""
+    date_display = date_iso[:10] if date_iso else "this day"
+    episodic_blob = "\n".join(f"- {m.get('document', '')}" for m in episodic if m.get("document"))
+    gist_blob = "\n".join(f"- {m.get('document', '')}" for m in gist if m.get("document"))
+    raw_section = ""
+    if raw_transcript and raw_transcript.strip():
+        raw_section = f"""
+RAW JOURNAL ENTRY (user and AI conversation) for this day:
+---
+{raw_transcript.strip()[:8000]}
+---
+"""
+    prompt = f"""You are summarizing a single day of the user's journaling life. Given the date and any raw journal transcript plus what is stored in the memory DB for that day, return exactly TWO separate paragraphs with these exact headings.
+
+Date: {date_display}
+{raw_section}
+MEMORY DB — Episodic summaries for this day:
+{episodic_blob or "(none)"}
+
+MEMORY DB — Gist facts for this day:
+{gist_blob or "(none)"}
+
+Use exactly this format (include the headings and a blank line after each heading):
+
+Objective
+
+[One paragraph: facts only. What happened, what was said or done, concrete events or topics. No interpretation or feelings. Just the facts.]
+
+Story of the day
+
+[One paragraph: synthesis. The narrative of the day — themes, how things fit together, what it added up to. The story of the day.]
+
+If there is no journal and no DB content for this day, say so briefly under Objective and under Story of the day write something like "No recorded content to synthesize." Do not invent details."""
+    out = _call_gemini(prompt)
+    return (out or "No summary generated.").strip()
+
+
 def list_memory_facts() -> list[dict]:
     """Return all gist facts with id, document, session_id, timestamp for Memory UI."""
     import vec_store
@@ -1047,32 +1191,48 @@ def _parse_recommendation_json(text: str, default: list) -> list:
     ]
 
 
-def _books_agent(facts_blob: str, summaries_blob: str, consumed: str) -> list:
+def _books_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
     """Dedicated agent for book recommendations only."""
-    prompt = f"""You are a book curator. Based on this person's journal-derived memory and what they have already read, suggest 3–5 books they might find helpful or comforting.
+    recent_section = ""
+    if recent_summaries_blob:
+        recent_section = f"""
+MOST RECENT JOURNAL ENTRIES (give ~20% more weight to themes and needs that appear here—what's most present for them right now):
+{recent_summaries_blob}
+
+"""
+    prompt = f"""You are a book curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 3–5 books they might find helpful or comforting.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
 {facts_blob or "(none yet)"}
 
-JOURNAL SESSION SUMMARIES:
+JOURNAL SESSION SUMMARIES (all themes over time):
 {summaries_blob or "(none yet)"}
+{recent_section}{consumed}
 
-{consumed}
-
-Rules: Do NOT suggest books they have already consumed. For each book give title, author, and a short "reason" (one sentence) tied to their life or journal themes. No URLs.
+Rules: Do NOT suggest books they have already consumed. Use their reflections and tastes from podcasts, articles, and research too—e.g. if they liked a paper or podcast on a topic, that can inform book picks. For each book give title, author, and a short "reason" (one sentence) tied to their life or journal themes. No URLs.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "..."}}, ...]"""
     text = _call_gemini(prompt)
     return _parse_recommendation_json(text, [])
 
 
 LISTEN_NOTES_BASE = "https://listen-api.listennotes.com/api/v2"
+# Set to True to skip calling the Listen Notes API (use LLM-only fallback for podcast suggestions).
+PODCAST_API_PAUSED = True
 
 
-def _listen_notes_search_episodes(query: str, api_key: str, max_results: int = 5) -> list[dict]:
-    """Call Listen Notes API search (type=episode). Returns list of {title, author, url, reason}."""
+def _listen_notes_search_episodes(
+    query: str,
+    api_key: str,
+    max_results: int = 5,
+    published_after_ms: int | None = None,
+) -> list[dict]:
+    """Call Listen Notes API search (type=episode). Returns list of {title, author, url, reason, pub_date_ms}."""
     import urllib.parse
     import urllib.request
-    qs = urllib.parse.urlencode({"q": query, "type": "episode", "only_one_episode_per_podcast": 1})
+    params = {"q": query, "type": "episode", "only_one_episode_per_podcast": 1}
+    if published_after_ms is not None:
+        params["published_after"] = published_after_ms
+    qs = urllib.parse.urlencode(params)
     url = f"{LISTEN_NOTES_BASE}/search?{qs}"
     req = urllib.request.Request(url, headers={"X-ListenAPI-Key": api_key})
     try:
@@ -1088,31 +1248,83 @@ def _listen_notes_search_episodes(query: str, api_key: str, max_results: int = 5
         podcast = r.get("podcast") or {}
         author = (podcast.get("title_original") or podcast.get("title_highlighted") or "").strip()
         ln_url = (r.get("listennotes_url") or "").strip()
+        pub_ms = r.get("pub_date_ms")
+        if isinstance(pub_ms, (int, float)):
+            pub_ms = int(pub_ms)
+        else:
+            pub_ms = 0
         if title and ln_url:
             out.append({
                 "title": title[:500],
                 "author": author[:300],
                 "reason": f"Suggested based on your interests: {query[:80]}.",
                 "url": ln_url,
+                "pub_date_ms": pub_ms,
             })
         if len(out) >= max_results:
             break
     return out
 
 
-def _podcasts_agent(facts_blob: str, summaries_blob: str, consumed: str) -> list:
+def _generate_podcast_reasons(
+    episodes: list[dict],
+    facts_blob: str,
+    summaries_blob: str,
+    consumed: str,
+) -> list[str]:
+    """Generate a short personalized reason (blurb) for each podcast episode. Returns list of strings in same order."""
+    if not episodes:
+        return []
+    list_text = "\n".join(
+        f"{i + 1}. Show: {e.get('author', '')} | Episode: {e.get('title', '')}"
+        for i, e in enumerate(episodes)
+    )
+    prompt = f"""Given this user's context and these podcast episodes, write a one-sentence reason why each episode is a good suggestion for them. Be specific to their interests (from journals and consumed items). Same order as the list.
+
+USER CONTEXT (facts and journal themes):
+{facts_blob or "(none)"}
+
+CONSUMED (what they've read/listened to and their reflections):
+{consumed[:1500]}
+
+EPISODES (show | episode title):
+{list_text}
+
+Return ONLY a JSON array of {len(episodes)} strings, one reason per episode, in the same order. No markdown. Example: ["Reason for episode 1.", "Reason for episode 2."]"""
+    try:
+        text = _call_gemini(prompt)
+        text = str(text).strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        reasons = json.loads(text)
+        if isinstance(reasons, list) and len(reasons) >= len(episodes):
+            return [str(r).strip() or "Matches your interests." for r in reasons[: len(episodes)]]
+    except Exception as e:
+        print("[backend] _generate_podcast_reasons error:", e)
+    return [e.get("reason", "Matches your interests.") for e in episodes]
+
+
+def _podcasts_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
     """Dedicated podcast agent: uses Listen Notes API for real episode links when key is set."""
+    recent_section = ""
+    if recent_summaries_blob:
+        recent_section = f"""
+MOST RECENT JOURNAL ENTRIES (weight these ~20% more when picking topics):
+{recent_summaries_blob}
+
+"""
     api_key = (os.getenv("LISTENNOTES_API_KEY") or "").strip()
-    if api_key:
-        prompt = f"""Based on this person's journal-derived memory and what they have already listened to, suggest 2–3 short search queries (topics or themes) to find relevant podcast episodes. Examples: "mindfulness sleep", "anxiety therapy", "Huberman Lab sleep".
+    if api_key and not PODCAST_API_PAUSED:
+        prompt = f"""Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 2–3 short search queries (topics or themes) to find relevant podcast episodes. Use tastes from their book notes, article reads, and research too—e.g. themes from a book they loved can become podcast queries. We will prioritize episodes from the last 3 months, so prefer queries that are likely to surface recent, timely episodes. Examples: "mindfulness sleep", "anxiety therapy", "Huberman Lab sleep".
 
 FACTS AND THEMES FROM THEIR JOURNALS:
 {facts_blob or "(none yet)"}
 
-JOURNAL SESSION SUMMARIES:
+JOURNAL SESSION SUMMARIES (all themes):
 {summaries_blob or "(none yet)"}
-
-{consumed}
+{recent_section}{consumed}
 
 Return ONLY a JSON array of 2–3 short search query strings, no markdown. Example: ["mindfulness and sleep", "therapy for anxiety"]"""
         try:
@@ -1130,33 +1342,54 @@ Return ONLY a JSON array of 2–3 short search query strings, no markdown. Examp
             queries = []
         consumed_lower = consumed.lower()
         seen_urls = set()
+        # Prefer episodes from the last 3 months (newer = better)
+        from datetime import datetime, timedelta
+        published_after_ms = int((datetime.utcnow() - timedelta(days=90)).timestamp() * 1000)
         out = []
-        per_query = 2
+        per_query = 3
         for q in queries[:3]:
             if not isinstance(q, str) or not q.strip():
                 continue
-            for item in _listen_notes_search_episodes(q.strip(), api_key, max_results=per_query):
+            for item in _listen_notes_search_episodes(
+                q.strip(), api_key, max_results=per_query, published_after_ms=published_after_ms
+            ):
                 if item["url"] in seen_urls:
                     continue
                 if item["title"].lower() in consumed_lower or (item["author"] and item["author"].lower() in consumed_lower):
                     continue
                 seen_urls.add(item["url"])
                 out.append(item)
+        # If we got few recent episodes, fill with older ones (no date filter)
+        if len(out) < 5:
+            for q in queries[:3]:
                 if len(out) >= 5:
                     break
-            if len(out) >= 5:
-                break
+                if not isinstance(q, str) or not q.strip():
+                    continue
+                for item in _listen_notes_search_episodes(q.strip(), api_key, max_results=per_query):
+                    if item["url"] in seen_urls:
+                        continue
+                    if item["title"].lower() in consumed_lower or (item["author"] and item["author"].lower() in consumed_lower):
+                        continue
+                    seen_urls.add(item["url"])
+                    out.append(item)
+        # Sort by pub_date_ms descending (newer first), then take top 5
+        out.sort(key=lambda x: x.get("pub_date_ms") or 0, reverse=True)
+        out = out[:5]
         if out:
+            reasons = _generate_podcast_reasons(out, facts_blob, summaries_blob, consumed)
+            for i, item in enumerate(out):
+                item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "Matches your interests.")
+                item.pop("pub_date_ms", None)
             return out
-    prompt = f"""You are a podcast curator. Based on this person's journal-derived memory and what they have already listened to, suggest 3–5 specific podcast episodes (show + episode).
+    prompt = f"""You are a podcast curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 3–5 specific podcast episodes (show + episode). Use their tastes from books, articles, and research too—e.g. themes from a paper or book they liked can inform podcast picks.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
 {facts_blob or "(none yet)"}
 
-JOURNAL SESSION SUMMARIES:
+JOURNAL SESSION SUMMARIES (all themes):
 {summaries_blob or "(none yet)"}
-
-{consumed}
+{recent_section}{consumed}
 
 Rules: Use "author" for the show name and "title" for the episode. Provide direct "url" (Spotify or Apple Podcasts episode link) when you know it; otherwise leave "url" empty. Do NOT suggest items they have already consumed. For each give a short "reason" (one sentence).
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
@@ -1164,17 +1397,23 @@ Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reas
     return _parse_recommendation_json(text, [])
 
 
-def _articles_agent(facts_blob: str, summaries_blob: str, consumed: str) -> list:
+def _articles_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
     """Dedicated agent for article recommendations only. Article URLs must work (non-negotiable)."""
-    prompt = f"""You are an article curator. Based on this person's journal-derived memory and what they have already read, suggest 3–5 news articles or long-reads.
+    recent_section = ""
+    if recent_summaries_blob:
+        recent_section = f"""
+MOST RECENT JOURNAL ENTRIES (weight these ~20% more when matching interests):
+{recent_summaries_blob}
+
+"""
+    prompt = f"""You are an article curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 3–5 news articles or long-reads. Use their tastes from books, podcasts, and research too—e.g. themes from a book or paper they liked can inform article picks.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
 {facts_blob or "(none yet)"}
 
-JOURNAL SESSION SUMMARIES:
+JOURNAL SESSION SUMMARIES (all themes):
 {summaries_blob or "(none yet)"}
-
-{consumed}
+{recent_section}{consumed}
 
 CRITICAL: Every article MUST have a "url" that is a real, working link to the actual article page—no 404s. Use only URLs you are certain exist (exact paths from nytimes.com, theatlantic.com, healthline.com, bbc.com, nature.com, apa.org, etc.). Do NOT guess or construct URLs. If you cannot provide a verified working URL for an article, do NOT include it. For each give title, author/source, reason, and url.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
@@ -1182,17 +1421,23 @@ Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reas
     return _parse_recommendation_json(text, [])
 
 
-def _research_agent(facts_blob: str, summaries_blob: str, consumed: str) -> list:
+def _research_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
     """Dedicated agent for research paper recommendations only."""
-    prompt = f"""You are a research curator. Based on this person's journal-derived memory and what they have already read, suggest 3–5 academic or scientific research papers (peer-reviewed articles, studies, or review papers) they might find relevant or helpful.
+    recent_section = ""
+    if recent_summaries_blob:
+        recent_section = f"""
+MOST RECENT JOURNAL ENTRIES (weight these ~20% more when matching interests):
+{recent_summaries_blob}
+
+"""
+    prompt = f"""You are a research curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 3–5 academic or scientific research papers (peer-reviewed articles, studies, or review papers) they might find relevant or helpful. Use their tastes from books, podcasts, and articles too—e.g. themes from a book or podcast they liked can inform paper picks.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
 {facts_blob or "(none yet)"}
 
-JOURNAL SESSION SUMMARIES:
+JOURNAL SESSION SUMMARIES (all themes):
 {summaries_blob or "(none yet)"}
-
-{consumed}
+{recent_section}{consumed}
 
 Rules: Do NOT suggest papers they have already consumed. For each paper give: "title" (paper title), "author" (lead author or author list, or journal name and year), "reason" (one sentence on why it fits their interests), and "url" (working link to the paper—DOI link like https://doi.org/10.1234/... or publisher link to the abstract/full text). Only include papers where you can provide a real, working url (doi.org, PubMed, PMC, journal websites). Do not guess URLs.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
@@ -1204,11 +1449,18 @@ def generate_recommendations() -> dict:
     """
     Run four dedicated agents (books, podcasts, articles, research) in parallel, each with
     its own prompt and specialization. Combines results into one response.
+    Uses full journal history for themes but gives ~20% more weight to the most recent entries.
     """
     gist_docs, episodic_docs = get_memory_for_visualization()
     consumed = get_consumed_context()
     facts_blob = "\n".join(f"- {f}" for f in (gist_docs or [])[:60])
+    # Episodic from get_memory_for_visualization is oldest-first (ORDER BY id). Use all for themes.
     summaries_blob = "\n".join(f"- {s}" for s in (episodic_docs or [])[:40])
+    # Most recent ~20% of journal entries (by count) for extra weight—what's most present right now.
+    episodic_list = episodic_docs or []
+    n_recent = max(5, int(len(episodic_list) * 0.2)) if episodic_list else 0
+    recent_episodic = episodic_list[-n_recent:] if n_recent else []
+    recent_summaries_blob = "\n".join(f"- {s}" for s in recent_episodic) if recent_episodic else ""
 
     from concurrent.futures import ThreadPoolExecutor
     books_list: list = []
@@ -1218,10 +1470,10 @@ def generate_recommendations() -> dict:
 
     agent_timeout = 90  # seconds per agent so one hang doesn't block forever
     with ThreadPoolExecutor(max_workers=4) as executor:
-        future_books = executor.submit(_books_agent, facts_blob, summaries_blob, consumed)
-        future_podcasts = executor.submit(_podcasts_agent, facts_blob, summaries_blob, consumed)
-        future_articles = executor.submit(_articles_agent, facts_blob, summaries_blob, consumed)
-        future_research = executor.submit(_research_agent, facts_blob, summaries_blob, consumed)
+        future_books = executor.submit(_books_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
+        future_podcasts = executor.submit(_podcasts_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
+        future_articles = executor.submit(_articles_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
+        future_research = executor.submit(_research_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
         try:
             books_list = future_books.result(timeout=agent_timeout)
         except Exception as e:
