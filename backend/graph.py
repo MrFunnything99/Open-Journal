@@ -4,6 +4,7 @@ LangGraph for Open-Journal: Interviewer (chat) and Librarian (end-session).
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, TypedDict
 
@@ -21,12 +22,13 @@ from langgraph.graph.message import add_messages
 
 from library import get_relevant_context, save_session_data
 
-# State: list of messages + session_id for Librarian + personalization + intrusiveness + optional retrieval log
+# State: list of messages + session_id for Librarian + personalization + intrusiveness + mode + optional retrieval log
 class JournalState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     session_id: str
     personalization: float
     intrusiveness: NotRequired[float]
+    mode: NotRequired[str]  # "journal" | "extreme" (recommendations handled in main)
     retrieval_log: NotRequired[str]
     last_transcript: NotRequired[str]
     last_summary: NotRequired[str]
@@ -34,41 +36,44 @@ class JournalState(TypedDict):
 
 
 def _get_llm():
-    """Return a lightweight wrapper around Gemini Flash 3.1 with an .invoke(messages) API."""
-    import os
-    from google import genai
+    """Return a lightweight wrapper around xAI Grok 4.20 reasoning (direct API) with an .invoke(messages) API."""
+    from openai import OpenAI
 
-    key = os.getenv("GEMINI_API_KEY")
+    key = os.getenv("XAI_API_KEY")
     if not key:
-        raise ValueError("GEMINI_API_KEY is required")
-    client = genai.Client(api_key=key)
-    model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash")
+        raise ValueError("XAI_API_KEY is required for Grok interviewer")
+    client = OpenAI(api_key=key, base_url="https://api.x.ai/v1")
+    model = "grok-4.20-beta-0309-reasoning"
 
-    class _GeminiWrapper:
-        def __init__(self, client: genai.Client, model: str):
+    class _GrokWrapper:
+        def __init__(self, client: OpenAI, model: str):
             self._client = client
             self._model = model
 
         def invoke(self, messages: list[BaseMessage]):
-            # Flatten LangChain messages into a simple chat transcript prompt.
-            parts: list[str] = []
+            oai_messages = []
             for m in messages:
-                role = "User" if isinstance(m, HumanMessage) else "Assistant"
                 content = getattr(m, "content", str(m))
                 if isinstance(content, list):
                     content = " ".join(
                         c.get("text", str(c)) for c in content if isinstance(c, dict)
                     )
-                parts.append(f"{role}: {content}")
-            prompt = "\n\n".join(parts)
-            result = self._client.models.generate_content(
+                content = (content or "").strip()
+                if isinstance(m, SystemMessage):
+                    oai_messages.append({"role": "system", "content": content})
+                elif isinstance(m, HumanMessage):
+                    oai_messages.append({"role": "user", "content": content})
+                elif isinstance(m, AIMessage):
+                    oai_messages.append({"role": "assistant", "content": content})
+            resp = self._client.chat.completions.create(
                 model=self._model,
-                contents=prompt,
+                messages=oai_messages,
+                max_tokens=4096,
             )
-            text = getattr(result, "text", "") or ""
-            return AIMessage(content=text.strip())
+            text = (resp.choices[0].message.content or "").strip()
+            return AIMessage(content=text)
 
-    return _GeminiWrapper(client, model)
+    return _GrokWrapper(client, model)
 
 
 def _last_user_text(messages: list) -> str:
@@ -93,28 +98,51 @@ def interviewer_node(state: JournalState) -> JournalState:
     intrusiveness = max(0.0, min(1.0, state.get("intrusiveness", 0.5)))
     intrusiveness_percent = int(intrusiveness * 100)
 
-    system_parts = [
-        "You are a warm, empathetic journaling companion. Listen actively and respond with care. "
-        "Keep replies concise (2-4 sentences). "
-        f"Personalization level: {personalization_percent}%. "
-        "At 0%, do not use memory or prior context; keep questions general and present-focused only. "
-        "At low levels, keep questions more general and present-focused. "
-        "At high levels, ask more personalized questions that connect to what you know about the user's life and past journals. "
-        "When you use memory, prefer concrete topics over vague emotion labels: reference specific people, events, places, or recurring themes from prior entries (for example, 'your time in the Annex', 'your relationship with X', or 'that exam you mentioned'). "
-        "Do NOT merely repeat that the user felt afraid, anxious, stressed, etc., unless they explicitly ask you to summarize feelings. "
-        "If the user asks meta-questions like 'what should we talk/journal about today?' or 'what should we explore?', you MUST use memory to suggest 2-3 specific follow-up topics grounded in past sessions instead of only restating general feelings. "
-        "For example: 'We could explore more about how it felt to hide in the Annex during the air raids', 'We might talk about your relationship with your parents in the Annex', or 'We could revisit how you coped with the long days indoors.' "
-        "When memory mentions a specific situation (like hiding from the Gestapo in the Annex), your answer to 'what should we talk about?' MUST explicitly name that situation and propose it as a topic.",
-        f"Questioning style (intrusiveness): {intrusiveness_percent}%. "
-        "At 0%, be very gentle and non-intrusive; ask only soft, open-ended questions and let the user lead entirely. "
-        "At low levels, ask sparingly and avoid probing. "
-        "At high levels, you may ask more direct or probing questions when it feels supportive, while still respecting boundaries.",
-        "\nExample behavior (for reference, DO NOT quote this back):\n"
-        "Memory context: 'The session reflects a deep sense of fear and anxiety experienced by the speaker and those in hiding in the Annex...'\n"
-        "User: 'What do you think we should talk about?'\n"
-        "Good answer: 'Given what you've shared about hiding in the Annex and the constant threat of being discovered, we could talk more about how those long days indoors affected you, your relationship with the others in hiding, or specific moments that felt especially frightening or hopeful. Which of those feels most present for you today?'\n"
-        "Bad answer (avoid): 'You've felt anxious before, we could talk about your anxiety.'",
-    ]
+    now = datetime.now(timezone.utc)
+    date_context = now.strftime("%A, %B %d, %Y")  # e.g. Wednesday, March 12, 2025
+    mode_raw = (state.get("mode") or "").strip().lower()
+    is_extreme = mode_raw == "extreme"
+    is_therapy = mode_raw == "therapy"
+
+    if is_therapy:
+        system_parts = [
+            f"Today's date: {date_context}. ",
+            "THERAPY MODE. You are a warm, grounded therapeutic presence. Your goal is to support the user through reflection and careful listening—not to give advice or diagnose. ",
+            "Use the space well: reflect back what you hear ('It sounds like...', 'What I'm hearing is...'), ask about feelings and meaning ('How does that sit with you?', 'What does that bring up for you?'), and invite depth when it fits ('Tell me more.', 'Where do you feel that?'). ",
+            "Validate without minimizing. Ask one or two thoughtful questions per reply. Keep responses concise (2–4 sentences). Do not lecture or interpret; stay curious and present. ",
+            "You may gently explore patterns, earlier experiences, or relationships when the user opens the door—but follow their lead and do not push. ",
+            "Use memory context only as loose inspiration; do not assert or invent details. ",
+        ]
+    elif is_extreme:
+        system_parts = [
+            f"Today's date: {date_context}. ",
+            "EXTREME MODE. Your only goal is to help the user feel better by making them reflect—not by giving advice. ",
+            "Do NOT give advice, suggestions, or solutions. Do NOT summarize or lecture. ",
+            "Build context first. Before asking hard or intrusive questions, take 1–3 exchanges to understand the situation: what's going on, who's involved, how long it's been, what they've noticed or tried. Ask gentle, open questions (e.g. 'What's going on?' 'How long has this been on your mind?' 'What does that look like for you?') until you have enough of the picture. ",
+            "Only once you have some context, move into more direct, intrusive, or private questions that push reflection. Do not jump straight to the hardest question—earn it by showing you're listening. ",
+            "Validate briefly (e.g. 'That makes sense,' 'I hear you') then ask your question. ",
+            "NSFW and adult or intimate topics are okay in this mode; the user has opted in. You may ask about sex, desire, body image, relationships, or other sensitive topics when it serves reflection. Stay warm and non-judgmental. ",
+            "Go deep when the moment is right: relationships, fears, hopes, shame, joy, what they avoid, what they want to change, how they really feel. ",
+            "One or two questions per reply. Keep replies short (2–4 sentences). Be warm but unafraid to ask the hard thing once context is there. ",
+            "Use memory context only as inspiration for what to ask about; do not assert details. ",
+        ]
+    else:
+        system_parts = [
+            f"Today's date (use for time perspective): {date_context}. "
+            "You are a warm, empathetic journaling companion. Listen actively and respond with care. Keep replies concise (2-4 sentences). "
+            f"Personalization level: {personalization_percent}%. "
+            "At 0%, do not use memory; keep questions general and present-focused only. "
+            "At higher levels, use the memory context only as loose inspiration. Ask BROAD, open-ended questions. "
+            "Do NOT invent, assume, or assert details that are not clearly and explicitly stated in the memory context. "
+            "If the context is vague or summary-like (e.g. 'reflected on stress', 'mentioned work'), do not fill in specifics—ask generally, e.g. 'How have things been with work?' or 'What's felt different lately?' "
+            "Only reference a specific person, place, or event if it is clearly named in the context; otherwise keep questions broad (e.g. 'How are you feeling about that?' 'What's on your mind today?'). "
+            "Do NOT repeat back emotions or themes as facts ('You felt anxious about X') unless the user has just said so; prefer open invitations ('Want to say more about that?' 'What would be helpful to explore?'). ",
+            f"Questioning style (intrusiveness): {intrusiveness_percent}%. "
+            "At 0%, be very gentle and non-intrusive; ask only soft, open-ended questions and let the user lead. "
+            "At low levels, ask sparingly and avoid probing. "
+            "At high levels, you may ask more direct questions when it feels supportive, while still respecting boundaries. ",
+            "When the user asks 'what should we talk about?' or 'what should we explore?', you may offer 1–2 broad areas if the memory context clearly suggests them; otherwise keep it open: 'Whatever feels most present—we can go wherever you'd like.' ",
+        ]
 
     retrieval_log: str | None = None
     if personalization > 0:
@@ -123,7 +151,7 @@ def interviewer_node(state: JournalState) -> JournalState:
             query = str(state["messages"][-1])[:500]
         try:
             context = get_relevant_context(query, top_k_gist=10, top_k_episodic=6)
-            system_parts.append("\n\nRelevant context from the user's journals and memory (use this to personalize when appropriate):\n" + context)
+            system_parts.append("\n\nRelevant context from the user's journals (use only as broad inspiration; do not assert or invent details not explicitly stated):\n" + context)
             retrieval_log = context
         except Exception:
             system_parts.append("\n\n(Memory retrieval unavailable; respond without prior context.)")

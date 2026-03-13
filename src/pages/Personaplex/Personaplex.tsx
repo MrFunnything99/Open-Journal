@@ -86,16 +86,16 @@ export const Personaplex = () => {
   // Personalization is always \"high\": the agent should actively connect past memories and journals to the current conversation when relevant.
   const personalization = 1;
   const [intrusiveness, setIntrusiveness] = useState(0.5);
-  const [sessionMode, setSessionMode] = useState<"journal" | "recommendations">("journal");
+  const [sessionMode, setSessionMode] = useState<"journal" | "recommendations" | "extreme" | "therapy">("journal");
   const [voices, setVoices] = useState<VoiceOption[]>(FALLBACK_VOICES);
   const [selectedVoiceId, setSelectedVoiceId] = useState(DEFAULT_VOICE_ID);
-  // Fixed voice settings: slightly expressive, 20% stability, speed 1.2x.
+  // Fixed voice settings: speed 1.0, moderate stability to reduce ElevenLabs variability/errors.
   const voiceSettings = useMemo(
     () => ({
-      stability: 0.2,
+      stability: 0.4,
       similarity_boost: 0.75,
-      style: 0.6,
-      speed: 1.2,
+      style: 0.4,
+      speed: 1.0,
     }),
     []
   );
@@ -451,36 +451,47 @@ export const Personaplex = () => {
     [consumedIds]
   );
 
-  const handleIngestPriorJournal = useCallback(() => {
+  const handleIngestPriorJournal = useCallback(async () => {
     if (!priorJournalText.trim()) return;
     setIsIngesting(true);
     const textToIngest = priorJournalText.trim();
-    fetch(`${BACKEND_URL}/ingest-history`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: textToIngest }),
-    })
-      .then((r) => {
-        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d.detail ?? "Ingest failed")));
-        return r.json();
-      })
-      .then((data) => {
-        if (data && data.ok === false) {
-          setToastMessage("Failed to add to memory. Check backend logs.");
-          setTimeout(() => setToastMessage(null), 4000);
-          return;
-        }
-        setPriorJournalText("");
-        saveEntry([{ role: "user", text: textToIngest }]);
-        setToastMessage("Journal added to memory and saved to History.");
-        setTimeout(() => setToastMessage(null), 5000);
-        fetchMemoryStats();
-      })
-      .catch((err) => {
-        setToastMessage(err instanceof Error ? err.message : "Failed to add to memory");
+    let inferredDate: string | undefined;
+    try {
+      const ir = await fetch(`${BACKEND_URL}/infer-entry-date`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: textToIngest }),
+      });
+      if (ir.ok) {
+        const data = await ir.json();
+        if (data?.date) inferredDate = data.date;
+      }
+    } catch {
+      /* use no date / today as fallback */
+    }
+    try {
+      const r = await fetch(`${BACKEND_URL}/ingest-history`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: textToIngest, entry_date: inferredDate }),
+      });
+      const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };
+      if (data && data.ok === false) {
+        setToastMessage("Failed to add to memory. Check backend logs.");
         setTimeout(() => setToastMessage(null), 4000);
-      })
-      .finally(() => setIsIngesting(false));
+        return;
+      }
+      setPriorJournalText("");
+      saveEntry([{ role: "user", text: textToIngest }], inferredDate);
+      setToastMessage("Journal added to memory and saved to History.");
+      setTimeout(() => setToastMessage(null), 5000);
+      fetchMemoryStats();
+    } catch (err) {
+      setToastMessage(err instanceof Error ? err.message : "Failed to add to memory");
+      setTimeout(() => setToastMessage(null), 4000);
+    } finally {
+      setIsIngesting(false);
+    }
   }, [priorJournalText, fetchMemoryStats, saveEntry]);
 
   const handleWipeMemory = useCallback(() => {
@@ -678,7 +689,7 @@ export const Personaplex = () => {
                 const r = await fetch(`${BACKEND_URL}/ingest-history`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ text }),
+                  body: JSON.stringify({ text, entry_date: inferredDate }),
                 });
                 if (r.ok) synced += 1;
               } catch {
@@ -721,7 +732,7 @@ export const Personaplex = () => {
               return;
             }
             setToastMessage(`Imported ${count} journal${count === 1 ? "" : "s"}. Syncing to memory…`);
-            const entries = parsed.entries as { fullTranscript?: { role: string; text: string }[] }[];
+            const entries = parsed.entries as { fullTranscript?: { role: string; text: string }[]; date?: string }[];
             let synced = 0;
             for (const entry of entries) {
               const msgs = entry?.fullTranscript;
@@ -734,7 +745,7 @@ export const Personaplex = () => {
                 const r = await fetch(`${BACKEND_URL}/ingest-history`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ text: transcriptText }),
+                  body: JSON.stringify({ text: transcriptText, entry_date: entry?.date }),
                 });
                 if (r.ok) synced += 1;
               } catch {
@@ -769,7 +780,7 @@ export const Personaplex = () => {
               const ingestRes = await fetch(`${BACKEND_URL}/ingest-history`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: content }),
+                body: JSON.stringify({ text: content, entry_date: inferredDate }),
               });
               const data = ingestRes.ok ? await ingestRes.json().catch(() => ({})) : { ok: false };
               fetchMemoryStats();
@@ -926,17 +937,29 @@ export const Personaplex = () => {
                 <select
                   id="personaplex-session-mode"
                   value={sessionMode}
-                  onChange={(e) => setSessionMode(e.target.value as "journal" | "recommendations")}
+                  onChange={(e) => setSessionMode(e.target.value as "journal" | "recommendations" | "extreme" | "therapy")}
                   disabled={isConnected}
                   className="w-full px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
-                  aria-label="Interview mode: journal or recommendations"
+                  aria-label="Interview mode: journal, recommendations, extreme, or therapy"
                 >
                   <option value="journal">Regular interview (journal entries)</option>
                   <option value="recommendations">Recommendations (talk about your books)</option>
+                  <option value="extreme">Extreme (intrusive reflection)</option>
+                  <option value="therapy">Therapy mode</option>
                 </select>
                 {sessionMode === "recommendations" && (
                   <p className="text-xs text-slate-500 mt-1">
                     Same speech-to-text; agent asks about your library and saves short notes for better recommendations.
+                  </p>
+                )}
+                {sessionMode === "extreme" && (
+                  <p className="text-xs text-slate-500 mt-1">
+                    Asks direct, private questions to help you reflect and feel better. No advice—just reflection.
+                  </p>
+                )}
+                {sessionMode === "therapy" && (
+                  <p className="text-xs text-slate-500 mt-1">
+                    Supportive, reflective listening. No advice—just space to explore.
                   </p>
                 )}
               </div>

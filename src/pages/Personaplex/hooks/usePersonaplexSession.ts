@@ -14,7 +14,7 @@ export type VoiceSettings = {
   speed?: number;
 };
 
-export type SessionMode = "journal" | "recommendations";
+export type SessionMode = "journal" | "recommendations" | "extreme" | "therapy";
 
 export type UsePersonaplexSessionOptions = {
   systemPrompt: string;
@@ -45,7 +45,7 @@ async function fetchInterviewerQuestion(
   sessionId: string | null,
   personalization: number,
   intrusiveness: number,
-  mode: "journal" | "recommendations"
+  mode: "journal" | "recommendations" | "extreme" | "therapy"
 ): Promise<{ question: string; sessionId: string; retrievalLog?: string; notesSaved?: { item_id: string; note: string }[] }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), CHAT_FETCH_TIMEOUT_MS);

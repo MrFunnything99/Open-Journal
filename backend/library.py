@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -817,11 +817,12 @@ People:
             print("[backend] run_people_grouping_agent set_person_groups error:", e)
 
 
-def save_session_data(session_id: str, transcript: str) -> dict:
+def save_session_data(session_id: str, transcript: str, entry_date: str | None = None) -> dict:
     """
     Extract summary + facts + metadata from transcript via Gemini, embed via Gemini, save to SQLite+sqlite-vec.
     Returns {"summary": str, "facts": list[str]} for callers (e.g. LightRAG feed).
     Episodic row also stores metadata_json for future time-series / pattern analysis; metadata is not embedded.
+    If entry_date is provided (ISO date or datetime), use it as the stored timestamp; otherwise use now.
     """
     import vec_store
 
@@ -832,6 +833,15 @@ def save_session_data(session_id: str, transcript: str) -> dict:
     metadata = data.get("metadata") or {}
 
     ts = datetime.utcnow().isoformat() + "Z"
+    if entry_date:
+        try:
+            s = entry_date.strip()[:26].replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        except Exception:
+            pass
 
     if summary:
         summary_emb = _embed_texts([summary])[0]
@@ -861,10 +871,30 @@ def save_session_data(session_id: str, transcript: str) -> dict:
     return {"summary": summary, "facts": facts}
 
 
+def _parse_iso_date(ts: str) -> datetime | None:
+    """Parse ISO timestamp to datetime; return None if invalid."""
+    if not ts or not ts.strip():
+        return None
+    try:
+        s = ts.strip()[:26].replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _recency_boost(days_ago: float) -> float:
+    """Return boost for recency: 0.4 for last 30 days, 0.2 for 31–90 days, 0 otherwise (40% more weight on present)."""
+    if days_ago <= 30:
+        return 0.4
+    if days_ago <= 90:
+        return 0.2
+    return 0.0
+
+
 def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 5) -> str:
     """
     Embed the query, retrieve relevant gist facts and episodic summaries from SQLite+sqlite-vec,
-    and return a single string for injection into the interviewer's context.
+    with ~40% more weight on recent journals. Return a single string for the interviewer's context.
     """
     import vec_store
 
@@ -872,23 +902,80 @@ def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 
         return "None."
     _ensure_storage()
     query_emb = _embed_texts([query.strip()])[0]
+    now = datetime.now(timezone.utc)
+
+    def rerank_with_recency(
+        items: list[tuple[str, str]],
+        k: int,
+    ) -> list[tuple[str, str]]:
+        scored: list[tuple[float, tuple[str, str]]] = []
+        for rank, (doc, ts) in enumerate(items):
+            days_ago = 999.0
+            dt = _parse_iso_date(ts)
+            if dt:
+                try:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    days_ago = max(0, (now - dt).total_seconds() / 86400)
+                except Exception:
+                    pass
+            boost = _recency_boost(days_ago)
+            # Lower rank = better similarity; add recency boost so recent items rank higher
+            score = -rank + boost
+            scored.append((score, (doc, ts)))
+        scored.sort(key=lambda x: -x[0])
+        return [item for _, item in scored[:k]]
 
     parts = []
     try:
         if vec_store.gist_count() > 0:
+            count = vec_store.gist_count()
+            fetch_k = min(max(top_k_gist * 2, 10), count)
+            raw = vec_store.query_gist_with_timestamp(query_emb, fetch_k)
+            items = rerank_with_recency(raw, top_k_gist)
+            if items:
+                lines = []
+                for doc, ts in items:
+                    dt = _parse_iso_date(ts)
+                    if dt:
+                        lines.append(f"- {doc} (from {dt.strftime('%Y-%m-%d')})")
+                    else:
+                        lines.append(f"- {doc}")
+                parts.append("Facts and details from the user's life and journals:\n" + "\n".join(lines))
+    except Exception:
+        try:
             docs = vec_store.query_gist(query_emb, min(top_k_gist, vec_store.gist_count()))
             if docs:
                 parts.append("Facts and details from the user's life and journals:\n" + "\n".join(f"- {d}" for d in docs))
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     try:
         if vec_store.episodic_count() > 0:
+            count = vec_store.episodic_count()
+            fetch_k = min(max(top_k_episodic * 2, 8), count)
+            raw = vec_store.query_episodic_with_timestamp(query_emb, fetch_k)
+            items = rerank_with_recency(raw, top_k_episodic)
+            if items:
+                lines = []
+                for doc, ts in items:
+                    dt = _parse_iso_date(ts)
+                    if dt:
+                        lines.append(f"- {doc} (from {dt.strftime('%Y-%m-%d')})")
+                    else:
+                        lines.append(f"- {doc}")
+                parts.append("Relevant journal summaries (more recent entries favored):\n" + "\n".join(lines))
+            elif not items and vec_store.episodic_count() > 0:
+                docs = vec_store.query_episodic(query_emb, min(top_k_episodic, vec_store.episodic_count()))
+                if docs:
+                    parts.append("Relevant journal summaries:\n" + "\n".join(f"- {d}" for d in docs))
+    except Exception:
+        try:
             docs = vec_store.query_episodic(query_emb, min(top_k_episodic, vec_store.episodic_count()))
             if docs:
                 parts.append("Relevant journal summaries:\n" + "\n".join(f"- {d}" for d in docs))
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     if not parts:
         return "None."

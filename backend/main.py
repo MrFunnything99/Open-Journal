@@ -78,11 +78,16 @@ async def lifespan(app: FastAPI):
         os.environ.pop(v, None)
     os.environ["NO_PROXY"] = "*"
     # Startup: log whether env is loaded (no secrets)
-    key = os.getenv("GEMINI_API_KEY")
-    if key and key.strip():
-        print("[backend] GEMINI_API_KEY is set (ready for /chat and LLM ops)")
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    xai_key = os.getenv("XAI_API_KEY")
+    if gemini_key and gemini_key.strip():
+        print("[backend] GEMINI_API_KEY is set (embeddings, memory, etc.)")
     else:
-        print("[backend] WARNING: GEMINI_API_KEY is missing. Set it in .env at project root and restart.")
+        print("[backend] WARNING: GEMINI_API_KEY is missing. Set it in .env for embeddings and memory.")
+    if xai_key and xai_key.strip():
+        print("[backend] XAI_API_KEY is set (Grok 4.20 reasoning for interviewer)")
+    else:
+        print("[backend] WARNING: XAI_API_KEY is missing. Set it in .env for /chat interviewer.")
     yield
     # Cleanup if needed
     pass
@@ -157,6 +162,7 @@ class LibraryInterviewResponse(BaseModel):
 class IngestHistoryRequest(BaseModel):
     text: str
     session_id: Optional[str] = None
+    entry_date: Optional[str] = None  # ISO date/datetime when the journal was written; used for vector DB timestamp
 
 
 class IngestHistoryResponse(BaseModel):
@@ -340,7 +346,7 @@ async def chat(req: ChatRequest):
     """User sends text; Interviewer responds. State updated in memory. mode=recommendations uses library interview (books, notes)."""
     session_id = get_or_create_session(req.session_id)
     mode = (req.mode or "journal").strip().lower()
-    if mode not in ("journal", "recommendations"):
+    if mode not in ("journal", "recommendations", "extreme", "therapy"):
         mode = "journal"
 
     if mode == "recommendations":
@@ -405,6 +411,7 @@ async def chat(req: ChatRequest):
         "session_id": session_id,
         "personalization": personalization,
         "intrusiveness": intrusiveness,
+        "mode": mode,
     }
     try:
         result = await asyncio.wait_for(
@@ -546,7 +553,8 @@ async def ingest_history(req: IngestHistoryRequest):
         text = (req.text or "").strip()
         if not text:
             return IngestHistoryResponse(ok=True, session_id=session_id)
-        extracted = await asyncio.to_thread(save_session_data, session_id, text)
+        entry_date = (req.entry_date or "").strip() or None
+        extracted = await asyncio.to_thread(save_session_data, session_id, text, entry_date=entry_date)
         summary = extracted.get("summary") or ""
         facts = extracted.get("facts") or []
         if summary or facts:

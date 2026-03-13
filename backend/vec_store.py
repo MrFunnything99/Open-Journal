@@ -349,6 +349,36 @@ def query_episodic(embedding: list[float], k: int) -> list[str]:
     return [r[0] for r in rows if r[0]]
 
 
+def query_episodic_with_timestamp(embedding: list[float], k: int) -> list[tuple[str, str]]:
+    """Return top-k (document, timestamp) by cosine similarity. Timestamp may be ''."""
+    conn = _get_conn()
+    blob = _blob_from_floats(embedding)
+    rows = conn.execute(
+        """
+        SELECT document, timestamp
+        FROM vec_episodic
+        WHERE embedding MATCH ? AND k = ?
+        """,
+        (blob, k),
+    ).fetchall()
+    return [(r[0] or "", r[1] or "") for r in rows if r[0]]
+
+
+def query_gist_with_timestamp(embedding: list[float], k: int) -> list[tuple[str, str]]:
+    """Return top-k (document, timestamp) by cosine similarity. Timestamp may be ''."""
+    conn = _get_conn()
+    blob = _blob_from_floats(embedding)
+    rows = conn.execute(
+        """
+        SELECT document, timestamp
+        FROM vec_gist
+        WHERE embedding MATCH ? AND k = ?
+        """,
+        (blob, k),
+    ).fetchall()
+    return [(r[0] or "", r[1] or "") for r in rows if r[0]]
+
+
 def get_all_gist() -> list[str]:
     """Return all gist documents (for visualization); from canonical memory_facts."""
     conn = _get_conn()

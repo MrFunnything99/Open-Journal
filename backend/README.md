@@ -22,8 +22,9 @@ cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install 
 
 Copy `.env.example` to `.env` in the project root and set:
 
-- `GEMINI_API_KEY` – for embeddings and chat (required)
-- `GEMINI_CHAT_MODEL` – e.g. `gemini-1.5-flash` (optional)
+- `GEMINI_API_KEY` – for embeddings, memory extraction, date inference (required)
+- `XAI_API_KEY` – for interviewer chat (Grok 4.20 reasoning, required for /chat)
+- `GEMINI_CHAT_MODEL` – e.g. `gemini-1.5-flash` (optional, for other LLM ops)
 - `GEMINI_EMBEDDING_MODEL` – e.g. `gemini-embedding-2-preview` (optional)
 - `EMBEDDING_DIM` – vector size, default `768` (optional)
 - `LIGHTRAG_ENABLED` – set to `false` to disable LightRAG indexing (optional)
