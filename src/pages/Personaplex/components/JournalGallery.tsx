@@ -8,17 +8,6 @@ type JournalGalleryProps = {
   onToast?: (message: string) => void;
 };
 
-async function fetchReformattedEntry(messages: { role: "user" | "ai"; text: string }[]): Promise<string> {
-  const res = await fetch("/api/reformat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Failed to reformat");
-  return data.text;
-}
-
 export const JournalGallery: FC<JournalGalleryProps> = ({
   entries,
   onDeleteEntry,
@@ -27,7 +16,6 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
 }) => {
   const [selectedEntry, setSelectedEntry] = useState<JournalEntry | null>(null);
   const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
-  const [, setIsGenerating] = useState(false);
   const [reformattedModal, setReformattedModal] = useState<{ text: string; entry: JournalEntry } | null>(null);
   const [thinkingLogsModal, setThinkingLogsModal] = useState<string | null>(null);
 
