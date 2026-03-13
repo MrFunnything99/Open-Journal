@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import ForceGraph2D, { NodeObject, LinkObject } from "react-force-graph-2d";
+import ForceGraph2D, { NodeObject } from "react-force-graph-2d";
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
 

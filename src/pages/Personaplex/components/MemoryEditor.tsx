@@ -32,6 +32,8 @@ type Metadata = {
   activities?: string[];
   events?: string[];
   emotions?: string[];
+  mood?: number | null;
+  energy?: number | null;
 };
 
 function parseMetadata(metadata_json: string | null | undefined): Metadata {
@@ -44,6 +46,8 @@ function parseMetadata(metadata_json: string | null | undefined): Metadata {
       activities: Array.isArray(o.activities) ? o.activities.map(String) : [],
       events: Array.isArray(o.events) ? o.events.map(String) : [],
       emotions: Array.isArray(o.emotions) ? o.emotions.map(String) : [],
+      mood: typeof o.mood === "number" ? o.mood : null,
+      energy: typeof o.energy === "number" ? o.energy : null,
     };
   } catch {
     return {};
@@ -105,20 +109,6 @@ export function MemoryEditor({
       map.get(key)!.push(s);
     }
     const keys = Array.from(map.keys()).sort().reverse();
-    return { keys, map };
-  }, [summaries]);
-
-  const summariesByPerson = useMemo(() => {
-    const map = new Map<string, MemorySummary[]>();
-    for (const s of summaries) {
-      const meta = parseMetadata(s.metadata_json);
-      const people = meta.people?.length ? meta.people : ["(No person)"];
-      for (const p of people) {
-        if (!map.has(p)) map.set(p, []);
-        map.get(p)!.push(s);
-      }
-    }
-    const keys = Array.from(map.keys()).sort();
     return { keys, map };
   }, [summaries]);
 
@@ -458,7 +448,6 @@ export function MemoryEditor({
             ["person", "People", "See who appears in your memories.", false],
             ["topic", "Topics", "Coming soon", true],
             ["place", "Places", "Coming soon", true],
-            ["facts", "Facts", "Coming soon", true],
             ["activity", "Activities", "Coming soon", true],
             ["emotion", "Emotions", "Coming soon", true],
           ] as const
@@ -471,10 +460,10 @@ export function MemoryEditor({
                 onToast("Coming soon");
                 return;
               }
-              setViewTab(key === "facts" ? "time" : (key as Exclude<MemoryViewTab, "facts">));
+              setViewTab(key as MemoryViewTab);
             }}
             className={`text-left rounded-xl bg-slate-900/60 border px-4 py-3 transition-colors ${
-              !comingSoon && (key === "facts" ? viewTab === "time" : viewTab === key)
+              !comingSoon && viewTab === key
                 ? "border-violet-500/80 ring-1 ring-violet-500/60"
                 : "border-slate-700/70 hover:border-slate-500/80"
             } ${comingSoon ? "opacity-80" : ""}`}

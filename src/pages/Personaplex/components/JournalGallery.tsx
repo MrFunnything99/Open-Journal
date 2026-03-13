@@ -27,7 +27,7 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
 }) => {
   const [selectedEntry, setSelectedEntry] = useState<JournalEntry | null>(null);
   const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [, setIsGenerating] = useState(false);
   const [reformattedModal, setReformattedModal] = useState<{ text: string; entry: JournalEntry } | null>(null);
   const [thinkingLogsModal, setThinkingLogsModal] = useState<string | null>(null);
 
@@ -51,7 +51,7 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
       "",
     ];
     let aiIndex = 0;
-    entry.fullTranscript.forEach((msg, i) => {
+    entry.fullTranscript.forEach((msg) => {
       if (msg.role === "ai") {
         aiIndex += 1;
         lines.push(`--- AI Response ${aiIndex} ---`);
@@ -90,23 +90,6 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
       onToast?.("Downloaded. Viewing logs.");
     },
     [buildThinkingLogsContent, onToast]
-  );
-
-  const handleAiReformat = useCallback(
-    async (entry: JournalEntry) => {
-      if (entry.fullTranscript.length === 0) return;
-      setIsGenerating(true);
-      try {
-        const text = await fetchReformattedEntry(entry.fullTranscript);
-        setReformattedModal({ text, entry });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "AI reformatting failed";
-        onToast?.(msg);
-      } finally {
-        setIsGenerating(false);
-      }
-    },
-    [onToast]
   );
 
   const copyReformattedToClipboard = useCallback(async (text: string) => {

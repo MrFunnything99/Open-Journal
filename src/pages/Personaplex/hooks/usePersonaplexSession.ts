@@ -241,7 +241,7 @@ function createSilentPcmBase64(numSamples: number): string {
 }
 
 export const usePersonaplexSession = ({
-  systemPrompt,
+  systemPrompt: _systemPrompt,
   selectedVoiceId,
   manualMode = false,
   personalization,
