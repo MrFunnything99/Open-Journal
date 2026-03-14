@@ -1076,7 +1076,7 @@ export const Personaplex = () => {
         >
           {view === "history" && (
             <>
-              <div className="p-4 md:p-6 flex-shrink-0 space-y-4">
+              <div className="px-4 pt-4 pb-2 md:px-6 md:pt-6 md:pb-3 flex-shrink-0 space-y-4">
                 <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 max-w-2xl">
                   <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
                     Add prior journal to memory
@@ -1307,7 +1307,7 @@ export const Personaplex = () => {
             </div>
           )}
           {view === "recommendations" && (
-            <div className="flex-1 flex flex-col min-h-0 p-4 md:p-6 overflow-hidden">
+            <div className="flex-1 flex flex-col min-h-0 px-4 pt-4 pb-0 md:px-6 md:pt-6 md:pb-1 overflow-hidden">
               <div className="flex-shrink-0 flex flex-wrap items-center justify-between gap-3 mb-4">
                 <div>
                   <h2 className="text-lg font-medium text-slate-300 uppercase tracking-wider">
@@ -1614,7 +1614,7 @@ export const Personaplex = () => {
               ) : recommendationsLoading && !recommendations.books.length && !recommendations.podcasts.length && !recommendations.articles.length && !recommendations.research.length ? (
                 <p className="text-slate-500 text-sm">Loading recommendations… This can take up to a minute.</p>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 pb-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 pb-0">
                   {/* Books */}
                   <section className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex flex-col">
                     <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-3">Books</h3>
@@ -1914,7 +1914,7 @@ export const Personaplex = () => {
       </main>
 
       {/* Footer */}
-      <footer className="flex-none z-0 bg-slate-950/80 backdrop-blur-sm py-2 px-4 text-center space-y-2 border-t border-slate-800/60">
+      <footer className="mt-auto flex-shrink-0 z-0 bg-slate-950/80 backdrop-blur-sm pt-0 pb-1.5 px-4 text-center space-y-1">
         <p className="text-xs text-slate-500">
           {!isConnected
             ? "Connect to begin your journaling session."
@@ -1922,10 +1922,10 @@ export const Personaplex = () => {
               ? "Thinking..."
               : "Speak naturally. The AI is listening."}
         </p>
-        <div className="pt-2 space-y-1">
-          <p className="text-[10px] text-slate-600">
-            By John S., Sherelle M., Aniyah T., Dominique S., Andy C., Jackeline G.
-          </p>
+        <p className="text-[10px] text-slate-600 max-w-xl mx-auto">
+          This is a prototype. Please avoid sharing highly sensitive personal information until our data pipeline is more secure. For private or stress testing, run the app locally and use local LLMs.
+        </p>
+        <div className="pt-1">
           <p className="text-[10px] text-slate-600 flex items-center justify-center gap-2 flex-wrap">
             <a
               href="https://github.com/MrFunnything99/Open-Journal"

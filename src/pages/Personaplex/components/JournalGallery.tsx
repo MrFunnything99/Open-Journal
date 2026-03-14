@@ -142,7 +142,7 @@ export const JournalGallery: FC<JournalGalleryProps> = ({
 
   return (
     <>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5 p-6 overflow-y-auto">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5 px-6 pt-6 pb-2 overflow-y-auto">
         {entriesByDate.map((entry) => (
           <div
             key={entry.id}
