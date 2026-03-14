@@ -55,7 +55,6 @@ import { MemoryEditor } from "./components/MemoryEditor";
 /** Default journaling assistant prompt (base; personalization is always \"high\" / memory-connected) */
 const DEFAULT_PERSONAPLEX_PROMPT = `You are an empathetic and insightful conversational journaling assistant. Your goal is to provide a supportive space for the user to reflect on their thoughts, experiences, and emotions. Read the user's entries and respond naturally. Ask open-ended questions to encourage further exploration, but always let the user guide the direction and depth of the conversation. Avoid being overly prescriptive, giving unsolicited advice, or summarizing their thoughts unnecessarily. Just be a curious, active listener. Always facilitate conversation that gets the user exploring their thoughts and emotions. Try to keep responses brief and concise when possible to conserve tokens.`;
 
-const INTRUSIVENESS_LEVELS = [0, 0.25, 0.5, 0.75, 1] as const;
 const INTRUSIVENESS_LABELS: Record<number, string> = {
   0: "Context building only; follow the user's lead; gather and reflect back; avoid probing or emotional questions.",
   0.25: "Mostly context building; ask sparingly and only to clarify or expand.",
@@ -85,7 +84,7 @@ const FALLBACK_VOICES: VoiceOption[] = [
 export const Personaplex = () => {
   // Personalization is always \"high\": the agent should actively connect past memories and journals to the current conversation when relevant.
   const personalization = 1;
-  const [intrusiveness, setIntrusiveness] = useState(0.5);
+  const intrusiveness = 0.5;
   const [sessionMode, setSessionMode] = useState<"journal" | "recommendations" | "extreme" | "therapy">("journal");
   const [voices, setVoices] = useState<VoiceOption[]>(FALLBACK_VOICES);
   const [selectedVoiceId, setSelectedVoiceId] = useState(DEFAULT_VOICE_ID);
@@ -982,44 +981,6 @@ export const Personaplex = () => {
                 </select>
               </div>
               <div className="mt-3 space-y-1.5">
-                <label htmlFor="personaplex-intrusiveness" className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
-                  Questioning style
-                </label>
-                <div className="hidden sm:block">
-                  <input
-                    id="personaplex-intrusiveness"
-                    type="range"
-                    min={0}
-                    max={INTRUSIVENESS_LEVELS.length - 1}
-                    step={1}
-                    value={Math.max(0, INTRUSIVENESS_LEVELS.findIndex((p) => p === intrusiveness))}
-                    onChange={(e) => setIntrusiveness(INTRUSIVENESS_LEVELS[Number(e.target.value)])}
-                    disabled={isConnected}
-                    className="w-full h-2 rounded-full bg-slate-600 accent-violet-500 disabled:opacity-60"
-                    aria-valuenow={Math.round(intrusiveness * 100)}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuetext={`${Math.round(intrusiveness * 100)}%`}
-                  />
-                </div>
-                <select
-                  aria-label="Questioning style"
-                  value={intrusiveness}
-                  onChange={(e) => setIntrusiveness(Number(e.target.value))}
-                  disabled={isConnected}
-                  className="sm:hidden w-full px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/50"
-                >
-                  {INTRUSIVENESS_LEVELS.map((p) => (
-                    <option key={p} value={p}>
-                      {Math.round(p * 100)}%
-                    </option>
-                  ))}
-                </select>
-                <p className="text-xs text-slate-500">
-                  {Math.round(intrusiveness * 100)}% — context building ↔ dynamic questions
-                </p>
-              </div>
-              <div className="mt-3 space-y-1.5">
                 <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
                   Live transcription
                 </label>
@@ -1048,19 +1009,6 @@ export const Personaplex = () => {
                         : "Only show what you said after you tap Done."}
                   </span>
                 </div>
-              </div>
-              <div className="mt-3 flex-1 min-h-0 flex flex-col">
-                <label htmlFor="personaplex-text-prompt" className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1.5">
-                  System Prompt
-                </label>
-                <textarea
-                  id="personaplex-text-prompt"
-                  value={textPrompt}
-                  readOnly
-                  rows={4}
-                  className="w-full min-w-0 px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm resize-none min-h-[72px] max-h-[120px] overflow-auto"
-                  aria-label="System prompt (updates with personalization and questioning style)"
-                />
               </div>
             </div>
 
@@ -1989,7 +1937,7 @@ export const Personaplex = () => {
         </p>
         <div className="pt-2 space-y-1">
           <p className="text-[10px] text-slate-600">
-            By John Stewart, Sherelle McDaniel, Aniyah Tucker, Dominique Sanchez, Andy Coto, Jackeline Garcia Ulloa
+            By John S., Sherelle M., Aniyah T., Dominique S., Andy C., Jackeline G.
           </p>
           <p className="text-[10px] text-slate-600 flex items-center justify-center gap-2 flex-wrap">
             <a

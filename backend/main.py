@@ -101,6 +101,7 @@ _cors_origins = [
     "http://localhost:5174",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
+    "https://open-journal-pearl.vercel.app",
     *_extra_origins,
 ]
 app.add_middleware(
@@ -669,7 +670,7 @@ async def infer_entry_date(req: InferEntryDateRequest):
         return InferEntryDateResponse(date=None)
     try:
         client = genai.Client(api_key=key)
-        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
+        model = os.getenv("GEMINI_INFER_ENTRY_DATE_MODEL", "gemini-3.1-flash-lite-preview")
         # Truncate very long text to avoid token limits
         text = (req.text or "")[:8000].strip()
         if not text:
