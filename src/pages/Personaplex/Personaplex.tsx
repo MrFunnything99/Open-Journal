@@ -50,7 +50,6 @@ import { Orb, OrbState } from "./components/Orb";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConnectButton } from "./components/ConnectButton";
 import { JournalGallery } from "./components/JournalGallery";
-import { MemoryEditor } from "./components/MemoryEditor";
 
 /** Default journaling assistant prompt (base; personalization is always \"high\" / memory-connected) */
 const DEFAULT_PERSONAPLEX_PROMPT = `You are an empathetic and insightful conversational journaling assistant. Your goal is to provide a supportive space for the user to reflect on their thoughts, experiences, and emotions. Read the user's entries and respond naturally. Ask open-ended questions to encourage further exploration, but always let the user guide the direction and depth of the conversation. Avoid being overly prescriptive, giving unsolicited advice, or summarizing their thoughts unnecessarily. Just be a curious, active listener. Always facilitate conversation that gets the user exploring their thoughts and emotions. Try to keep responses brief and concise when possible to conserve tokens.`;
@@ -111,7 +110,7 @@ export const Personaplex = () => {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
   const [interimTranscript, setInterimTranscript] = useState("");
-  const [view, setView] = useState<"session" | "history" | "memory" | "recommendations" | "calendar">("session");
+  const [view, setView] = useState<"session" | "history" | "recommendations" | "calendar">("session");
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [priorJournalText, setPriorJournalText] = useState("");
   const [isIngesting, setIsIngesting] = useState(false);
@@ -148,25 +147,6 @@ export const Personaplex = () => {
   const [calendarSelectedDate, setCalendarSelectedDate] = useState<string | null>(null);
   const [calendarDaySummary, setCalendarDaySummary] = useState<string | null>(null);
   const [calendarDaySummaryLoading, setCalendarDaySummaryLoading] = useState(false);
-  const [memoryFacts, setMemoryFacts] = useState<{ id: number; document: string; session_id?: string; timestamp?: string }[]>([]);
-  const [memorySummaries, setMemorySummaries] = useState<{ id: number; document: string; session_id?: string; timestamp?: string; metadata_json?: string | null }[]>([]);
-  const [memoryLoading, setMemoryLoading] = useState(false);
-  const fetchMemoryList = useCallback(() => {
-    setMemoryLoading(true);
-    Promise.all([
-      fetch(`${BACKEND_URL}/memory/facts`).then((r) => (r.ok ? r.json() : { facts: [] })),
-      fetch(`${BACKEND_URL}/memory/summaries`).then((r) => (r.ok ? r.json() : { summaries: [] })),
-    ])
-      .then(([factsRes, summariesRes]) => {
-        setMemoryFacts(Array.isArray(factsRes.facts) ? factsRes.facts : []);
-        setMemorySummaries(Array.isArray(summariesRes.summaries) ? summariesRes.summaries : []);
-      })
-      .catch(() => {
-        setMemoryFacts([]);
-        setMemorySummaries([]);
-      })
-      .finally(() => setMemoryLoading(false));
-  }, []);
   const fetchLibrary = useCallback((showCachedFirst = false): Promise<void> => {
     if (showCachedFirst) {
       try {
@@ -298,11 +278,10 @@ export const Personaplex = () => {
   }, []);
 
   useEffect(() => {
-    if (view === "memory") {
+    if (view === "history") {
       fetchMemoryStats();
-      fetchMemoryList();
     }
-  }, [view, fetchMemoryStats, fetchMemoryList]);
+  }, [view, fetchMemoryStats]);
 
   const fetchRecommendations = useCallback((showLoadingUnlessCached = false) => {
     try {
@@ -866,19 +845,6 @@ export const Personaplex = () => {
           </button>
           <button
             type="button"
-            onClick={() => setView("memory")}
-            className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
-              view === "memory" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
-            }`}
-            title="Brain (AI memory editor)"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 sm:h-5 sm:w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-            </svg>
-            <span className="hidden sm:inline">Brain</span>
-          </button>
-          <button
-            type="button"
             onClick={() => setView("recommendations")}
             className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
               view === "recommendations" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
@@ -1105,16 +1071,52 @@ export const Personaplex = () => {
 
         <div
           className={`flex-1 flex flex-col min-h-0 overflow-y-auto transition-opacity duration-300 ${
-            view === "history" || view === "memory" || view === "recommendations" || view === "calendar" ? "opacity-100" : "opacity-0 pointer-events-none absolute inset-0"
+            view === "history" || view === "recommendations" || view === "calendar" ? "opacity-100" : "opacity-0 pointer-events-none absolute inset-0"
           }`}
         >
           {view === "history" && (
             <>
               <div className="p-4 md:p-6 flex-shrink-0 space-y-4">
-                <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 max-w-2xl">
-                  <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
-                    Export & import
-                  </h3>
+                <div className="flex flex-wrap gap-4">
+                  <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex-1 min-w-[min(100%,280px)]">
+                    <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
+                      Memory stats
+                    </h3>
+                    {memoryStats !== null ? (
+                      <div className="space-y-1.5 text-sm text-slate-300 mb-2">
+                        <p>
+                          Facts: <span className="font-medium text-violet-300">{memoryStats.gist_facts_count}</span>
+                        </p>
+                        <p>
+                          Episodic summaries:{" "}
+                          <span className="font-medium text-violet-300">{memoryStats.episodic_log_count}</span>
+                        </p>
+                        <div className="flex flex-wrap gap-2 mt-2">
+                          <button
+                            type="button"
+                            onClick={fetchMemoryStats}
+                            className="px-3 py-1.5 rounded-lg bg-slate-700/50 text-slate-400 text-xs font-medium hover:bg-slate-600/50"
+                          >
+                            Refresh
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleWipeMemory}
+                            disabled={isWipingMemory}
+                            className="px-3 py-1.5 rounded-lg bg-red-900/40 text-red-300 text-xs font-medium hover:bg-red-800/50 disabled:opacity-50"
+                          >
+                            {isWipingMemory ? "Wiping…" : "Wipe memory"}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-500 mb-2">Load stats from backend.</p>
+                    )}
+                  </div>
+                  <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex-1 min-w-[min(100%,280px)]">
+                    <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
+                      Export & import
+                    </h3>
                   <p className="text-xs text-slate-500 mb-3">
                     Download all journal entries as one JSON file, or upload a previously exported file to restore them here.
                   </p>
@@ -1151,13 +1153,14 @@ export const Personaplex = () => {
                       {isImporting ? "Importing…" : "Import from file"}
                     </button>
                   </div>
+                  </div>
                 </div>
                 <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 max-w-2xl">
                   <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
                     Add prior journal to memory
                   </h3>
                   <p className="text-xs text-slate-500 mb-3">
-                    Paste journal text to ingest into memory. It will be summarized and stored so the AI can personalize at 100%. View stats on Memory.
+                    Paste journal text to ingest into memory. It will be summarized and stored so the AI can personalize. View stats below.
                   </p>
                   <textarea
                     value={priorJournalText}
@@ -1188,22 +1191,6 @@ export const Personaplex = () => {
                 />
               </div>
             </>
-          )}
-          {view === "memory" && (
-            <MemoryEditor
-              facts={memoryFacts}
-              summaries={memorySummaries}
-              stats={memoryStats}
-              loading={memoryLoading}
-              onRefresh={fetchMemoryList}
-              onRefreshStats={fetchMemoryStats}
-              onToast={(msg) => {
-                setToastMessage(msg);
-                setTimeout(() => setToastMessage(null), 2000);
-              }}
-              onWipeMemory={handleWipeMemory}
-              isWipingMemory={isWipingMemory}
-            />
           )}
           {view === "calendar" && (
             <div className="flex-1 flex flex-col min-h-0 p-4 md:p-6 overflow-hidden">
