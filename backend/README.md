@@ -28,6 +28,7 @@ Copy `.env.example` to `.env` in the project root and set:
 - `GEMINI_EMBEDDING_MODEL` – e.g. `gemini-embedding-2-preview` (optional)
 - `EMBEDDING_DIM` – vector size, default `768` (optional)
 - `LIGHTRAG_ENABLED` – set to `false` to disable LightRAG indexing (optional)
+- `VECTOR_DB_PATH` – full path to SQLite DB file (optional; for production so the vector DB persists)
 
 On macOS, the system Python SQLite may not support extensions; install `pysqlite3` so sqlite-vec works (`pip install pysqlite3`).
 
@@ -54,3 +55,29 @@ On macOS, the system Python SQLite may not support extensions; install `pysqlite
 | POST | `/end-session` | Trigger Librarian to extract & save to SQLite+sqlite-vec and LightRAG |
 | GET | `/lightrag-context?q=...` | Optional RAG context from LightRAG (hybrid/local/global) |
 | GET | `/health` | Health check |
+
+## Fly.io: persistent vector DB
+
+On Fly the app filesystem is **ephemeral**: the SQLite DB is lost on every deploy or machine restart, so memory stats stay at 0. To persist the vector DB:
+
+1. **Create a volume** (one-time, same region as your app, e.g. `iad`):
+
+   ```bash
+   fly volumes create data --size 1 --region iad
+   ```
+
+2. **Mount it** in `fly.toml`:
+
+   ```toml
+   [mounts]
+     source = "data"
+     destination = "/data"
+   ```
+
+3. **Point the app at it** with a secret:
+
+   ```bash
+   fly secrets set VECTOR_DB_PATH=/data/open_journal.db
+   ```
+
+4. **Redeploy** so the app uses the volume. The DB file will be created under `/data` and will persist across deploys.

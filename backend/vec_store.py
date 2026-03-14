@@ -28,7 +28,9 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Embedding dimension must match Gemini embedding model output (gemini-embedding-2* often returns 3072)
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "3072"))
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "open_journal.db"
+# Use VECTOR_DB_PATH in production (e.g. Fly volume) so data persists across deploys
+_default_db = Path(__file__).resolve().parent.parent / "data" / "open_journal.db"
+DB_PATH = Path(os.getenv("VECTOR_DB_PATH", str(_default_db))).resolve()
 
 _conn: sqlite3.Connection | None = None
 
