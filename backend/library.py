@@ -58,7 +58,7 @@ def _call_gemini(prompt: str) -> str:
     """
     try:
         client = _get_embeddings_client()
-        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash")
+        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
         result = client.models.generate_content(model=model, contents=prompt)
         text = getattr(result, "text", "") or ""
         return text.strip()

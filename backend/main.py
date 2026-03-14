@@ -669,7 +669,7 @@ async def infer_entry_date(req: InferEntryDateRequest):
         return InferEntryDateResponse(date=None)
     try:
         client = genai.Client(api_key=key)
-        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash")
+        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
         # Truncate very long text to avoid token limits
         text = (req.text or "")[:8000].strip()
         if not text:
