@@ -1077,6 +1077,29 @@ export const Personaplex = () => {
           {view === "history" && (
             <>
               <div className="p-4 md:p-6 flex-shrink-0 space-y-4">
+                <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 max-w-2xl">
+                  <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
+                    Add prior journal to memory
+                  </h3>
+                  <p className="text-xs text-slate-500 mb-3">
+                    Paste journal text to ingest into memory. It will be summarized and stored so the AI can personalize. View stats below.
+                  </p>
+                  <textarea
+                    value={priorJournalText}
+                    onChange={(e) => setPriorJournalText(e.target.value)}
+                    placeholder="Paste journal text here..."
+                    rows={4}
+                    className="w-full px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 resize-y mb-3"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleIngestPriorJournal}
+                    disabled={!priorJournalText.trim() || isIngesting}
+                    className="px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
+                  >
+                    {isIngesting ? "Adding… (may take a minute)" : "Add to memory"}
+                  </button>
+                </div>
                 <div className="flex flex-wrap gap-4">
                   <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 flex-1 min-w-[min(100%,280px)]">
                     <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
@@ -1117,66 +1140,43 @@ export const Personaplex = () => {
                     <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
                       Export & import
                     </h3>
-                  <p className="text-xs text-slate-500 mb-3">
-                    Download all journal entries as one JSON file, or upload a previously exported file to restore them here.
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={handleDownloadAllJournals}
-                      disabled={entries.length === 0}
-                      className="px-4 py-2 rounded-lg bg-slate-700/80 hover:bg-slate-600/80 disabled:opacity-50 disabled:cursor-not-allowed text-slate-200 text-sm font-medium transition-colors flex items-center gap-2"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                      </svg>
-                      Download all journals
-                    </button>
-                    <input
-                      ref={importFileInputRef}
-                      type="file"
-                      accept=".json,.txt,.md,.markdown,.journal,.log,application/json,text/plain"
-                      multiple
-                      onChange={handleImportFileChange}
-                      className="hidden"
-                      aria-label="Import journal(s) or export file"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => importFileInputRef.current?.click()}
-                      disabled={isImporting}
-                      className="px-4 py-2 rounded-lg bg-slate-700/80 hover:bg-slate-600/80 disabled:opacity-50 disabled:cursor-not-allowed text-slate-200 text-sm font-medium transition-colors flex items-center gap-2"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-                      </svg>
-                      {isImporting ? "Importing…" : "Import from file"}
-                    </button>
+                    <p className="text-xs text-slate-500 mb-3">
+                      Download all journal entries as one JSON file, or upload a previously exported file to restore them here.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={handleDownloadAllJournals}
+                        disabled={entries.length === 0}
+                        className="px-4 py-2 rounded-lg bg-slate-700/80 hover:bg-slate-600/80 disabled:opacity-50 disabled:cursor-not-allowed text-slate-200 text-sm font-medium transition-colors flex items-center gap-2"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                        Download all journals
+                      </button>
+                      <input
+                        ref={importFileInputRef}
+                        type="file"
+                        accept=".json,.txt,.md,.markdown,.journal,.log,application/json,text/plain"
+                        multiple
+                        onChange={handleImportFileChange}
+                        className="hidden"
+                        aria-label="Import journal(s) or export file"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => importFileInputRef.current?.click()}
+                        disabled={isImporting}
+                        className="px-4 py-2 rounded-lg bg-slate-700/80 hover:bg-slate-600/80 disabled:opacity-50 disabled:cursor-not-allowed text-slate-200 text-sm font-medium transition-colors flex items-center gap-2"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                        </svg>
+                        {isImporting ? "Importing…" : "Import from file"}
+                      </button>
+                    </div>
                   </div>
-                  </div>
-                </div>
-                <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 p-4 max-w-2xl">
-                  <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
-                    Add prior journal to memory
-                  </h3>
-                  <p className="text-xs text-slate-500 mb-3">
-                    Paste journal text to ingest into memory. It will be summarized and stored so the AI can personalize. View stats below.
-                  </p>
-                  <textarea
-                    value={priorJournalText}
-                    onChange={(e) => setPriorJournalText(e.target.value)}
-                    placeholder="Paste journal text here..."
-                    rows={4}
-                    className="w-full px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 resize-y mb-3"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleIngestPriorJournal}
-                    disabled={!priorJournalText.trim() || isIngesting}
-                    className="px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
-                  >
-                    {isIngesting ? "Adding… (may take a minute)" : "Add to memory"}
-                  </button>
                 </div>
               </div>
               <div className="flex-1 min-h-0">
