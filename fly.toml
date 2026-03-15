@@ -1,12 +1,16 @@
-# fly.toml app configuration file generated for backend-cold-meadow-9174 on 2026-03-13T13:24:10-04:00
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# Fly.io app: monolith (FastAPI + built React frontend).
+# Deploy from repo root:  cd /path/to/Open-Journal  &&  fly deploy
+# See https://fly.io/docs/reference/configuration/
 
-app = 'backend-cold-meadow-9174'
+app = "backend-cold-meadow-9174"
 primary_region = 'iad'
 
 [build]
+  dockerfile = "backend/Dockerfile"
+
+[env]
+  VECTOR_DB_PATH = "/data/open_journal.db"
+  ENVIRONMENT = "production"
 
 [mounts]
   source = "data"

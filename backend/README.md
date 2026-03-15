@@ -61,6 +61,15 @@ On macOS, the system Python SQLite may not support extensions; install `pysqlite
 
 ## Fly.io: persistent vector DB
 
+**Deploy from repo root** (not from `backend/`):
+
+```bash
+cd /path/to/Open-Journal
+fly deploy
+```
+
+The `fly.toml` is at the repo root; it builds the monolith (frontend + backend) via `backend/Dockerfile`.
+
 On Fly the app filesystem is **ephemeral**: the SQLite DB is lost on every deploy or machine restart, so memory stats stay at 0. To persist the vector DB:
 
 1. **Create a volume** (one-time, same region as your app, e.g. `iad`):

@@ -196,11 +196,12 @@ export const Personaplex = () => {
     const token = getStoredToken();
     if (token) {
       const payload = decodeJwtPayload(token);
-      if (payload?.sub != null) setAuthUser({ username: payload.username ?? "", user_id: payload.sub });
+      if (payload?.sub != null)
+        setAuthUser({ username: payload.email ?? payload.username ?? "", user_id: payload.sub });
     }
     authMe()
-      .then((u: { username: string; user_id: number } | null) => {
-        if (u) setAuthUser({ username: u.username, user_id: u.user_id });
+      .then((u: { username?: string; email?: string; user_id: number } | null) => {
+        if (u) setAuthUser({ username: u.email ?? u.username ?? "", user_id: u.user_id });
         else if (!getStoredToken()) setAuthUser(null);
       })
       .catch(() => {});

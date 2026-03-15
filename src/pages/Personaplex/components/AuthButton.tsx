@@ -1,12 +1,12 @@
 import { FC, useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  authLogin,
-  authRegister,
+  apiLogin,
+  apiLogout,
+  apiRegister,
+  backendFetch,
   getAnonymousInstanceId,
-  getBackendUrl,
-  setStoredToken,
-  type AuthResponse,
+  type ApiAuthResponse,
 } from "../../../backendApi";
 
 export type AuthUser = { username: string; user_id: number };
@@ -24,7 +24,7 @@ export const AuthButton: FC<AuthButtonProps> = ({
 }) => {
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<"login" | "register">("login");
-  const [username, setUsername] = useState("");
+  const [emailOrUsername, setEmailOrUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -35,8 +35,8 @@ export const AuthButton: FC<AuthButtonProps> = ({
     async (e: React.FormEvent) => {
       e.preventDefault();
       setError("");
-      if (!username.trim() || !password) {
-        setError("Username and password required.");
+      if (!emailOrUsername.trim() || !password) {
+        setError("Email or username and password required.");
         return;
       }
       if (password.length < 6) {
@@ -46,16 +46,17 @@ export const AuthButton: FC<AuthButtonProps> = ({
       const anonIdBefore = getAnonymousInstanceId();
       setLoading(true);
       try {
-        const res: AuthResponse =
+        const value = emailOrUsername.trim();
+        const res: ApiAuthResponse =
           mode === "login"
-            ? await authLogin(username.trim(), password)
-            : await authRegister(username.trim(), password);
-        setStoredToken(res.token);
-        onUserChange({ username: res.username, user_id: res.user_id });
-        setUsername("");
+            ? await apiLogin(value, password)
+            : await apiRegister(value, password);
+        onUserChange({ username: res.email, user_id: res.user_id });
+        setEmailOrUsername("");
         setPassword("");
         if (anonIdBefore) {
-          const countRes = await fetch(`${getBackendUrl()}/auth/anonymous-memory-count`, {
+          const countRes = await fetch("/api/auth/anonymous-memory-count", {
+            credentials: "include",
             headers: { "X-Instance-ID": anonIdBefore },
           });
           const countData = (await countRes.json().catch(() => ({}))) as { gist_count?: number; episodic_count?: number };
@@ -74,7 +75,7 @@ export const AuthButton: FC<AuthButtonProps> = ({
         setLoading(false);
       }
     },
-    [mode, username, password, onUserChange]
+    [mode, emailOrUsername, password, onUserChange]
   );
 
   const handleSyncConfirm = useCallback(
@@ -87,16 +88,11 @@ export const AuthButton: FC<AuthButtonProps> = ({
       if (doSync) {
         setSyncing(true);
         try {
-          const token = typeof localStorage !== "undefined" ? localStorage.getItem("open_journal_token") : null;
-          const r = await fetch(`${getBackendUrl()}/auth/merge-instance`, {
+          await backendFetch("/auth/merge-instance", {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(token ? { Authorization: `Bearer ${token}` } : {}),
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ from_instance_id: syncPrompt.anonId }),
           });
-          if (!r.ok) throw new Error("Sync failed");
         } catch {
           // non-blocking
         } finally {
@@ -109,8 +105,8 @@ export const AuthButton: FC<AuthButtonProps> = ({
     [syncPrompt]
   );
 
-  const handleLogout = useCallback(() => {
-    setStoredToken(null);
+  const handleLogout = useCallback(async () => {
+    await apiLogout();
     onUserChange(null);
     setOpen(false);
   }, [onUserChange]);
@@ -118,7 +114,7 @@ export const AuthButton: FC<AuthButtonProps> = ({
   if (user) {
     return (
       <div className={`flex items-center gap-2 ${className}`}>
-        <span className="text-sm text-slate-400 truncate max-w-[120px]" title={user.username}>
+        <span className="text-sm text-slate-400 truncate max-w-[140px]" title={user.username}>
           {user.username}
         </span>
         <button
@@ -185,48 +181,48 @@ export const AuthButton: FC<AuthButtonProps> = ({
               ) : (
                 <>
                   <p className="text-xs text-slate-500 mb-3">
-                    Log in to keep your data. No email. Without logging in, data is forgotten after 1 hour.
+                    Log in to keep your data. Without logging in, data is forgotten after 1 hour.
                   </p>
                   <form onSubmit={handleSubmit} className="space-y-3">
-                <input
-                  type="text"
-                  placeholder="Username"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  autoComplete="username"
-                  className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-600 text-slate-200 placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
-                />
-                <input
-                  type="password"
-                  placeholder="Password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  autoComplete={mode === "login" ? "current-password" : "new-password"}
-                  className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-600 text-slate-200 placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
-                />
-                {error && (
-                  <p className="text-xs text-red-400">{error}</p>
-                )}
-                <div className="flex gap-2">
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    className="flex-1 px-3 py-2 rounded-lg bg-violet-600 text-white text-sm font-medium hover:bg-violet-500 disabled:opacity-50"
-                  >
-                    {loading ? "..." : mode === "login" ? "Log in" : "Register"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMode((m) => (m === "login" ? "register" : "login"));
-                      setError("");
-                    }}
-                    className="px-3 py-2 rounded-lg text-slate-400 text-sm hover:text-slate-300"
-                  >
-                    {mode === "login" ? "Register" : "Log in"}
-                  </button>
-                </div>
-              </form>
+                    <input
+                      type="text"
+                      placeholder="Email or username"
+                      value={emailOrUsername}
+                      onChange={(e) => setEmailOrUsername(e.target.value)}
+                      autoComplete="username"
+                      className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-600 text-slate-200 placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
+                    />
+                    <input
+                      type="password"
+                      placeholder="Password"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      autoComplete={mode === "login" ? "current-password" : "new-password"}
+                      className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-600 text-slate-200 placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
+                    />
+                    {error && (
+                      <p className="text-xs text-red-400">{error}</p>
+                    )}
+                    <div className="flex gap-2">
+                      <button
+                        type="submit"
+                        disabled={loading}
+                        className="flex-1 px-3 py-2 rounded-lg bg-violet-600 text-white text-sm font-medium hover:bg-violet-500 disabled:opacity-50"
+                      >
+                        {loading ? "..." : mode === "login" ? "Log in" : "Register"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMode((m) => (m === "login" ? "register" : "login"));
+                          setError("");
+                        }}
+                        className="px-3 py-2 rounded-lg text-slate-400 text-sm hover:text-slate-300"
+                      >
+                        {mode === "login" ? "Register" : "Log in"}
+                      </button>
+                    </div>
+                  </form>
                 </>
               )}
             </div>

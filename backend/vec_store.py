@@ -181,13 +181,23 @@ def _init_db(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass  # column already exists
 
-    # Simple login (no email): username + password_hash for persistent data
+    # Simple login (no email): username + password_hash for persistent data (legacy)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS auth_users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # Two-token auth: email + passlib hashed password
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            hashed_password TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
     """)
@@ -300,6 +310,48 @@ def auth_user_get_by_username(username: str) -> dict | None:
     if not row:
         return None
     return {"id": row[0], "username": row[1], "password_hash": row[2], "salt": row[3]}
+
+
+def user_create(email: str, hashed_password: str) -> int | None:
+    """Create user (email + passlib hash). Return user id or None if email taken."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO users (email, hashed_password, created_at) VALUES (?, ?, ?)",
+            (email.strip().lower(), hashed_password, datetime.datetime.utcnow().isoformat() + "Z"),
+        )
+        conn.commit()
+        row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return row[0] if row else None
+    except sqlite3.IntegrityError:
+        return None
+
+
+def user_get_by_email(email: str) -> dict | None:
+    """Return {id, email, hashed_password} or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id, email, hashed_password FROM users WHERE email = ?",
+        (email.strip().lower(),),
+    ).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "email": row[1], "hashed_password": row[2]}
+
+
+# Username-only accounts stored as email = "username@anonymous.local"
+ANONYMOUS_EMAIL_SUFFIX = "@anonymous.local"
+
+
+def user_get_by_email_or_username(identifier: str) -> dict | None:
+    """Look up by email or by username (tries identifier then identifier@anonymous.local). Return {id, email, hashed_password} or None."""
+    ident = identifier.strip().lower()
+    user = user_get_by_email(ident)
+    if user:
+        return user
+    if "@" not in ident:
+        user = user_get_by_email(ident + ANONYMOUS_EMAIL_SUFFIX)
+    return user
 
 
 def _instance_where(instance_id: str, table: str = "memory_facts") -> tuple[str, list]:

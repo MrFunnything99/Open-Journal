@@ -3,7 +3,7 @@ import topLevelAwait from "vite-plugin-top-level-await";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd());
-  const apiTarget = env.VITE_API_URL || "http://localhost:3001";
+  const apiTarget = env.VITE_API_URL || "http://localhost:8000";
   return {
     server: {
       host: "0.0.0.0",

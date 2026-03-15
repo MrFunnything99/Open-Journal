@@ -1,1 +1,13 @@
-.cache
+# Reduce context size; backend is needed in stage 2
+.git
+.gitignore
+.env
+.env.*
+node_modules
+dist
+.venv
+__pycache__
+*.pyc
+.cursor
+.idea
+*.md
