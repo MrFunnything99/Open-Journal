@@ -1150,3 +1150,121 @@ def wipe_memory() -> None:
     conn.execute("DELETE FROM vec_episodic")
     conn.execute("UPDATE _vec_seq SET val = 0 WHERE name IN ('gist', 'episodic')")
     conn.commit()
+
+
+def wipe_memory_for_instance(instance_id: str) -> None:
+    """Clear gist and episodic for one instance only; leave vec tables in sync by deleting by doc_id."""
+    if not instance_id:
+        return
+    conn = _get_conn()
+    for doc_id, in conn.execute("SELECT id FROM memory_facts WHERE instance_id = ?", (instance_id,)).fetchall():
+        conn.execute("DELETE FROM vec_gist WHERE doc_id = ?", (doc_id,))
+    conn.execute("DELETE FROM memory_facts WHERE instance_id = ?", (instance_id,))
+    for doc_id, in conn.execute("SELECT id FROM memory_episodic WHERE instance_id = ?", (instance_id,)).fetchall():
+        conn.execute("DELETE FROM vec_episodic WHERE doc_id = ?", (doc_id,))
+    conn.execute("DELETE FROM memory_episodic WHERE instance_id = ?", (instance_id,))
+    conn.commit()
+
+
+def memory_count_for_instance(instance_id: str) -> tuple[int, int]:
+    """Return (gist_count, episodic_count) for the given instance_id. Used to ask anonymous user if they want to sync."""
+    if not instance_id or not instance_id.strip():
+        return (0, 0)
+    return (gist_count(instance_id), episodic_count(instance_id))
+
+
+def merge_instance_memory(from_instance_id: str, to_instance_id: str) -> None:
+    """Copy all memory (gist, episodic, consumed) from from_instance_id to to_instance_id. Used when anonymous user logs in and opts to sync."""
+    if not from_instance_id or not to_instance_id or from_instance_id == to_instance_id:
+        return
+    conn = _get_conn()
+    # Copy gist: memory_facts + vec_gist
+    try:
+        mrows = conn.execute(
+            "SELECT id, document, session_id, timestamp FROM memory_facts WHERE instance_id = ?",
+            (from_instance_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        mrows = []
+    for (doc_id, document, session_id, timestamp) in mrows:
+        row = conn.execute(
+            "SELECT embedding FROM vec_gist WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        if not row:
+            continue
+        new_id = _next_id(conn, "gist")
+        conn.execute(
+            "INSERT INTO vec_gist (doc_id, embedding, session_id, timestamp, document) VALUES (?, ?, ?, ?, ?)",
+            (new_id, row[0], session_id or "", timestamp or "", document or ""),
+        )
+        conn.execute(
+            "INSERT INTO memory_facts (id, document, session_id, timestamp, instance_id) VALUES (?, ?, ?, ?, ?)",
+            (new_id, document, session_id, timestamp, to_instance_id),
+        )
+    # Copy episodic: memory_episodic + vec_episodic
+    try:
+        erows = conn.execute(
+            "SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic WHERE instance_id = ?",
+            (from_instance_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        erows = []
+    for row in erows:
+        doc_id, document, session_id, timestamp, metadata_json = row[0], row[1], row[2], row[3], row[4] if len(row) > 4 else None
+        vrow = conn.execute(
+            "SELECT embedding FROM vec_episodic WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        if not vrow:
+            continue
+        new_id = _next_id(conn, "episodic")
+        conn.execute(
+            "INSERT INTO vec_episodic (doc_id, embedding, session_id, timestamp, document) VALUES (?, ?, ?, ?, ?)",
+            (new_id, vrow[0], session_id or "", timestamp or "", document or ""),
+        )
+        try:
+            conn.execute(
+                "INSERT INTO memory_episodic (id, document, session_id, timestamp, metadata_json, instance_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (new_id, document, session_id, timestamp, metadata_json, to_instance_id),
+            )
+        except sqlite3.OperationalError:
+            conn.execute(
+                "INSERT INTO memory_episodic (id, document, session_id, timestamp, instance_id) VALUES (?, ?, ?, ?, ?)",
+                (new_id, document, session_id, timestamp, to_instance_id),
+            )
+    # Copy consumed_meta + vec_consumed (by id_original from consumed_meta for from_id)
+    try:
+        crows = conn.execute(
+            """SELECT id_original, type, title, author, url, liked, timestamp, date_completed, note
+               FROM consumed_meta WHERE instance_id = ?""",
+            (from_instance_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        crows = []
+    for c in crows:
+        id_orig, type_, title, author, url, liked, ts, date_completed, note = c
+        vrow = conn.execute(
+            "SELECT embedding, document FROM vec_consumed WHERE id_original = ? LIMIT 1",
+            (id_orig,),
+        ).fetchone()
+        if not vrow:
+            continue
+        r = conn.execute("SELECT COALESCE(MAX(row_id), 0) + 1 FROM vec_consumed").fetchone()
+        new_row_id = r[0] if r else 1
+        conn.execute(
+            """INSERT INTO vec_consumed (row_id, id_original, embedding, type, title, author, url, liked, timestamp, note, date_completed, document)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (new_row_id, id_orig, vrow[0], type_ or "article", (title or "?")[:500], (author or "")[:300], (url or "")[:500], liked or 1, ts or "", (note or "")[:2000], (date_completed or "")[:50], vrow[1] or ""),
+        )
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO consumed_meta (id_original, type, title, author, url, liked, timestamp, date_completed, note, instance_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id_orig, type_, title, author, url, liked, ts, date_completed, note, to_instance_id),
+            )
+        except sqlite3.OperationalError:
+            conn.execute(
+                """INSERT OR REPLACE INTO consumed_meta (id_original, type, title, author, url, liked, timestamp, date_completed, note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id_orig, type_, title, author, url, liked, ts, date_completed, note),
+            )
+    conn.commit()

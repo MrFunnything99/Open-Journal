@@ -442,6 +442,50 @@ async def auth_me(request: Request):
         raise HTTPException(status_code=401, detail="Not logged in")
 
 
+class AnonymousMemoryCountResponse(BaseModel):
+    gist_count: int
+    episodic_count: int
+
+
+@app.get("/auth/anonymous-memory-count", response_model=AnonymousMemoryCountResponse)
+async def anonymous_memory_count(request: Request):
+    """Return memory counts for the current X-Instance-ID (no Bearer). Used when anonymous user is about to log in, to ask if they want to sync."""
+    instance_id = (request.headers.get("X-Instance-ID") or "").strip()
+    if not instance_id:
+        return AnonymousMemoryCountResponse(gist_count=0, episodic_count=0)
+    try:
+        g, e = await asyncio.to_thread(vec_store.memory_count_for_instance, instance_id)
+        return AnonymousMemoryCountResponse(gist_count=g, episodic_count=e)
+    except Exception:
+        return AnonymousMemoryCountResponse(gist_count=0, episodic_count=0)
+
+
+class MergeInstanceRequest(BaseModel):
+    from_instance_id: str
+
+
+@app.post("/auth/merge-instance")
+async def merge_instance(req: MergeInstanceRequest, request: Request):
+    """Copy memory from anonymous instance (from_instance_id) into the logged-in user's instance. Requires Bearer token."""
+    to_id = _instance_id(request)
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer ") or not to_id or not JWT_SECRET:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    try:
+        jwt.decode(auth[7:].strip(), JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    from_id = (req.from_instance_id or "").strip()
+    if not from_id or from_id == to_id:
+        return {"ok": True}
+    try:
+        await asyncio.to_thread(vec_store.merge_instance_memory, from_id, to_id)
+        return {"ok": True}
+    except Exception as e:
+        print("[backend] merge_instance error:", e)
+        raise HTTPException(status_code=500, detail="Merge failed")
+
+
 @app.get("/memory-diagram", response_model=MemoryDiagramResponse)
 async def memory_diagram(request: Request):
     """
@@ -837,16 +881,17 @@ async def infer_entry_date(req: InferEntryDateRequest):
 
 
 @app.get("/memory-stats", response_model=MemoryStats)
-async def memory_stats():
+async def memory_stats(request: Request):
     """
-    Lightweight stats endpoint to verify vector store is populated.
+    Lightweight stats endpoint; scoped to current user/instance when auth or X-Instance-ID present.
     """
     import vec_store
 
     vec_store.ensure_db()
+    instance_id = _instance_id(request)
     return MemoryStats(
-        gist_facts_count=vec_store.gist_count(),
-        episodic_log_count=vec_store.episodic_count(),
+        gist_facts_count=vec_store.gist_count(instance_id),
+        episodic_log_count=vec_store.episodic_count(instance_id),
         episodic_metadata_count=vec_store.episodic_metadata_count(),
     )
 
@@ -1336,11 +1381,15 @@ async def lightrag_context(q: str = "", mode: str = "hybrid"):
 
 
 @app.post("/memory-wipe")
-async def memory_wipe():
+async def memory_wipe(request: Request):
     """
-    Wipe gist and episodic memory (SQLite+sqlite-vec). Consumed library is kept.
+    Wipe gist and episodic memory for the current user/instance. Consumed library is kept.
     """
-    wipe_memory()
+    instance_id = _instance_id(request)
+    if instance_id:
+        vec_store.wipe_memory_for_instance(instance_id)
+    else:
+        wipe_memory()
     return {"ok": True, "message": "Memory wiped."}
 
 

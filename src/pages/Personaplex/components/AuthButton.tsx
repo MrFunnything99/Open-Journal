@@ -3,6 +3,8 @@ import { createPortal } from "react-dom";
 import {
   authLogin,
   authRegister,
+  getAnonymousInstanceId,
+  getBackendUrl,
   setStoredToken,
   type AuthResponse,
 } from "../../../backendApi";
@@ -26,6 +28,8 @@ export const AuthButton: FC<AuthButtonProps> = ({
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [syncPrompt, setSyncPrompt] = useState<{ anonId: string; total: number } | null>(null);
+  const [syncing, setSyncing] = useState(false);
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -39,6 +43,7 @@ export const AuthButton: FC<AuthButtonProps> = ({
         setError("Password must be at least 6 characters.");
         return;
       }
+      const anonIdBefore = getAnonymousInstanceId();
       setLoading(true);
       try {
         const res: AuthResponse =
@@ -47,9 +52,22 @@ export const AuthButton: FC<AuthButtonProps> = ({
             : await authRegister(username.trim(), password);
         setStoredToken(res.token);
         onUserChange({ username: res.username, user_id: res.user_id });
-        setOpen(false);
         setUsername("");
         setPassword("");
+        if (anonIdBefore) {
+          const countRes = await fetch(`${getBackendUrl()}/auth/anonymous-memory-count`, {
+            headers: { "X-Instance-ID": anonIdBefore },
+          });
+          const countData = (await countRes.json().catch(() => ({}))) as { gist_count?: number; episodic_count?: number };
+          const total = (countData.gist_count ?? 0) + (countData.episodic_count ?? 0);
+          if (total > 0) {
+            setLoading(false);
+            setSyncPrompt({ anonId: anonIdBefore, total });
+            setOpen(true);
+            return;
+          }
+        }
+        setOpen(false);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Something went wrong.");
       } finally {
@@ -57,6 +75,38 @@ export const AuthButton: FC<AuthButtonProps> = ({
       }
     },
     [mode, username, password, onUserChange]
+  );
+
+  const handleSyncConfirm = useCallback(
+    async (doSync: boolean) => {
+      if (!syncPrompt) {
+        setSyncPrompt(null);
+        setOpen(false);
+        return;
+      }
+      if (doSync) {
+        setSyncing(true);
+        try {
+          const token = typeof localStorage !== "undefined" ? localStorage.getItem("open_journal_token") : null;
+          const r = await fetch(`${getBackendUrl()}/auth/merge-instance`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({ from_instance_id: syncPrompt.anonId }),
+          });
+          if (!r.ok) throw new Error("Sync failed");
+        } catch {
+          // non-blocking
+        } finally {
+          setSyncing(false);
+        }
+      }
+      setSyncPrompt(null);
+      setOpen(false);
+    },
+    [syncPrompt]
   );
 
   const handleLogout = useCallback(() => {
@@ -101,17 +151,43 @@ export const AuthButton: FC<AuthButtonProps> = ({
             <div
               className="fixed inset-0 z-[100]"
               aria-hidden
-              onClick={() => setOpen(false)}
+              onClick={() => !syncPrompt && setOpen(false)}
             />
             <div
               className="fixed left-1/2 top-24 z-[101] w-72 -translate-x-1/2 rounded-xl bg-slate-800 border border-slate-600 shadow-xl p-4"
               role="dialog"
-              aria-label="Log in or register"
+              aria-label={syncPrompt ? "Sync memories?" : "Log in or register"}
             >
-              <p className="text-xs text-slate-500 mb-3">
-                Log in to keep your data. No email. Without logging in, data is forgotten after 1 hour.
-              </p>
-              <form onSubmit={handleSubmit} className="space-y-3">
+              {syncPrompt ? (
+                <div className="space-y-3">
+                  <p className="text-sm text-slate-200">
+                    Do you want to sync current memories? ({syncPrompt.total} journal entr{syncPrompt.total === 1 ? "y" : "ies"} will be merged into your account.)
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSyncConfirm(true)}
+                      disabled={syncing}
+                      className="flex-1 px-3 py-2 rounded-lg bg-violet-600 text-white text-sm font-medium hover:bg-violet-500 disabled:opacity-50"
+                    >
+                      {syncing ? "Syncing…" : "Yes, sync"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleSyncConfirm(false)}
+                      disabled={syncing}
+                      className="flex-1 px-3 py-2 rounded-lg bg-slate-600 text-slate-200 text-sm font-medium hover:bg-slate-500 disabled:opacity-50"
+                    >
+                      No
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <p className="text-xs text-slate-500 mb-3">
+                    Log in to keep your data. No email. Without logging in, data is forgotten after 1 hour.
+                  </p>
+                  <form onSubmit={handleSubmit} className="space-y-3">
                 <input
                   type="text"
                   placeholder="Username"
@@ -151,6 +227,8 @@ export const AuthButton: FC<AuthButtonProps> = ({
                   </button>
                 </div>
               </form>
+                </>
+              )}
             </div>
           </>,
           document.body

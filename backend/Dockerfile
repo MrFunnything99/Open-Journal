@@ -10,8 +10,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Install Python dependencies (prefer binaries, avoid resolver hang on networkx)
 COPY requirements.txt .
+ENV PIP_PREFER_BINARY=1 PIP_DEFAULT_TIMEOUT=120
 RUN pip install -r requirements.txt
 
 # Copy backend source

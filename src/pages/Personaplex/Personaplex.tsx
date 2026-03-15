@@ -51,7 +51,7 @@ import { Orb, OrbState } from "./components/Orb";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConnectButton } from "./components/ConnectButton";
 import { AuthButton, type AuthUser } from "./components/AuthButton";
-import { authMe } from "../../backendApi";
+import { authMe, decodeJwtPayload, getStoredToken } from "../../backendApi";
 import { JournalGallery } from "./components/JournalGallery";
 
 /** Default journaling assistant prompt (base; personalization is always \"high\" / memory-connected) */
@@ -193,8 +193,16 @@ export const Personaplex = () => {
       });
   }, []);
   useEffect(() => {
+    const token = getStoredToken();
+    if (token) {
+      const payload = decodeJwtPayload(token);
+      if (payload?.sub != null) setAuthUser({ username: payload.username ?? "", user_id: payload.sub });
+    }
     authMe()
-      .then((u: { username: string; user_id: number } | null) => u && setAuthUser({ username: u.username, user_id: u.user_id }))
+      .then((u: { username: string; user_id: number } | null) => {
+        if (u) setAuthUser({ username: u.username, user_id: u.user_id });
+        else if (!getStoredToken()) setAuthUser(null);
+      })
       .catch(() => {});
   }, []);
 

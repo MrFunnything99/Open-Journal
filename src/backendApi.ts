@@ -24,6 +24,19 @@ export function getStoredToken(): string | null {
   }
 }
 
+/** Decode JWT payload without verification (for optimistic display only). Returns sub + username if present. */
+export function decodeJwtPayload(token: string): { sub?: number; username?: string } | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const raw = atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"));
+    const payload = JSON.parse(raw) as { sub?: number; username?: string };
+    return payload?.sub != null ? { sub: payload.sub, username: payload.username ?? "" } : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Store token after login/register; clear on logout. */
 export function setStoredToken(token: string | null): void {
   try {
@@ -33,7 +46,7 @@ export function setStoredToken(token: string | null): void {
 }
 
 /** Ephemeral instance ID for anonymous users: same for 1 hour, then new (data effectively forgotten). */
-function getAnonymousInstanceId(): string {
+export function getAnonymousInstanceId(): string {
   try {
     const id = sessionStorage.getItem(ANON_ID_KEY);
     const ts = sessionStorage.getItem(ANON_TS_KEY);
