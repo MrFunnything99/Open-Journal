@@ -162,6 +162,7 @@ def add_consumed(
     liked: bool = True,
     note: str | None = None,
     date_completed: str | None = None,
+    instance_id: str = "",
 ) -> None:
     """
     Record that the user has read/listened to a recommendation (book, podcast, article, research).
@@ -194,10 +195,11 @@ def add_consumed(
         timestamp=ts,
         note=(note or "")[:2000],
         date_completed=(date_completed or "")[:50],
+        instance_id=instance_id or "",
     )
 
 
-def process_library_note(text: str, type_filter: str | None = None) -> int:
+def process_library_note(text: str, type_filter: str | None = None, instance_id: str = "") -> int:
     """
     Agent that organizes freeform 'library' notes into structured consumed items.
     If type_filter is set ("book" | "podcast" | "article" | "research"), only that type is extracted.
@@ -263,7 +265,7 @@ Rules:
         liked = bool(item.get("liked", True))
         note = (item.get("note") or "").strip() or None
         try:
-            add_consumed(ctype, title, author=author, url=url, liked=liked, note=note)
+            add_consumed(ctype, title, author=author, url=url, liked=liked, note=note, instance_id=instance_id)
             added += 1
         except Exception as e:
             print("[backend] process_library_note add_consumed error:", e)
@@ -271,7 +273,7 @@ Rules:
     return added
 
 
-def get_consumed_context(max_items: int = 80) -> str:
+def get_consumed_context(max_items: int = 80, instance_id: str = "") -> str:
     """
     Return a single string describing what the user has consumed and liked,
     for injection into the recommendation agent prompt.
@@ -280,7 +282,7 @@ def get_consumed_context(max_items: int = 80) -> str:
 
     _ensure_storage()
     try:
-        rows = vec_store.get_consumed_context_rows(max_items=max_items)
+        rows = vec_store.get_consumed_context_rows(max_items=max_items, instance_id=instance_id)
         if not rows:
             return "The user has not marked any books, podcasts, or articles as read/listened yet."
         lines = []
@@ -322,7 +324,7 @@ def _parse_date_completed(s: str) -> tuple[int, int, int]:
     return (y, m, d)
 
 
-def list_consumed(max_items: int = 200) -> dict[str, list[dict]]:
+def list_consumed(max_items: int = 200, instance_id: str = "") -> dict[str, list[dict]]:
     """
     Return consumed items grouped by type for the Library UI, sorted by date_completed (newest first).
     Each item: { "id", "title", "author", "date_completed", "note" }.
@@ -332,7 +334,7 @@ def list_consumed(max_items: int = 200) -> dict[str, list[dict]]:
     _ensure_storage()
     out: dict[str, list[dict]] = {"books": [], "podcasts": [], "articles": [], "research": []}
     try:
-        rows = vec_store.list_consumed_rows(max_items=max_items)
+        rows = vec_store.list_consumed_rows(max_items=max_items, instance_id=instance_id)
         type_to_key = {"book": "books", "podcast": "podcasts", "article": "articles", "research": "research"}
         for r in rows:
             key = type_to_key.get(r["type"])
@@ -355,25 +357,25 @@ def list_consumed(max_items: int = 200) -> dict[str, list[dict]]:
         return out
 
 
-def update_consumed(item_id: str, *, date_completed: str | None = None, note: str | None = None) -> bool:
+def update_consumed(item_id: str, *, date_completed: str | None = None, note: str | None = None, instance_id: str = "") -> bool:
     """Update date_completed and/or note for a consumed item. Returns True if updated."""
     import vec_store
 
     _ensure_storage()
     try:
-        return vec_store.update_consumed(item_id, date_completed=date_completed, note=note)
+        return vec_store.update_consumed(item_id, date_completed=date_completed, note=note, instance_id=instance_id)
     except Exception as e:
         print("[backend] update_consumed error:", e)
         return False
 
 
-def delete_consumed(item_id: str) -> bool:
+def delete_consumed(item_id: str, instance_id: str = "") -> bool:
     """Remove a consumed item by id. Returns True if deleted."""
     import vec_store
 
     _ensure_storage()
     try:
-        return vec_store.delete_consumed(item_id)
+        return vec_store.delete_consumed(item_id, instance_id=instance_id)
     except Exception as e:
         print("[backend] delete_consumed error:", e)
         return False
@@ -817,7 +819,7 @@ People:
             print("[backend] run_people_grouping_agent set_person_groups error:", e)
 
 
-def save_session_data(session_id: str, transcript: str, entry_date: str | None = None) -> dict:
+def save_session_data(session_id: str, transcript: str, entry_date: str | None = None, instance_id: str = "") -> dict:
     """
     Extract summary + facts + metadata from transcript via Gemini, embed via Gemini, save to SQLite+sqlite-vec.
     Returns {"summary": str, "facts": list[str]} for callers (e.g. LightRAG feed).
@@ -846,13 +848,13 @@ def save_session_data(session_id: str, transcript: str, entry_date: str | None =
     if summary:
         summary_emb = _embed_texts([summary])[0]
         metadata_json = json.dumps(metadata) if metadata else None
-        vec_store.add_episodic(session_id, ts, summary, summary_emb, metadata_json=metadata_json)
+        vec_store.add_episodic(session_id, ts, summary, summary_emb, metadata_json=metadata_json, instance_id=instance_id or "")
 
     # Deduplicate facts: if a new fact is very similar to an existing one, update it instead of inserting
     GIST_SIMILARITY_THRESHOLD = 0.85  # cosine similarity above this => update existing fact
     if facts:
         fact_embs = _embed_texts(facts)
-        n_existing = vec_store.gist_count()
+        n_existing = vec_store.gist_count(instance_id=instance_id or "")
         for fact in facts:
             emb = fact_embs[facts.index(fact)]
             if n_existing > 0:
@@ -865,7 +867,7 @@ def save_session_data(session_id: str, transcript: str, entry_date: str | None =
                         if len(fact) > len(existing_doc):
                             vec_store.update_gist(_doc_id, fact, emb)
                         continue
-            vec_store.add_gist(session_id, ts, fact, emb)
+            vec_store.add_gist(session_id, ts, fact, emb, instance_id=instance_id or "")
             n_existing += 1
 
     return {"summary": summary, "facts": facts}
@@ -891,7 +893,7 @@ def _recency_boost(days_ago: float) -> float:
     return 0.0
 
 
-def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 5) -> str:
+def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 5, instance_id: str = "") -> str:
     """
     Embed the query, retrieve relevant gist facts and episodic summaries from SQLite+sqlite-vec,
     with ~40% more weight on recent journals. Return a single string for the interviewer's context.
@@ -928,10 +930,10 @@ def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 
 
     parts = []
     try:
-        if vec_store.gist_count() > 0:
-            count = vec_store.gist_count()
+        if vec_store.gist_count(instance_id=instance_id) > 0:
+            count = vec_store.gist_count(instance_id=instance_id)
             fetch_k = min(max(top_k_gist * 2, 10), count)
-            raw = vec_store.query_gist_with_timestamp(query_emb, fetch_k)
+            raw = vec_store.query_gist_with_timestamp(query_emb, fetch_k, instance_id=instance_id)
             items = rerank_with_recency(raw, top_k_gist)
             if items:
                 lines = []
@@ -944,17 +946,17 @@ def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 
                 parts.append("Facts and details from the user's life and journals:\n" + "\n".join(lines))
     except Exception:
         try:
-            docs = vec_store.query_gist(query_emb, min(top_k_gist, vec_store.gist_count()))
+            docs = vec_store.query_gist(query_emb, min(top_k_gist, vec_store.gist_count(instance_id=instance_id)), instance_id=instance_id)
             if docs:
                 parts.append("Facts and details from the user's life and journals:\n" + "\n".join(f"- {d}" for d in docs))
         except Exception:
             pass
 
     try:
-        if vec_store.episodic_count() > 0:
-            count = vec_store.episodic_count()
+        if vec_store.episodic_count(instance_id=instance_id) > 0:
+            count = vec_store.episodic_count(instance_id=instance_id)
             fetch_k = min(max(top_k_episodic * 2, 8), count)
-            raw = vec_store.query_episodic_with_timestamp(query_emb, fetch_k)
+            raw = vec_store.query_episodic_with_timestamp(query_emb, fetch_k, instance_id=instance_id)
             items = rerank_with_recency(raw, top_k_episodic)
             if items:
                 lines = []
@@ -965,13 +967,13 @@ def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 
                     else:
                         lines.append(f"- {doc}")
                 parts.append("Relevant journal summaries (more recent entries favored):\n" + "\n".join(lines))
-            elif not items and vec_store.episodic_count() > 0:
-                docs = vec_store.query_episodic(query_emb, min(top_k_episodic, vec_store.episodic_count()))
+            elif not items and vec_store.episodic_count(instance_id=instance_id) > 0:
+                docs = vec_store.query_episodic(query_emb, min(top_k_episodic, vec_store.episodic_count(instance_id=instance_id)), instance_id=instance_id)
                 if docs:
                     parts.append("Relevant journal summaries:\n" + "\n".join(f"- {d}" for d in docs))
     except Exception:
         try:
-            docs = vec_store.query_episodic(query_emb, min(top_k_episodic, vec_store.episodic_count()))
+            docs = vec_store.query_episodic(query_emb, min(top_k_episodic, vec_store.episodic_count(instance_id=instance_id)), instance_id=instance_id)
             if docs:
                 parts.append("Relevant journal summaries:\n" + "\n".join(f"- {d}" for d in docs))
         except Exception:
@@ -982,7 +984,7 @@ def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 
     return "\n\n".join(parts)
 
 
-def get_memory_for_visualization() -> tuple[list[str], list[str]]:
+def get_memory_for_visualization(instance_id: str = "") -> tuple[list[str], list[str]]:
     """
     Return (gist_facts, episodic_summaries) as lists of document strings for diagram generation.
     """
@@ -993,19 +995,19 @@ def get_memory_for_visualization() -> tuple[list[str], list[str]]:
     episodic_docs: list[str] = []
 
     try:
-        gist_docs = vec_store.get_all_gist()
+        gist_docs = vec_store.get_all_gist(instance_id=instance_id)
     except Exception:
         pass
 
     try:
-        episodic_docs = vec_store.get_all_episodic()
+        episodic_docs = vec_store.get_all_episodic(instance_id=instance_id)
     except Exception:
         pass
 
     return (gist_docs, episodic_docs)
 
 
-def get_memory_for_date(date_iso: str) -> tuple[list[dict], list[dict]]:
+def get_memory_for_date(date_iso: str, instance_id: str = "") -> tuple[list[dict], list[dict]]:
     """Return (episodic_summaries, gist_facts) for the given date (YYYY-MM-DD)."""
     import vec_store
 
@@ -1013,11 +1015,11 @@ def get_memory_for_date(date_iso: str) -> tuple[list[dict], list[dict]]:
     episodic: list[dict] = []
     gist: list[dict] = []
     try:
-        episodic = vec_store.get_episodic_for_date(date_iso)
+        episodic = vec_store.get_episodic_for_date(date_iso, instance_id=instance_id)
     except Exception as e:
         print("[backend] get_episodic_for_date error:", e)
     try:
-        gist = vec_store.get_gist_for_date(date_iso)
+        gist = vec_store.get_gist_for_date(date_iso, instance_id=instance_id)
     except Exception as e:
         print("[backend] get_gist_for_date error:", e)
     return (episodic, gist)
@@ -1066,25 +1068,25 @@ If there is no journal and no DB content for this day, say so briefly under Obje
     return (out or "No summary generated.").strip()
 
 
-def list_memory_facts() -> list[dict]:
+def list_memory_facts(instance_id: str = "") -> list[dict]:
     """Return all gist facts with id, document, session_id, timestamp for Memory UI."""
     import vec_store
 
     _ensure_storage()
     try:
-        return vec_store.list_gist_with_ids()
+        return vec_store.list_gist_with_ids(instance_id=instance_id)
     except Exception as e:
         print("[backend] list_memory_facts error:", e)
         return []
 
 
-def list_memory_summaries() -> list[dict]:
+def list_memory_summaries(instance_id: str = "") -> list[dict]:
     """Return all episodic summaries with id, document, session_id, timestamp for Memory UI."""
     import vec_store
 
     _ensure_storage()
     try:
-        return vec_store.list_episodic_with_ids()
+        return vec_store.list_episodic_with_ids(instance_id=instance_id)
     except Exception as e:
         print("[backend] list_memory_summaries error:", e)
         return []
@@ -1182,7 +1184,7 @@ def delete_memory_summary(summary_id: int) -> bool:
     return vec_store.delete_episodic(summary_id)
 
 
-def add_memory_fact(document: str, session_id: str | None = None) -> int | None:
+def add_memory_fact(document: str, session_id: str | None = None, instance_id: str = "") -> int | None:
     """Add a single user-created fact; returns new id or None on failure."""
     import vec_store
 
@@ -1193,10 +1195,10 @@ def add_memory_fact(document: str, session_id: str | None = None) -> int | None:
     sid = session_id or "user"
     ts = datetime.utcnow().isoformat() + "Z"
     emb = _embed_texts([doc])[0]
-    return vec_store.add_gist(sid, ts, doc, emb)
+    return vec_store.add_gist(sid, ts, doc, emb, instance_id=instance_id or "")
 
 
-def add_memory_summary(document: str, session_id: str | None = None) -> int | None:
+def add_memory_summary(document: str, session_id: str | None = None, instance_id: str = "") -> int | None:
     """Add a single user-created summary; returns new id or None on failure."""
     import vec_store
 
@@ -1207,7 +1209,7 @@ def add_memory_summary(document: str, session_id: str | None = None) -> int | No
     sid = session_id or "user"
     ts = datetime.utcnow().isoformat() + "Z"
     emb = _embed_texts([doc])[0]
-    return vec_store.add_episodic(sid, ts, doc, emb)
+    return vec_store.add_episodic(sid, ts, doc, emb, instance_id=instance_id or "")
 
 
 def generate_memory_mermaid(gist_facts: list[str], episodic_summaries: list[str]) -> str:
@@ -1484,8 +1486,173 @@ Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reas
     return _parse_recommendation_json(text, [])
 
 
+def _generate_article_reasons(
+    articles: list[dict],
+    facts_blob: str,
+    summaries_blob: str,
+    consumed: str,
+) -> list[str]:
+    """Generate one-sentence reasons for each article using LLM."""
+    list_text = "\n".join(
+        f"{i + 1}. {e.get('title', '')} | {e.get('url', '')}"
+        for i, e in enumerate(articles)
+    )
+    prompt = f"""Given these articles, write one short sentence per article saying why it might interest the user. Base the reason on what the article is actually about; be concrete and literal. Only mention journal themes if there's a direct, obvious fit—do not stretch (e.g. don't link a sports replay to "Steinbeck" or "roommates"). Same order as the list.
+
+USER CONTEXT (facts and journal themes):
+{facts_blob or "(none)"}
+
+CONSUMED (what they've read and their reflections):
+{consumed[:1500]}
+
+ARTICLES (title | url):
+{list_text}
+
+Return ONLY a JSON array of {len(articles)} strings, one reason per article, in the same order. No markdown. Example: ["Reason for article 1.", "Reason for article 2."]"""
+    try:
+        text = _call_gemini(prompt)
+        text = str(text).strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        reasons = json.loads(text)
+        if isinstance(reasons, list) and len(reasons) >= len(articles):
+            return [str(r).strip() or "Matches your interests." for r in reasons[: len(articles)]]
+    except Exception as e:
+        print("[backend] _generate_article_reasons error:", e)
+    return [a.get("reason", "Matches your interests.") for a in articles]
+
+
+# Domains we exclude from article recommendations to avoid paywalled content (Tavily + post-filter).
+PAYWALLED_ARTICLE_DOMAINS = [
+    "nytimes.com",
+    "wsj.com",
+    "washingtontimes.com",
+    "washingtonpost.com",
+    "theatlantic.com",
+    "newyorker.com",
+    "economist.com",
+    "ft.com",
+    "bloomberg.com",
+    "barrons.com",
+    "latimes.com",
+    "bostonglobe.com",
+    "chicagotribune.com",
+    "harpers.org",
+    "medium.com",
+    "substack.com",  # many paywalled
+]
+
+
+def _is_video_or_replay_result(title: str, url: str) -> bool:
+    """Skip sports replays, full-length videos, and live streams—we want articles and long-reads only."""
+    t = (title or "").lower()
+    if "full-length replay" in t or "full replay" in t or "game replay" in t:
+        return True
+    if " vs. " in t and ("tournament" in t or "game #" in t or "watch" in t):
+        return True
+    if "watch " in t and ("live" in t or "stream" in t or "replay" in t):
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).netloc or "").lower()
+        if any(x in host for x in ("foxsports.com", "espn.com", "cbssports.com", "nbcsports.com", "bleacherreport.com")):
+            if "replay" in t or "watch" in t or " vs " in t:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_paywalled_domain(url: str) -> bool:
+    """True if the URL's host is in our paywalled-domain list (or a subdomain of one)."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        if not host:
+            return False
+        for domain in PAYWALLED_ARTICLE_DOMAINS:
+            if host == domain or host.endswith("." + domain):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _tavily_search_articles(
+    queries: list[str],
+    api_key: str,
+    max_per_query: int = 4,
+    topic: str = "news",
+) -> list[dict]:
+    """Call Tavily Search API and return list of {title, author, reason, url}. Uses topic=news for real articles. Excludes paywalled domains."""
+    from urllib.parse import urlparse
+
+    import sys
+    print(f"[backend] Tavily Search API: entered with {len(queries)} queries", flush=True)
+    try:
+        from tavily import TavilyClient
+    except ImportError as e:
+        print("[backend] Tavily Search API: import failed (install with: pip install tavily-python):", e, flush=True)
+        return []
+    try:
+        client = TavilyClient(api_key=api_key)
+    except Exception as e:
+        print("[backend] Tavily Search API: client init failed:", e, flush=True)
+        return []
+    seen_urls: set[str] = set()
+    out: list[dict] = []
+    for q in queries:
+        if not isinstance(q, str) or not q.strip():
+            continue
+        query_str = q.strip()
+        try:
+            print(f"[backend] Tavily Search API: query={query_str!r} topic={topic} max_results={max_per_query}", flush=True)
+            response = client.search(
+                query=query_str,
+                topic=topic,
+                max_results=max_per_query,
+                search_depth="basic",
+                exclude_domains=PAYWALLED_ARTICLE_DOMAINS,
+            )
+        except Exception as e:
+            print("[backend] Tavily search error:", e)
+            continue
+        results = response.get("results", []) if isinstance(response, dict) else getattr(response, "results", []) or []
+        print(f"[backend] Tavily Search API: got {len(results)} results for {query_str!r}", flush=True)
+        for r in results:
+            url = (r.get("url", "") if isinstance(r, dict) else getattr(r, "url", None)) or ""
+            if not url or url in seen_urls or _is_paywalled_domain(url):
+                continue
+            title = (r.get("title", "") if isinstance(r, dict) else getattr(r, "title", None)) or ""
+            if _is_video_or_replay_result(title, url):
+                continue
+            seen_urls.add(url)
+            content = (r.get("content", "") if isinstance(r, dict) else getattr(r, "content", None)) or ""
+            try:
+                parsed = urlparse(url)
+                author = parsed.netloc or ""
+                if author.startswith("www."):
+                    author = author[4:]
+            except Exception:
+                author = ""
+            out.append({
+                "title": title or "Article",
+                "author": author,
+                "reason": (content[:120] + "…") if content else "Matches your interests.",
+                "url": url,
+            })
+    if out:
+        print(f"[backend] Tavily Search API: returning {len(out)} articles (after dedupe and paywall filter)")
+    return out
+
+
 def _articles_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
-    """Dedicated agent for article recommendations only. Article URLs must work (non-negotiable)."""
+    """Dedicated agent for article recommendations. Uses Tavily Search (topic=news) when TAVILY_API_KEY is set for real URLs."""
     recent_section = ""
     if recent_summaries_blob:
         recent_section = f"""
@@ -1493,6 +1660,63 @@ MOST RECENT JOURNAL ENTRIES (weight these ~20% more when matching interests):
 {recent_summaries_blob}
 
 """
+    api_key = (os.getenv("TAVILY_API_KEY") or "").strip()
+    if api_key:
+        print("[backend] Articles: using Tavily Search (topic=news) for real article URLs.")
+        prompt = f"""Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 2–3 short search queries to find relevant news articles or long-reads. Use tastes from books, podcasts, and research too. We will search the web for real articles, so prefer clear topic queries. Examples: "mindfulness and sleep research", "anxiety therapy evidence", "work-life balance psychology".
+
+FACTS AND THEMES FROM THEIR JOURNALS:
+{facts_blob or "(none yet)"}
+
+JOURNAL SESSION SUMMARIES (all themes):
+{summaries_blob or "(none yet)"}
+{recent_section}{consumed}
+
+Return ONLY a JSON array of 2–3 short search query strings, no markdown. Example: ["mindfulness sleep research", "therapy for anxiety"]"""
+        try:
+            text = _call_gemini(prompt)
+            if not isinstance(text, str):
+                text = str(text or "")
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            text = text.strip()
+            # Extract a JSON array if response has extra content (e.g. thought_signature or wrapper text)
+            if "[" in text and "]" in text:
+                start = text.index("[")
+                end = text.rindex("]") + 1
+                text = text[start:end]
+            queries = json.loads(text)
+            if not isinstance(queries, list):
+                queries = []
+            queries = [str(q).strip() for q in queries if q]
+        except Exception as e:
+            try:
+                snippet = (text[:200] + "…") if text else "(empty)"
+            except Exception:
+                snippet = "(parse error)"
+            print("[backend] Articles agent query parsing:", e, "| snippet:", snippet)
+            queries = []
+        print(f"[backend] Articles: parsed {len(queries)} search queries for Tavily: {queries!r}")
+        consumed_lower = consumed.lower()
+        seen_urls: set[str] = set()
+        out = []
+        for item in _tavily_search_articles(queries[:3], api_key, max_per_query=4, topic="news"):
+            if item["url"] in seen_urls:
+                continue
+            if item["title"].lower() in consumed_lower or (item.get("author") and item["author"].lower() in consumed_lower):
+                continue
+            seen_urls.add(item["url"])
+            out.append(item)
+        out = out[:5]
+        if out:
+            reasons = _generate_article_reasons(out, facts_blob, summaries_blob, consumed)
+            for i, item in enumerate(out):
+                item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "Matches your interests.")
+            print(f"[backend] Articles: Tavily path returning {len(out)} articles.")
+            return out
+        print("[backend] Articles: Tavily returned no articles; falling back to LLM-only.")
     prompt = f"""You are an article curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 3–5 news articles or long-reads. Use their tastes from books, podcasts, and research too—e.g. themes from a book or paper they liked can inform article picks.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
@@ -1508,8 +1732,224 @@ Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reas
     return _parse_recommendation_json(text, [])
 
 
+# --- Research: Semantic Scholar + PMC/PubMed (E-Utilities) ---
+# Semantic Scholar: https://api.semanticscholar.org/api-docs/
+# PMC/NCBI E-Utilities: https://pmc.ncbi.nlm.nih.gov/tools/developers/ (E-Utilities), https://www.ncbi.nlm.nih.gov/books/NBK25501/
+
+
+def _semantic_scholar_search_papers(
+    queries: list[str],
+    max_per_query: int = 5,
+) -> list[dict]:
+    """Search Semantic Scholar Academic Graph API. Returns list of {title, author, url, year}. Optional SEMANTIC_SCHOLAR_API_KEY for higher rate limits."""
+    import time
+    import urllib.parse
+    import urllib.request
+
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+    # Without key: ~100 req/5 min → ~3.5s between requests to avoid 429
+    delay_between_requests = 0.1 if api_key else 4.0
+
+    base = "https://api.semanticscholar.org/graph/v1/paper/search"
+    fields = "title,url,authors,year,externalIds,openAccessPdf"
+    seen_urls: set[str] = set()
+    out: list[dict] = []
+    for i, q in enumerate(queries):
+        if not isinstance(q, str) or not q.strip():
+            continue
+        if i > 0:
+            time.sleep(delay_between_requests)
+        query_str = q.strip()
+        params = urllib.parse.urlencode({"query": query_str, "limit": max_per_query, "fields": fields})
+        url = f"{base}?{params}"
+        headers = {"User-Agent": "OpenJournal/1.0 (research recommendations)"}
+        if api_key:
+            headers["x-api-key"] = api_key
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(5.0)
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=12) as resp:
+                        data = json.loads(resp.read().decode())
+                except Exception as retry_e:
+                    print("[backend] Semantic Scholar search error (429 then retry):", retry_e)
+                    continue
+            else:
+                print("[backend] Semantic Scholar search error:", e)
+                continue
+        except Exception as e:
+            print("[backend] Semantic Scholar search error:", e)
+            continue
+        results = data.get("data") if isinstance(data, dict) else []
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            paper_id = r.get("paperId") or ""
+            title = (r.get("title") or "").strip()
+            if not title:
+                continue
+            url_val = r.get("url") or ""
+            if not url_val:
+                url_val = f"https://www.semanticscholar.org/paper/{paper_id}" if paper_id else ""
+            if url_val and url_val in seen_urls:
+                continue
+            authors = r.get("authors") or []
+            if authors and isinstance(authors[0], dict):
+                name = authors[0].get("name") or ""
+                author = f"{name} et al." if name else "Unknown"
+            else:
+                author = "Unknown"
+            year = r.get("year")
+            if year is not None:
+                author = f"{author} ({year})" if author else str(year)
+            seen_urls.add(url_val)
+            out.append({"title": title, "author": author, "url": url_val, "reason": ""})
+    return out
+
+
+def _pmc_pubmed_search_papers(
+    queries: list[str],
+    max_per_query: int = 5,
+) -> list[dict]:
+    """Search PubMed via NCBI E-Utilities (esearch + efetch). Returns list of {title, author, url}. No API key required."""
+    import urllib.parse
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    base_esearch = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    base_efetch = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    common = {"tool": "OpenJournal", "email": "research@openjournal.app"}
+    seen_urls: set[str] = set()
+    out: list[dict] = []
+    for q in queries:
+        if not isinstance(q, str) or not q.strip():
+            continue
+        query_str = q.strip()
+        try:
+            params_esearch = {**common, "db": "pubmed", "term": query_str, "retmax": max_per_query, "retmode": "json"}
+            url_esearch = base_esearch + "?" + urllib.parse.urlencode(params_esearch)
+            req = urllib.request.Request(url_esearch, headers={"User-Agent": "OpenJournal/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            print("[backend] PubMed esearch error:", e)
+            continue
+        id_list = []
+        try:
+            id_list = (data.get("esearchresult") or {}).get("idlist") or []
+        except Exception:
+            pass
+        if not id_list:
+            continue
+        ids_str = ",".join(str(x) for x in id_list[: max_per_query])
+        try:
+            params_efetch = {**common, "db": "pubmed", "id": ids_str, "retmode": "xml"}
+            url_efetch = base_efetch + "?" + urllib.parse.urlencode(params_efetch)
+            req = urllib.request.Request(url_efetch, headers={"User-Agent": "OpenJournal/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                root = ET.fromstring(resp.read())
+        except Exception as e:
+            print("[backend] PubMed efetch error:", e)
+            continue
+        def _find(el, path: str):
+            """Find first child by tag path (no namespace)."""
+            for tag in path.split("/"):
+                if el is None:
+                    return None
+                for c in el:
+                    if c.tag.endswith("}" + tag) or c.tag == tag:
+                        el = c
+                        break
+                else:
+                    return None
+            return el
+
+        for art in root.iter():
+            if art.tag.endswith("}PubmedArticle") or art.tag == "PubmedArticle":
+                try:
+                    med = _find(art, "MedlineCitation")
+                    art_el = _find(med, "Article") if med is not None else None
+                    if art_el is None:
+                        continue
+                    title_el = _find(art_el, "ArticleTitle")
+                    title = "".join((title_el.itertext() or [])).strip() if title_el is not None else ""
+                    pmid = ""
+                    pubmed_data = _find(art, "PubmedData")
+                    if pubmed_data is not None:
+                        id_list = _find(pubmed_data, "ArticleIdList")
+                        if id_list is not None:
+                            for aid in id_list:
+                                if aid.tag.endswith("}ArticleId") or aid.tag == "ArticleId":
+                                    if (aid.get("IdType") or aid.get("idtype")) == "pubmed":
+                                        pmid = (aid.text or "").strip()
+                                        break
+                    if not pmid:
+                        continue
+                    author_el = _find(art_el, "AuthorList")
+                    first_author = _find(author_el, "Author") if author_el is not None else None
+                    last_el = _find(first_author, "LastName") if first_author is not None else None
+                    last = (last_el.text or "").strip() if last_el is not None else ""
+                    author = f"{last} et al." if last else "Unknown"
+                    url_val = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                    if url_val in seen_urls:
+                        continue
+                    seen_urls.add(url_val)
+                    out.append({"title": title or "Article", "author": author, "url": url_val, "reason": ""})
+                except Exception as e:
+                    print("[backend] PubMed parse one article:", e)
+                    continue
+    return out
+
+
+def _generate_research_reasons(
+    papers: list[dict],
+    facts_blob: str,
+    summaries_blob: str,
+    consumed: str,
+) -> list[str]:
+    """Generate one short sentence per paper; keep reasons grounded in the paper topic."""
+    list_text = "\n".join(
+        f"{i + 1}. {p.get('title', '')} | {p.get('url', '')}"
+        for i, p in enumerate(papers)
+    )
+    prompt = f"""Given these research papers, write one short sentence per paper saying why it might interest the user. Base the reason on what the paper is actually about; be concrete. Only mention journal themes if there's a direct fit.
+Same order as the list.
+
+USER CONTEXT:
+{facts_blob or "(none)"}
+
+CONSUMED:
+{consumed[:1500]}
+
+PAPERS (title | url):
+{list_text}
+
+Return ONLY a JSON array of {len(papers)} strings, one reason per paper, same order. No markdown."""
+    try:
+        text = _call_gemini(prompt)
+        text = str(text).strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        if "[" in text and "]" in text:
+            start, end = text.index("["), text.rindex("]") + 1
+            text = text[start:end]
+        reasons = json.loads(text)
+        if isinstance(reasons, list) and len(reasons) >= len(papers):
+            return [str(r).strip() or "Relevant to your interests." for r in reasons[: len(papers)]]
+    except Exception as e:
+        print("[backend] _generate_research_reasons error:", e)
+    return [p.get("reason", "Relevant to your interests.") for p in papers]
+
+
 def _research_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
-    """Dedicated agent for research paper recommendations only."""
+    """Research paper recommendations using Semantic Scholar and PMC/PubMed (E-Utilities). Falls back to LLM-only if APIs return nothing."""
     recent_section = ""
     if recent_summaries_blob:
         recent_section = f"""
@@ -1517,7 +1957,70 @@ MOST RECENT JOURNAL ENTRIES (weight these ~20% more when matching interests):
 {recent_summaries_blob}
 
 """
-    prompt = f"""You are a research curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 3–5 academic or scientific research papers (peer-reviewed articles, studies, or review papers) they might find relevant or helpful. Use their tastes from books, podcasts, and articles too—e.g. themes from a book or podcast they liked can inform paper picks.
+    # 1) Generate 2–3 search queries from journal + consumed context
+    prompt_queries = f"""Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections, suggest 2–3 short search queries to find relevant academic or scientific research papers (peer-reviewed articles, studies, reviews). We will search Semantic Scholar and PubMed. Prefer concrete topic queries. Examples: "mindfulness meditation meta-analysis", "sleep deprivation cognitive performance", "CBT anxiety systematic review".
+
+FACTS AND THEMES:
+{facts_blob or "(none)"}
+
+JOURNAL SUMMARIES:
+{summaries_blob or "(none)"}
+{recent_section}{consumed}
+
+Return ONLY a JSON array of 2–3 query strings, no markdown. Example: ["mindfulness meta-analysis", "sleep and cognition"]"""
+    queries: list[str] = []
+    try:
+        text = _call_gemini(prompt_queries)
+        text = str(text or "").strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        if "[" in text and "]" in text:
+            start, end = text.index("["), text.rindex("]") + 1
+            text = text[start:end]
+        queries = json.loads(text)
+        if not isinstance(queries, list):
+            queries = []
+    except Exception as e:
+        print("[backend] Research agent query parsing:", e)
+
+    consumed_lower = (consumed or "").lower()
+    seen_titles: set[str] = set()
+    out: list[dict] = []
+
+    # 2) Semantic Scholar (broad academic)
+    for item in _semantic_scholar_search_papers(queries, max_per_query=5):
+        title = (item.get("title") or "").strip()
+        if not title or title.lower() in consumed_lower:
+            continue
+        key = title.lower()[:80]
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        out.append(item)
+
+    # 3) PMC/PubMed (biomedical)
+    for item in _pmc_pubmed_search_papers(queries, max_per_query=4):
+        title = (item.get("title") or "").strip()
+        if not title or title.lower() in consumed_lower:
+            continue
+        key = title.lower()[:80]
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        out.append(item)
+
+    out = out[:5]
+    if out:
+        reasons = _generate_research_reasons(out, facts_blob, summaries_blob, consumed)
+        for i, item in enumerate(out):
+            item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "Relevant to your interests.")
+        print(f"[backend] Research: API path returning {len(out)} papers (Semantic Scholar + PubMed).")
+        return out
+
+    # 4) Fallback: LLM-only with real-URL rule
+    prompt = f"""You are a research curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections, suggest 3–5 academic or scientific research papers they might find relevant. Use their tastes from books, podcasts, and articles too.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
 {facts_blob or "(none yet)"}
@@ -1526,20 +2029,20 @@ JOURNAL SESSION SUMMARIES (all themes):
 {summaries_blob or "(none yet)"}
 {recent_section}{consumed}
 
-Rules: Do NOT suggest papers they have already consumed. For each paper give: "title" (paper title), "author" (lead author or author list, or journal name and year), "reason" (one sentence on why it fits their interests), and "url" (working link to the paper—DOI link like https://doi.org/10.1234/... or publisher link to the abstract/full text). Only include papers where you can provide a real, working url (doi.org, PubMed, PMC, journal websites). Do not guess URLs.
+Rules: Do NOT suggest papers they have already consumed. For each paper give: "title", "author" (e.g. "Smith et al." or journal and year), "reason" (one sentence), and "url" (working link: https://doi.org/..., https://pubmed.ncbi.nlm.nih.gov/PMID/, or https://www.semanticscholar.org/paper/...). Do not guess URLs; only include papers where you are sure of the URL.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
     text = _call_gemini(prompt)
     return _parse_recommendation_json(text, [])
 
 
-def generate_recommendations() -> dict:
+def generate_recommendations(instance_id: str = "") -> dict:
     """
     Run four dedicated agents (books, podcasts, articles, research) in parallel, each with
     its own prompt and specialization. Combines results into one response.
     Uses full journal history for themes but gives ~20% more weight to the most recent entries.
     """
-    gist_docs, episodic_docs = get_memory_for_visualization()
-    consumed = get_consumed_context()
+    gist_docs, episodic_docs = get_memory_for_visualization(instance_id=instance_id)
+    consumed = get_consumed_context(instance_id=instance_id)
     facts_blob = "\n".join(f"- {f}" for f in (gist_docs or [])[:60])
     # Episodic from get_memory_for_visualization is oldest-first (ORDER BY id). Use all for themes.
     summaries_blob = "\n".join(f"- {s}" for s in (episodic_docs or [])[:40])

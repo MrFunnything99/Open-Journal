@@ -29,6 +29,9 @@ Copy `.env.example` to `.env` in the project root and set:
 - `EMBEDDING_DIM` – vector size, default `768` (optional)
 - `LIGHTRAG_ENABLED` – set to `false` to disable LightRAG indexing (optional)
 - `VECTOR_DB_PATH` – full path to SQLite DB file (optional; for production so the vector DB persists)
+- `TAVILY_API_KEY` – optional; when set, News & article recommendations use [Tavily Search](https://docs.tavily.com/welcome) (topic=news) for real article URLs
+- `SEMANTIC_SCHOLAR_API_KEY` – optional; research recommendations use [Semantic Scholar](https://www.semanticscholar.org/product/api) + PubMed. Without the key we throttle S2 requests (~4s between calls) to avoid 429; with a key you get higher rate limits.
+- `JWT_SECRET` – optional; when set, simple login (username + password, no email) is enabled. Logged-in users get persistent data; anonymous users can still use the app but their data is forgotten after 1 hour (client-side ephemeral instance). Use a long random string.
 
 On macOS, the system Python SQLite may not support extensions; install `pysqlite3` so sqlite-vec works (`pip install pysqlite3`).
 

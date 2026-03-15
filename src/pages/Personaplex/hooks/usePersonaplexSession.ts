@@ -33,8 +33,9 @@ export type UsePersonaplexSessionOptions = {
   showLiveTranscription?: boolean;
 };
 
-const BACKEND_URL =
-  import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
+import { backendFetch } from "../../../backendApi";
+
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
 
 export type TranscriptEntry = { role: "user" | "ai"; text: string; retrievalLog?: string };
 
@@ -49,7 +50,7 @@ async function fetchInterviewerQuestion(
 ): Promise<{ question: string; sessionId: string; retrievalLog?: string; notesSaved?: { item_id: string; note: string }[] }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), CHAT_FETCH_TIMEOUT_MS);
-  const res = await fetch(`${BACKEND_URL}/chat`, {
+  const res = await backendFetch("/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

@@ -174,6 +174,23 @@ def _init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE memory_episodic ADD COLUMN metadata_json TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # Optional instance isolation (X-Instance-ID): each instance only sees/writes its own rows
+    for tbl, col in (("memory_facts", "instance_id"), ("memory_episodic", "instance_id"), ("consumed_meta", "instance_id")):
+        try:
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # Simple login (no email): username + password_hash for persistent data
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
 
     # People / social graph tables for Brain -> People view
     conn.execute("""
@@ -258,7 +275,41 @@ def ensure_db() -> None:
     _get_conn()
 
 
-def add_gist(session_id: str, timestamp: str, document: str, embedding: list[float]) -> int:
+def auth_user_create(username: str, password_hash: str, salt: str) -> int | None:
+    """Create a user; return user id or None if username taken."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO auth_users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+            (username.strip().lower(), password_hash, salt, datetime.datetime.utcnow().isoformat() + "Z"),
+        )
+        conn.commit()
+        row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return row[0] if row else None
+    except sqlite3.IntegrityError:
+        return None
+
+
+def auth_user_get_by_username(username: str) -> dict | None:
+    """Return {id, username, password_hash, salt} or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id, username, password_hash, salt FROM auth_users WHERE username = ?",
+        (username.strip().lower(),),
+    ).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "username": row[1], "password_hash": row[2], "salt": row[3]}
+
+
+def _instance_where(instance_id: str, table: str = "memory_facts") -> tuple[str, list]:
+    """Return (WHERE clause fragment, params) for instance scoping. instance_id '' = legacy shared rows."""
+    if not instance_id:
+        return ("(instance_id = '' OR instance_id IS NULL)", [])
+    return ("instance_id = ?", [instance_id])
+
+
+def add_gist(session_id: str, timestamp: str, document: str, embedding: list[float], instance_id: str = "") -> int:
     """Insert gist fact; return stable id (doc_id) for later update/delete."""
     conn = _get_conn()
     doc_id = _next_id(conn, "gist")
@@ -270,10 +321,16 @@ def add_gist(session_id: str, timestamp: str, document: str, embedding: list[flo
         """,
         (doc_id, blob, session_id, timestamp, document),
     )
-    conn.execute(
-        "INSERT INTO memory_facts (id, document, session_id, timestamp) VALUES (?, ?, ?, ?)",
-        (doc_id, document, session_id, timestamp),
-    )
+    try:
+        conn.execute(
+            "INSERT INTO memory_facts (id, document, session_id, timestamp, instance_id) VALUES (?, ?, ?, ?, ?)",
+            (doc_id, document, session_id, timestamp, instance_id or ""),
+        )
+    except sqlite3.OperationalError:
+        conn.execute(
+            "INSERT INTO memory_facts (id, document, session_id, timestamp) VALUES (?, ?, ?, ?)",
+            (doc_id, document, session_id, timestamp),
+        )
     conn.commit()
     return doc_id
 
@@ -284,6 +341,7 @@ def add_episodic(
     document: str,
     embedding: list[float],
     metadata_json: str | None = None,
+    instance_id: str = "",
 ) -> int:
     """Insert episodic summary; return stable id (doc_id). metadata_json is optional structured JSON."""
     conn = _get_conn()
@@ -296,27 +354,47 @@ def add_episodic(
         """,
         (doc_id, blob, session_id, timestamp, document),
     )
-    conn.execute(
-        "INSERT INTO memory_episodic (id, document, session_id, timestamp, metadata_json) VALUES (?, ?, ?, ?, ?)",
-        (doc_id, document, session_id, timestamp, metadata_json),
-    )
+    try:
+        conn.execute(
+            "INSERT INTO memory_episodic (id, document, session_id, timestamp, metadata_json, instance_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (doc_id, document, session_id, timestamp, metadata_json, instance_id or ""),
+        )
+    except sqlite3.OperationalError:
+        conn.execute(
+            "INSERT INTO memory_episodic (id, document, session_id, timestamp, metadata_json) VALUES (?, ?, ?, ?, ?)",
+            (doc_id, document, session_id, timestamp, metadata_json),
+        )
     conn.commit()
     return doc_id
 
 
-def query_gist(embedding: list[float], k: int) -> list[str]:
-    """Return top-k gist document strings by cosine similarity."""
+def query_gist(embedding: list[float], k: int, instance_id: str = "") -> list[str]:
+    """Return top-k gist document strings by cosine similarity. Optional instance_id scopes to that instance."""
     conn = _get_conn()
     blob = _blob_from_floats(embedding)
+    fetch_k = (k * 4 + 20) if instance_id else k
     rows = conn.execute(
         """
-        SELECT document
+        SELECT doc_id, document
         FROM vec_gist
         WHERE embedding MATCH ? AND k = ?
         """,
-        (blob, k),
+        (blob, fetch_k),
     ).fetchall()
-    return [r[0] for r in rows if r[0]]
+    if not instance_id:
+        return [r[1] for r in rows if r[1]][:k]
+    allowed = set(
+        r[0] for r in conn.execute(
+            "SELECT id FROM memory_facts WHERE instance_id = ?", (instance_id,)
+        ).fetchall()
+    )
+    out = []
+    for doc_id, doc in rows:
+        if doc_id in allowed and doc:
+            out.append(doc)
+            if len(out) >= k:
+                break
+    return out
 
 
 def query_gist_nearest(
@@ -336,70 +414,114 @@ def query_gist_nearest(
     return [(r[0], r[1] or "", r[2]) for r in rows]
 
 
-def query_episodic(embedding: list[float], k: int) -> list[str]:
-    """Return top-k episodic document strings by cosine similarity."""
+def query_episodic(embedding: list[float], k: int, instance_id: str = "") -> list[str]:
+    """Return top-k episodic document strings by cosine similarity. Optional instance_id scopes to that instance."""
     conn = _get_conn()
     blob = _blob_from_floats(embedding)
+    fetch_k = (k * 4 + 20) if instance_id else k
     rows = conn.execute(
         """
-        SELECT document
+        SELECT doc_id, document
         FROM vec_episodic
         WHERE embedding MATCH ? AND k = ?
         """,
-        (blob, k),
+        (blob, fetch_k),
     ).fetchall()
-    return [r[0] for r in rows if r[0]]
+    if not instance_id:
+        return [r[1] for r in rows if r[1]][:k]
+    allowed = set(
+        r[0] for r in conn.execute(
+            "SELECT id FROM memory_episodic WHERE instance_id = ?", (instance_id,)
+        ).fetchall()
+    )
+    out = []
+    for doc_id, doc in rows:
+        if doc_id in allowed and doc:
+            out.append(doc)
+            if len(out) >= k:
+                break
+    return out
 
 
-def query_episodic_with_timestamp(embedding: list[float], k: int) -> list[tuple[str, str]]:
-    """Return top-k (document, timestamp) by cosine similarity. Timestamp may be ''."""
+def query_episodic_with_timestamp(embedding: list[float], k: int, instance_id: str = "") -> list[tuple[str, str]]:
+    """Return top-k (document, timestamp) by cosine similarity. Optional instance_id scopes results."""
     conn = _get_conn()
     blob = _blob_from_floats(embedding)
+    fetch_k = (k * 4 + 20) if instance_id else k
     rows = conn.execute(
         """
-        SELECT document, timestamp
+        SELECT doc_id, document, timestamp
         FROM vec_episodic
         WHERE embedding MATCH ? AND k = ?
         """,
-        (blob, k),
+        (blob, fetch_k),
     ).fetchall()
-    return [(r[0] or "", r[1] or "") for r in rows if r[0]]
+    if not instance_id:
+        return [(r[1] or "", r[2] or "") for r in rows if r[1]][:k]
+    allowed = set(r[0] for r in conn.execute("SELECT id FROM memory_episodic WHERE instance_id = ?", (instance_id,)).fetchall())
+    out = []
+    for doc_id, doc, ts in rows:
+        if doc_id in allowed and doc:
+            out.append((doc, ts or ""))
+            if len(out) >= k:
+                break
+    return out
 
 
-def query_gist_with_timestamp(embedding: list[float], k: int) -> list[tuple[str, str]]:
-    """Return top-k (document, timestamp) by cosine similarity. Timestamp may be ''."""
+def query_gist_with_timestamp(embedding: list[float], k: int, instance_id: str = "") -> list[tuple[str, str]]:
+    """Return top-k (document, timestamp) by cosine similarity. Optional instance_id scopes results."""
     conn = _get_conn()
     blob = _blob_from_floats(embedding)
+    fetch_k = (k * 4 + 20) if instance_id else k
     rows = conn.execute(
         """
-        SELECT document, timestamp
+        SELECT doc_id, document, timestamp
         FROM vec_gist
         WHERE embedding MATCH ? AND k = ?
         """,
-        (blob, k),
+        (blob, fetch_k),
     ).fetchall()
-    return [(r[0] or "", r[1] or "") for r in rows if r[0]]
+    if not instance_id:
+        return [(r[1] or "", r[2] or "") for r in rows if r[1]][:k]
+    allowed = set(r[0] for r in conn.execute("SELECT id FROM memory_facts WHERE instance_id = ?", (instance_id,)).fetchall())
+    out = []
+    for doc_id, doc, ts in rows:
+        if doc_id in allowed and doc:
+            out.append((doc, ts or ""))
+            if len(out) >= k:
+                break
+    return out
 
 
-def get_all_gist() -> list[str]:
+def get_all_gist(instance_id: str = "") -> list[str]:
     """Return all gist documents (for visualization); from canonical memory_facts."""
     conn = _get_conn()
-    rows = conn.execute("SELECT document FROM memory_facts ORDER BY id").fetchall()
+    where, params = _instance_where(instance_id)
+    rows = conn.execute(
+        f"SELECT document FROM memory_facts WHERE {where} ORDER BY id",
+        params,
+    ).fetchall()
     return [r[0] for r in rows if r[0]]
 
 
-def get_all_episodic() -> list[str]:
+def get_all_episodic(instance_id: str = "") -> list[str]:
     """Return all episodic documents (for visualization); from canonical memory_episodic."""
     conn = _get_conn()
-    rows = conn.execute("SELECT document FROM memory_episodic ORDER BY id").fetchall()
+    where, params = _instance_where(instance_id, "memory_episodic")
+    rows = conn.execute(
+        f"SELECT document FROM memory_episodic WHERE {where} ORDER BY id",
+        params,
+    ).fetchall()
     return [r[0] for r in rows if r[0]]
 
 
-def list_gist_with_ids() -> list[dict]:
+def list_gist_with_ids(instance_id: str = "") -> list[dict]:
     """Return all gist facts with id, document, session_id, timestamp for Memory UI."""
     conn = _get_conn()
+    where, params = _instance_where(instance_id)
     rows = conn.execute(
-        "SELECT id, document, session_id, timestamp FROM memory_facts ORDER BY id DESC"
+        f"SELECT id, document, session_id, timestamp FROM memory_facts WHERE {where} ORDER BY id DESC",
+        params,
     ).fetchall()
     return [
         {"id": r[0], "document": r[1] or "", "session_id": r[2] or "", "timestamp": r[3] or ""}
@@ -407,17 +529,19 @@ def list_gist_with_ids() -> list[dict]:
     ]
 
 
-def list_episodic_with_ids() -> list[dict]:
+def list_episodic_with_ids(instance_id: str = "") -> list[dict]:
     """Return all episodic summaries with id, document, session_id, timestamp, metadata_json for Memory UI."""
     conn = _get_conn()
+    where, params = _instance_where(instance_id, "memory_episodic")
     try:
         rows = conn.execute(
-            "SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic ORDER BY id DESC"
+            f"SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic WHERE {where} ORDER BY id DESC",
+            params,
         ).fetchall()
     except sqlite3.OperationalError:
-        # Fallback if metadata_json column missing (very old DB)
         rows = conn.execute(
-            "SELECT id, document, session_id, timestamp FROM memory_episodic ORDER BY id DESC"
+            f"SELECT id, document, session_id, timestamp FROM memory_episodic WHERE {where} ORDER BY id DESC",
+            params,
         ).fetchall()
         rows = [(*r, None) for r in rows]
     return [
@@ -432,19 +556,23 @@ def list_episodic_with_ids() -> list[dict]:
     ]
 
 
-def get_episodic_for_date(date_iso: str) -> list[dict]:
+def get_episodic_for_date(date_iso: str, instance_id: str = "") -> list[dict]:
     """Return episodic summaries whose timestamp falls on the given date (YYYY-MM-DD)."""
     if not date_iso or len(date_iso) < 10:
         return []
     conn = _get_conn()
+    where, params = _instance_where(instance_id, "memory_episodic")
+    params = [date_iso[:10]] + params
     try:
         rows = conn.execute(
-            "SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic WHERE date(timestamp) = ? ORDER BY timestamp DESC",
-            (date_iso[:10],),
+            f"SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic WHERE date(timestamp) = ? AND {where} ORDER BY timestamp DESC",
+            params,
         ).fetchall()
     except sqlite3.OperationalError:
+        where2, params2 = _instance_where(instance_id, "memory_episodic")
         all_rows = conn.execute(
-            "SELECT id, document, session_id, timestamp FROM memory_episodic ORDER BY id DESC"
+            f"SELECT id, document, session_id, timestamp FROM memory_episodic WHERE {where2} ORDER BY id DESC",
+            params2,
         ).fetchall()
         out = []
         for r in all_rows:
@@ -458,19 +586,21 @@ def get_episodic_for_date(date_iso: str) -> list[dict]:
     ]
 
 
-def get_gist_for_date(date_iso: str) -> list[dict]:
+def get_gist_for_date(date_iso: str, instance_id: str = "") -> list[dict]:
     """Return gist facts whose timestamp falls on the given date (YYYY-MM-DD)."""
     if not date_iso or len(date_iso) < 10:
         return []
     conn = _get_conn()
+    where, params = _instance_where(instance_id)
+    params = [date_iso[:10]] + params
     try:
         rows = conn.execute(
-            "SELECT id, document, session_id, timestamp FROM memory_facts WHERE date(timestamp) = ? ORDER BY timestamp DESC",
-            (date_iso[:10],),
+            f"SELECT id, document, session_id, timestamp FROM memory_facts WHERE date(timestamp) = ? AND {where} ORDER BY timestamp DESC",
+            params,
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
-        for r in conn.execute("SELECT id, document, session_id, timestamp FROM memory_facts ORDER BY id DESC").fetchall():
+        for r in conn.execute(f"SELECT id, document, session_id, timestamp FROM memory_facts WHERE {where} ORDER BY id DESC", params).fetchall():
             ts = r[3] or ""
             if ts.startswith(date_iso[:10]):
                 rows.append(r)
@@ -551,15 +681,23 @@ def delete_episodic(summary_id: int) -> bool:
     return True
 
 
-def gist_count() -> int:
+def gist_count(instance_id: str = "") -> int:
     conn = _get_conn()
-    r = conn.execute("SELECT COUNT(*) FROM memory_facts").fetchone()
+    where, params = _instance_where(instance_id)
+    try:
+        r = conn.execute(f"SELECT COUNT(*) FROM memory_facts WHERE {where}", params).fetchone()
+    except sqlite3.OperationalError:
+        r = conn.execute("SELECT COUNT(*) FROM memory_facts").fetchone()
     return r[0] if r else 0
 
 
-def episodic_count() -> int:
+def episodic_count(instance_id: str = "") -> int:
     conn = _get_conn()
-    r = conn.execute("SELECT COUNT(*) FROM memory_episodic").fetchone()
+    where, params = _instance_where(instance_id, "memory_episodic")
+    try:
+        r = conn.execute(f"SELECT COUNT(*) FROM memory_episodic WHERE {where}", params).fetchone()
+    except sqlite3.OperationalError:
+        r = conn.execute("SELECT COUNT(*) FROM memory_episodic").fetchone()
     return r[0] if r else 0
 
 
@@ -820,10 +958,10 @@ def add_consumed(
     timestamp: str = "",
     note: str = "",
     date_completed: str = "",
+    instance_id: str = "",
 ) -> None:
     conn = _get_conn()
     blob = _blob_from_floats(embedding)
-    # row_id: use a new sequence or hash; vec0 needs integer PK. Use max+1 for simplicity.
     r = conn.execute("SELECT COALESCE(MAX(row_id), 0) + 1 FROM vec_consumed").fetchone()
     row_id = r[0] if r else 1
     conn.execute(
@@ -838,30 +976,54 @@ def add_consumed(
             1 if liked else 0, timestamp, note[:2000], date_completed[:50], document,
         ),
     )
-    conn.execute(
-        """INSERT OR REPLACE INTO consumed_meta (
-            id_original, type, title, author, url, liked, timestamp, date_completed, note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            item_id, type_, title[:500], author[:300], url[:500],
-            1 if liked else 0, timestamp, date_completed[:50], note[:2000],
-        ),
-    )
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO consumed_meta (
+                id_original, type, title, author, url, liked, timestamp, date_completed, note, instance_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                item_id, type_, title[:500], author[:300], url[:500],
+                1 if liked else 0, timestamp, date_completed[:50], note[:2000], instance_id or "",
+            ),
+        )
+    except sqlite3.OperationalError:
+        conn.execute(
+            """INSERT OR REPLACE INTO consumed_meta (
+                id_original, type, title, author, url, liked, timestamp, date_completed, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                item_id, type_, title[:500], author[:300], url[:500],
+                1 if liked else 0, timestamp, date_completed[:50], note[:2000],
+            ),
+        )
     conn.commit()
 
 
-def list_consumed_rows(max_items: int = 200) -> list[dict]:
+def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict]:
     """Return all consumed rows from consumed_meta (source of truth for listing)."""
     conn = _get_conn()
-    rows = conn.execute(
-        """
-        SELECT id_original, type, title, author, date_completed, note
-        FROM consumed_meta
-        ORDER BY timestamp DESC
-        LIMIT ?
-        """,
-        (max_items,),
-    ).fetchall()
+    where, params = _instance_where(instance_id, "consumed_meta")
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT id_original, type, title, author, date_completed, note
+            FROM consumed_meta
+            WHERE {where}
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            params + [max_items],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute(
+            """
+            SELECT id_original, type, title, author, date_completed, note
+            FROM consumed_meta
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (max_items,),
+        ).fetchall()
     return [
         {
             "id": r[0] or "",
@@ -875,10 +1037,19 @@ def list_consumed_rows(max_items: int = 200) -> list[dict]:
     ]
 
 
-def update_consumed(item_id: str, *, date_completed: str | None = None, note: str | None = None) -> bool:
-    """Update date_completed and/or note by id_original in consumed_meta."""
+def update_consumed(item_id: str, *, date_completed: str | None = None, note: str | None = None, instance_id: str = "") -> bool:
+    """Update date_completed and/or note by id_original in consumed_meta. When instance_id is set, only update rows for that instance."""
     conn = _get_conn()
-    cur = conn.execute("SELECT 1 FROM consumed_meta WHERE id_original = ?", (item_id,))
+    if instance_id:
+        cur = conn.execute("SELECT 1 FROM consumed_meta WHERE id_original = ? AND instance_id = ?", (item_id, instance_id))
+    else:
+        try:
+            cur = conn.execute(
+                "SELECT 1 FROM consumed_meta WHERE id_original = ? AND (instance_id = '' OR instance_id IS NULL)",
+                (item_id,),
+            )
+        except sqlite3.OperationalError:
+            cur = conn.execute("SELECT 1 FROM consumed_meta WHERE id_original = ?", (item_id,))
     if not cur.fetchone():
         return False
     updates = []
@@ -892,41 +1063,72 @@ def update_consumed(item_id: str, *, date_completed: str | None = None, note: st
     if not updates:
         return True
     params.append(item_id)
-    conn.execute(
-        f"UPDATE consumed_meta SET {', '.join(updates)} WHERE id_original = ?",
-        params,
-    )
+    if instance_id:
+        conn.execute(
+            f"UPDATE consumed_meta SET {', '.join(updates)} WHERE id_original = ? AND instance_id = ?",
+            params + [instance_id],
+        )
+    else:
+        try:
+            conn.execute(
+                f"UPDATE consumed_meta SET {', '.join(updates)} WHERE id_original = ? AND (instance_id = '' OR instance_id IS NULL)",
+                params,
+            )
+        except sqlite3.OperationalError:
+            conn.execute(
+                f"UPDATE consumed_meta SET {', '.join(updates)} WHERE id_original = ?",
+                params,
+            )
     conn.commit()
     return True
 
 
-def delete_consumed(item_id: str) -> bool:
-    """Remove consumed item by id_original from both vec_consumed and consumed_meta."""
+def delete_consumed(item_id: str, instance_id: str = "") -> bool:
+    """Remove consumed item by id_original from both vec_consumed and consumed_meta. When instance_id is set, only delete rows for that instance."""
     conn = _get_conn()
     try:
         cur = conn.execute("SELECT row_id FROM vec_consumed WHERE id_original = ?", (item_id,))
         row = cur.fetchone()
         if row:
             conn.execute("DELETE FROM vec_consumed WHERE row_id = ?", (row[0],))
-        conn.execute("DELETE FROM consumed_meta WHERE id_original = ?", (item_id,))
+        if instance_id:
+            cur = conn.execute("DELETE FROM consumed_meta WHERE id_original = ? AND instance_id = ?", (item_id, instance_id))
+        else:
+            try:
+                conn.execute("DELETE FROM consumed_meta WHERE id_original = ? AND (instance_id = '' OR instance_id IS NULL)", (item_id,))
+            except sqlite3.OperationalError:
+                conn.execute("DELETE FROM consumed_meta WHERE id_original = ?", (item_id,))
         conn.commit()
         return True
     except Exception:
         return False
 
 
-def get_consumed_context_rows(max_items: int = 80) -> list[dict]:
+def get_consumed_context_rows(max_items: int = 80, instance_id: str = "") -> list[dict]:
     """Return consumed rows with type, title, author, liked, note from consumed_meta."""
     conn = _get_conn()
-    rows = conn.execute(
-        """
-        SELECT type, title, author, liked, note
-        FROM consumed_meta
-        ORDER BY timestamp DESC
-        LIMIT ?
-        """,
-        (max_items,),
-    ).fetchall()
+    where, params = _instance_where(instance_id, "consumed_meta")
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT type, title, author, liked, note
+            FROM consumed_meta
+            WHERE {where}
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            params + [max_items],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute(
+            """
+            SELECT type, title, author, liked, note
+            FROM consumed_meta
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (max_items,),
+        ).fetchall()
     return [
         {
             "type": (r[0] or "item").lower(),

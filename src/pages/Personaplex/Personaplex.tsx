@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { backendFetch } from "../../backendApi";
+import { usePersonaplexSession, type TranscriptEntry } from "./hooks/usePersonaplexSession";
 
 type VoiceOption = { voice_id: string; name: string };
-import { usePersonaplexSession, type TranscriptEntry } from "./hooks/usePersonaplexSession";
 
 function TranscriptBubble({
   entry,
@@ -49,6 +50,8 @@ import { useJournalHistory } from "./hooks/useJournalHistory";
 import { Orb, OrbState } from "./components/Orb";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConnectButton } from "./components/ConnectButton";
+import { AuthButton, type AuthUser } from "./components/AuthButton";
+import { authMe, setStoredToken } from "../../backendApi";
 import { JournalGallery } from "./components/JournalGallery";
 
 /** Default journaling assistant prompt (base; personalization is always \"high\" / memory-connected) */
@@ -63,7 +66,6 @@ const INTRUSIVENESS_LABELS: Record<number, string> = {
 };
 
 const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Rachel
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
 const RECOMMENDATIONS_CACHE_KEY = "openjournal-recommendations-cache";
 const LIBRARY_CACHE_KEY = "openjournal-library-cache";
 
@@ -122,6 +124,7 @@ export const Personaplex = () => {
   const [recommendationsLoading, setRecommendationsLoading] = useState(false);
   const [consumedIds, setConsumedIds] = useState<Set<string>>(new Set());
   const [removingKeys, setRemovingKeys] = useState<Set<string>>(new Set());
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [showLibrary, setShowLibrary] = useState(false);
   const [libraryExpandedCategory, setLibraryExpandedCategory] = useState<"book" | "podcast" | "article" | "research" | null>(null);
   const [libraryDraftText, setLibraryDraftText] = useState("");
@@ -166,7 +169,7 @@ export const Personaplex = () => {
         /* ignore cache parse errors */
       }
     }
-    return fetch(`${BACKEND_URL}/library`)
+    return backendFetch("/library")
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load library"))))
       .then((data: { books?: LibraryItem[]; podcasts?: LibraryItem[]; articles?: LibraryItem[]; research?: LibraryItem[] }) => {
         const next = {
@@ -187,6 +190,12 @@ export const Personaplex = () => {
       });
   }, []);
   useEffect(() => {
+    authMe()
+      .then((u: { username: string; user_id: number } | null) => u && setAuthUser({ username: u.username, user_id: u.user_id }))
+      .catch(() => setStoredToken(null));
+  }, []);
+
+  useEffect(() => {
     if (!showLibrary) return;
     setLibraryLoading(true);
     fetchLibrary(true).finally(() => setLibraryLoading(false));
@@ -199,7 +208,7 @@ export const Personaplex = () => {
       setLibraryInterviewInput("");
       setLibraryInterviewLoading(true);
       const snapshot = libraryItems.books.map((b) => ({ id: b.id, title: b.title, author: b.author ?? undefined, note: b.note ?? undefined }));
-      fetch(`${BACKEND_URL}/library-interview`, {
+      backendFetch("/library-interview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -266,7 +275,7 @@ export const Personaplex = () => {
   }, []);
 
   const fetchMemoryStats = useCallback(() => {
-    fetch(`${BACKEND_URL}/memory-stats`)
+    backendFetch("/memory-stats")
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
       .then((data: { gist_facts_count?: number; episodic_log_count?: number }) => {
         setMemoryStats({
@@ -298,7 +307,7 @@ export const Personaplex = () => {
           setRecommendationsLoading(true);
           const ac = new AbortController();
           const timeoutId = setTimeout(() => ac.abort(), 125000);
-          fetch(`${BACKEND_URL}/recommendations`, { signal: ac.signal })
+          backendFetch("/recommendations", { signal: ac.signal })
             .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
             .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
               const next = {
@@ -324,7 +333,7 @@ export const Personaplex = () => {
     setRecommendationsLoading(true);
     const ac = new AbortController();
     const timeoutId = setTimeout(() => ac.abort(), 125000);
-    fetch(`${BACKEND_URL}/recommendations`, { signal: ac.signal })
+    backendFetch("/recommendations", { signal: ac.signal })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
       .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
         const next = {
@@ -383,7 +392,7 @@ export const Personaplex = () => {
     (type: "book" | "podcast" | "article" | "research", item: RecItem) => {
       const key = `${type}:${item.title}`;
       if (consumedIds.has(key)) return;
-      fetch(`${BACKEND_URL}/recommendations/consumed`, {
+      backendFetch("/recommendations/consumed", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -435,7 +444,7 @@ export const Personaplex = () => {
     const textToIngest = priorJournalText.trim();
     let inferredDate: string | undefined;
     try {
-      const ir = await fetch(`${BACKEND_URL}/infer-entry-date`, {
+      const ir = await backendFetch("/infer-entry-date", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: textToIngest }),
@@ -448,7 +457,7 @@ export const Personaplex = () => {
       /* use no date / today as fallback */
     }
     try {
-      const r = await fetch(`${BACKEND_URL}/ingest-history`, {
+      const r = await backendFetch("/ingest-history", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: textToIngest, entry_date: inferredDate }),
@@ -475,7 +484,7 @@ export const Personaplex = () => {
   const handleWipeMemory = useCallback(() => {
     if (!window.confirm("Wipe all data from the vector DB? This cannot be undone. The AI will have no prior journal memory until you add entries again.")) return;
     setIsWipingMemory(true);
-    fetch(`${BACKEND_URL}/memory-wipe`, { method: "POST" })
+    backendFetch("/memory-wipe", { method: "POST" })
       .then((r) => {
         if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d.detail ?? "Wipe failed")));
       })
@@ -650,7 +659,7 @@ export const Personaplex = () => {
               imported += 1;
               let inferredDate: string | undefined;
               try {
-                const ir = await fetch(`${BACKEND_URL}/infer-entry-date`, {
+                const ir = await backendFetch("/infer-entry-date", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ text, filename: file.name }),
@@ -664,7 +673,7 @@ export const Personaplex = () => {
               }
               saveEntry([{ role: "user", text }], inferredDate);
               try {
-                const r = await fetch(`${BACKEND_URL}/ingest-history`, {
+                const r = await backendFetch("/ingest-history", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ text, entry_date: inferredDate }),
@@ -720,7 +729,7 @@ export const Personaplex = () => {
                 .join("\n");
               if (!transcriptText.trim()) continue;
               try {
-                const r = await fetch(`${BACKEND_URL}/ingest-history`, {
+                const r = await backendFetch("/ingest-history", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ text: transcriptText, entry_date: entry?.date }),
@@ -741,7 +750,7 @@ export const Personaplex = () => {
             if (!content) throw new Error("File is empty.");
             let inferredDate: string | undefined;
             try {
-              const ir = await fetch(`${BACKEND_URL}/infer-entry-date`, {
+              const ir = await backendFetch("/infer-entry-date", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ text: content, filename: file.name }),
@@ -755,7 +764,7 @@ export const Personaplex = () => {
             }
             saveEntry([{ role: "user", text: content }], inferredDate);
             try {
-              const ingestRes = await fetch(`${BACKEND_URL}/ingest-history`, {
+              const ingestRes = await backendFetch("/ingest-history", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ text: content, entry_date: inferredDate }),
@@ -812,12 +821,13 @@ export const Personaplex = () => {
             <span className="text-sm text-red-400">{errorMessage}</span>
           )}
         </div>
-        <div className="flex justify-center mt-1.5">
+        <div className="flex justify-center items-center gap-2 mt-1.5">
           <ConnectButton
             status={status}
             onConnect={handleConnect}
             onDisconnect={handleDisconnect}
           />
+          <AuthButton user={authUser} onUserChange={setAuthUser} />
         </div>
         <div className="flex items-center justify-end gap-1 sm:gap-2">
           <button
@@ -1259,7 +1269,7 @@ export const Personaplex = () => {
                                 const rawTranscript = dayEntries.length
                                   ? dayEntries.map((e) => e.fullTranscript.map((m) => `${m.role}: ${m.text}`).join("\n")).join("\n\n")
                                   : "";
-                                fetch(`${BACKEND_URL}/calendar-day-summary`, {
+                                backendFetch("/calendar-day-summary", {
                                   method: "POST",
                                   headers: { "Content-Type": "application/json" },
                                   body: JSON.stringify({ date, raw_transcript: rawTranscript }),
@@ -1406,7 +1416,7 @@ export const Personaplex = () => {
                                     if (!libraryDraftText.trim() || librarySubmitting) return;
                                     setLibrarySubmitting(true);
                                     const payload = libraryDraftText.trim();
-                                    fetch(`${BACKEND_URL}/library-notes`, {
+                                    backendFetch("/library-notes", {
                                       method: "POST",
                                       headers: { "Content-Type": "application/json" },
                                       body: JSON.stringify({ text: payload, type: cat }),
@@ -1536,7 +1546,7 @@ export const Personaplex = () => {
                                 if (!libraryEditingId || libraryUpdateSaving) return;
                                 if (!confirm("Remove from library and mark as unread? It may be recommended again.")) return;
                                 setLibraryUpdateSaving(true);
-                                fetch(`${BACKEND_URL}/library/${encodeURIComponent(libraryEditingId)}`, { method: "DELETE" })
+                                backendFetch(`/library/${encodeURIComponent(libraryEditingId)}`, { method: "DELETE" })
                                   .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Delete failed"))))
                                   .then((data: { ok?: boolean }) => {
                                     if (data?.ok !== false) {
@@ -1576,7 +1586,7 @@ export const Personaplex = () => {
                                 onClick={() => {
                                   if (!libraryEditingId || libraryUpdateSaving) return;
                                   setLibraryUpdateSaving(true);
-                                  fetch(`${BACKEND_URL}/library/${encodeURIComponent(libraryEditingId)}`, {
+                                  backendFetch(`/library/${encodeURIComponent(libraryEditingId)}`, {
                                     method: "PATCH",
                                     headers: { "Content-Type": "application/json" },
                                     body: JSON.stringify({

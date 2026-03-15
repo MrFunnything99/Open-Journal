@@ -4,17 +4,19 @@ FastAPI backend for Open-Journal: /chat and /end-session.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -25,6 +27,8 @@ for name in (".env", ".env.local"):
     load_dotenv(Path.cwd() / name)
     load_dotenv(Path.cwd().parent / name)
 
+import jwt
+import vec_store
 from graph import build_graph, build_librarian_graph, JournalState
 from langchain_core.messages import HumanMessage
 from library import (
@@ -54,6 +58,33 @@ from library import (
     wipe_memory,
 )
 from google import genai
+
+# Auth: simple login (no email). JWT_SECRET required for register/login.
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+JWT_ALGORITHM = "HS256"
+JWT_EXP_DAYS = 30
+PBKDF2_ITERATIONS = 120_000
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ITERATIONS).hex()
+
+
+def _instance_id(request: Request) -> str:
+    """Instance ID = logged-in user id (from JWT) or X-Instance-ID header (anonymous)."""
+    auth = request.headers.get("Authorization") or ""
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token and JWT_SECRET:
+            try:
+                payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+                sub = payload.get("sub")
+                if sub is not None:
+                    return str(sub)
+            except jwt.InvalidTokenError:
+                pass
+    return (request.headers.get("X-Instance-ID") or "").strip()
+
 
 # In-memory session store (minimal for 1hr sprint; replace with Redis/DB later)
 sessions: dict[str, list] = {}
@@ -130,6 +161,22 @@ class ChatResponse(BaseModel):
     session_id: str
     retrieval_log: Optional[str] = None
     notes_saved: Optional[List[Dict[str, str]]] = None  # [{"item_id": "...", "note": "..."}]
+
+
+class AuthRegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user_id: int
+    username: str
 
 
 class EndSessionRequest(BaseModel):
@@ -332,19 +379,84 @@ class MemoryDiagramResponse(BaseModel):
     mermaid: str
 
 
+# --- Simple auth (no email): persistent data when logged in; anonymous data forgotten after 1h on client ---
+@app.post("/auth/register", response_model=AuthResponse)
+async def auth_register(req: AuthRegisterRequest):
+    """Register with username + password. No email. Returns JWT for persistent data."""
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="Auth not configured (set JWT_SECRET in .env)")
+    username = (req.username or "").strip().lower()
+    password = req.password or ""
+    if len(username) < 2:
+        raise HTTPException(status_code=400, detail="Username must be at least 2 characters")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    salt = secrets.token_hex(16)
+    password_hash = _hash_password(password, salt)
+    vec_store.ensure_db()
+    user_id = vec_store.auth_user_create(username, password_hash, salt)
+    if user_id is None:
+        raise HTTPException(status_code=409, detail="Username already taken")
+    exp = datetime.now(timezone.utc) + timedelta(days=JWT_EXP_DAYS)
+    token = jwt.encode(
+        {"sub": user_id, "username": username, "exp": exp},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+    return AuthResponse(token=token, user_id=user_id, username=username)
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+async def auth_login(req: AuthLoginRequest):
+    """Login with username + password. Returns JWT for persistent data."""
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="Auth not configured (set JWT_SECRET in .env)")
+    username = (req.username or "").strip().lower()
+    password = req.password or ""
+    vec_store.ensure_db()
+    user = vec_store.auth_user_get_by_username(username)
+    if not user or _hash_password(password, user["salt"]) != user["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    exp = datetime.now(timezone.utc) + timedelta(days=JWT_EXP_DAYS)
+    token = jwt.encode(
+        {"sub": user["id"], "username": user["username"], "exp": exp},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+    return AuthResponse(token=token, user_id=user["id"], username=user["username"])
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    """Return current user if valid JWT; 401 if anonymous or invalid."""
+    instance_id = _instance_id(request)
+    if not instance_id:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer ") or not JWT_SECRET:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    try:
+        payload = jwt.decode(auth[7:].strip(), JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return {"user_id": payload["sub"], "username": payload.get("username", "")}
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Not logged in")
+
+
 @app.get("/memory-diagram", response_model=MemoryDiagramResponse)
-async def memory_diagram():
+async def memory_diagram(request: Request):
     """
     Legacy endpoint for memory diagram; retained for compatibility but not used by Brain UI.
     """
-    gist_facts, episodic_summaries = get_memory_for_visualization()
+    instance_id = _instance_id(request)
+    gist_facts, episodic_summaries = get_memory_for_visualization(instance_id=instance_id)
     mermaid_code = generate_memory_mermaid(gist_facts, episodic_summaries)
     return MemoryDiagramResponse(mermaid=mermaid_code)
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
     """User sends text; Interviewer responds. State updated in memory. mode=recommendations uses library interview (books, notes)."""
+    instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     mode = (req.mode or "journal").strip().lower()
     if mode not in ("journal", "recommendations", "extreme", "therapy"):
@@ -355,7 +467,7 @@ async def chat(req: ChatRequest):
         _get_or_create_library_interview_session(session_id)
         messages = library_interview_sessions[session_id]
         try:
-            library_data = await asyncio.to_thread(list_consumed)
+            library_data = await asyncio.to_thread(list_consumed, 200, instance_id)
             books = library_data.get("books") or []
             library_items = [
                 {"id": b.get("id", ""), "title": b.get("title", "?"), "author": b.get("author") or "", "note": (b.get("note") or "").strip() or None}
@@ -413,6 +525,7 @@ async def chat(req: ChatRequest):
         "personalization": personalization,
         "intrusiveness": intrusiveness,
         "mode": mode,
+        "instance_id": instance_id,
     }
     try:
         result = await asyncio.wait_for(
@@ -508,8 +621,9 @@ async def library_interview(req: LibraryInterviewRequest):
 
 
 @app.post("/end-session", response_model=EndSessionResponse)
-async def end_session(req: EndSessionRequest):
+async def end_session(req: EndSessionRequest, request: Request):
     """Trigger Librarian: extract, embed, save to SQLite+sqlite-vec (and LightRAG when enabled)."""
+    instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     messages = sessions.get(session_id, [])
 
@@ -517,6 +631,7 @@ async def end_session(req: EndSessionRequest):
         "messages": messages,
         "session_id": session_id,
         "personalization": 1.0,
+        "instance_id": instance_id,
     }
     state = await asyncio.to_thread(librarian_graph.invoke, state)
     # Feed LightRAG in background so response returns fast
@@ -543,19 +658,20 @@ async def end_session(req: EndSessionRequest):
 
 
 @app.post("/ingest-history", response_model=IngestHistoryResponse)
-async def ingest_history(req: IngestHistoryRequest):
+async def ingest_history(req: IngestHistoryRequest, request: Request):
     """
     Ingest a prior journal text into SQLite+sqlite-vec and LightRAG.
     Treats `text` as a single-session transcript. LightRAG gets same summary+facts as vec_store.
     Returns 200 always (so CORS headers are sent); ok=False on failure.
     """
+    instance_id = _instance_id(request)
     session_id = req.session_id or f"import-{uuid.uuid4()}"
     try:
         text = (req.text or "").strip()
         if not text:
             return IngestHistoryResponse(ok=True, session_id=session_id)
         entry_date = (req.entry_date or "").strip() or None
-        extracted = await asyncio.to_thread(save_session_data, session_id, text, entry_date=entry_date)
+        extracted = await asyncio.to_thread(save_session_data, session_id, text, entry_date, instance_id)
         summary = extracted.get("summary") or ""
         facts = extracted.get("facts") or []
         if summary or facts:
@@ -736,10 +852,11 @@ async def memory_stats():
 
 
 @app.get("/memory/facts")
-async def get_memory_facts():
+async def get_memory_facts(request: Request):
     """List all gist facts with ids for Memory UI (view/edit/delete)."""
+    instance_id = _instance_id(request)
     try:
-        items = await asyncio.to_thread(list_memory_facts)
+        items = await asyncio.to_thread(list_memory_facts, instance_id)
         return {"facts": [MemoryItem(**x) for x in items]}
     except Exception as e:
         print("[backend] GET /memory/facts error:", e)
@@ -747,10 +864,11 @@ async def get_memory_facts():
 
 
 @app.get("/memory/summaries")
-async def get_memory_summaries():
+async def get_memory_summaries(request: Request):
     """List all episodic summaries with ids for Memory UI."""
+    instance_id = _instance_id(request)
     try:
-        items = await asyncio.to_thread(list_memory_summaries)
+        items = await asyncio.to_thread(list_memory_summaries, instance_id)
         return {"summaries": [MemoryItem(**x) for x in items]}
     except Exception as e:
         print("[backend] GET /memory/summaries error:", e)
@@ -804,10 +922,11 @@ async def delete_memory_summary_route(summary_id: int):
 
 
 @app.post("/memory/facts")
-async def create_memory_fact(req: MemoryFactCreate):
+async def create_memory_fact(req: MemoryFactCreate, request: Request):
     """Add a user-created fact; returns new id."""
+    instance_id = _instance_id(request)
     try:
-        fid = await asyncio.to_thread(add_memory_fact, req.document)
+        fid = await asyncio.to_thread(add_memory_fact, req.document, None, instance_id)
         return {"ok": fid is not None, "id": fid}
     except Exception as e:
         print("[backend] POST /memory/facts error:", e)
@@ -815,10 +934,11 @@ async def create_memory_fact(req: MemoryFactCreate):
 
 
 @app.post("/memory/summaries")
-async def create_memory_summary(req: MemorySummaryCreate):
+async def create_memory_summary(req: MemorySummaryCreate, request: Request):
     """Add a user-created summary; returns new id."""
+    instance_id = _instance_id(request)
     try:
-        sid = await asyncio.to_thread(add_memory_summary, req.document)
+        sid = await asyncio.to_thread(add_memory_summary, req.document, None, instance_id)
         return {"ok": sid is not None, "id": sid}
     except Exception as e:
         print("[backend] POST /memory/summaries error:", e)
@@ -1040,14 +1160,15 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
 RECOMMENDATIONS_TIMEOUT_SEC = 120
 
 @app.get("/recommendations", response_model=RecommendationsResponse)
-async def get_recommendations():
+async def get_recommendations(request: Request):
     """
     Generate personalized book, podcast, and article recommendations from journal memory
     and what the user has already consumed/liked. May take 30–90s; runs with a timeout to avoid connection resets.
     """
+    instance_id = _instance_id(request)
     try:
         data = await asyncio.wait_for(
-            asyncio.to_thread(generate_recommendations),
+            asyncio.to_thread(generate_recommendations, instance_id),
             timeout=RECOMMENDATIONS_TIMEOUT_SEC,
         )
     except asyncio.TimeoutError:
@@ -1075,16 +1196,17 @@ class CalendarDayResponse(BaseModel):
 
 
 @app.post("/calendar-day-summary", response_model=CalendarDayResponse)
-async def calendar_day_summary(req: CalendarDayRequest):
+async def calendar_day_summary(req: CalendarDayRequest, request: Request):
     """
     For a given date, combine raw journal transcript (if any) with DB memory for that day
     and return an AI-generated day summary/highlights.
     """
+    instance_id = _instance_id(request)
     date_iso = (req.date or "").strip()[:10]
     if not date_iso or len(date_iso) < 10:
         return CalendarDayResponse(summary="Please provide a valid date (YYYY-MM-DD).", has_journal=False)
     try:
-        episodic, gist = await asyncio.to_thread(get_memory_for_date, date_iso)
+        episodic, gist = await asyncio.to_thread(get_memory_for_date, date_iso, instance_id)
         summary = await asyncio.to_thread(
             generate_day_summary,
             date_iso,
@@ -1105,11 +1227,12 @@ async def calendar_day_summary(req: CalendarDayRequest):
 
 
 @app.post("/recommendations/consumed", response_model=ConsumedResponse)
-async def mark_consumed(req: ConsumedRequest):
+async def mark_consumed(req: ConsumedRequest, request: Request):
     """
     Record that the user has read/listened to a recommendation. Stored in the vector store
     so future recommendations avoid repeats and better match their tastes.
     """
+    instance_id = _instance_id(request)
     content_type = (req.type or "article").lower()
     if content_type not in ("book", "podcast", "article", "research"):
         content_type = "article"
@@ -1120,6 +1243,7 @@ async def mark_consumed(req: ConsumedRequest):
             author=req.author,
             url=req.url,
             liked=req.liked,
+            instance_id=instance_id,
         )
         return ConsumedResponse(ok=True)
     except Exception as e:
@@ -1128,12 +1252,13 @@ async def mark_consumed(req: ConsumedRequest):
 
 
 @app.get("/library")
-async def get_library():
+async def get_library(request: Request):
     """
     Return consumed items grouped by type for the Library UI.
     """
+    instance_id = _instance_id(request)
     try:
-        data = await asyncio.to_thread(list_consumed)
+        data = await asyncio.to_thread(list_consumed, 200, instance_id)
         return data
     except Exception as e:
         print("[backend] GET /library error:", e)
@@ -1141,17 +1266,20 @@ async def get_library():
 
 
 @app.patch("/library/{item_id}")
-async def update_library_item(item_id: str, req: LibraryItemUpdate):
+async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Request):
     """
     Update date_completed and/or note for a library item by id.
     """
+    instance_id = _instance_id(request)
     try:
-        ok = await asyncio.to_thread(
-            update_consumed,
-            item_id,
-            date_completed=req.date_completed,
-            note=req.note,
-        )
+        def _wrap():
+            return update_consumed(
+                item_id,
+                date_completed=req.date_completed,
+                note=req.note,
+                instance_id=instance_id,
+            )
+        ok = await asyncio.to_thread(_wrap)
         return {"ok": ok}
     except Exception as e:
         print("[backend] PATCH /library error:", e)
@@ -1159,12 +1287,13 @@ async def update_library_item(item_id: str, req: LibraryItemUpdate):
 
 
 @app.delete("/library/{item_id}")
-async def delete_library_item(item_id: str):
+async def delete_library_item(item_id: str, request: Request):
     """
     Remove a library item from the consumed collection.
     """
+    instance_id = _instance_id(request)
     try:
-        ok = await asyncio.to_thread(delete_consumed, item_id)
+        ok = await asyncio.to_thread(delete_consumed, item_id, instance_id)
         return {"ok": ok}
     except Exception as e:
         print("[backend] DELETE /library error:", e)
@@ -1172,16 +1301,17 @@ async def delete_library_item(item_id: str):
 
 
 @app.post("/library-notes", response_model=LibraryNoteResponse)
-async def library_notes(req: LibraryNoteRequest):
+async def library_notes(req: LibraryNoteRequest, request: Request):
     """
     Library helper endpoint: user can paste titles or notes about books, podcasts,
     articles, or research they've read. An agent organizes this into structured
     consumed items to improve future recommendations.
     """
+    instance_id = _instance_id(request)
     try:
         from library import process_library_note
 
-        count = await asyncio.to_thread(process_library_note, req.text, req.type)
+        count = await asyncio.to_thread(process_library_note, req.text, req.type, instance_id)
         return LibraryNoteResponse(ok=count > 0, items_added=count)
     except Exception as e:
         print("[backend] /library-notes error:", e)

@@ -22,7 +22,7 @@ from langgraph.graph.message import add_messages
 
 from library import get_relevant_context, save_session_data
 
-# State: list of messages + session_id for Librarian + personalization + intrusiveness + mode + optional retrieval log
+# State: list of messages + session_id for Librarian + personalization + intrusiveness + mode + optional retrieval log + instance_id
 class JournalState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     session_id: str
@@ -33,6 +33,7 @@ class JournalState(TypedDict):
     last_transcript: NotRequired[str]
     last_summary: NotRequired[str]
     last_facts: NotRequired[list]
+    instance_id: NotRequired[str]  # X-Instance-ID for per-device data isolation
 
 
 def _get_llm():
@@ -149,8 +150,9 @@ def interviewer_node(state: JournalState) -> JournalState:
         query = _last_user_text(state["messages"])
         if not query and state["messages"]:
             query = str(state["messages"][-1])[:500]
+        instance_id = state.get("instance_id") or ""
         try:
-            context = get_relevant_context(query, top_k_gist=10, top_k_episodic=6)
+            context = get_relevant_context(query, top_k_gist=10, top_k_episodic=6, instance_id=instance_id)
             system_parts.append("\n\nRelevant context from the user's journals (use only as broad inspiration; do not assert or invent details not explicitly stated):\n" + context)
             retrieval_log = context
         except Exception:
@@ -168,8 +170,9 @@ def interviewer_node(state: JournalState) -> JournalState:
 def librarian_node(state: JournalState) -> JournalState:
     """Background worker: extract, embed, save to SQLite+sqlite-vec (and optionally LightRAG)."""
     session_id = state.get("session_id", "default")
+    instance_id = state.get("instance_id") or ""
     transcript = _messages_to_transcript(state["messages"])
-    extracted = save_session_data(session_id, transcript)
+    extracted = save_session_data(session_id, transcript, instance_id=instance_id)
     return {
         "messages": [],
         "last_transcript": transcript,

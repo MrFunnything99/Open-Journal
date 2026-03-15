@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import mermaid from "mermaid";
-
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
+import { backendFetch } from "../../../backendApi";
 
 type MemoryDiagramProps = {
   onRefreshStats?: () => void;
@@ -54,7 +53,7 @@ export function MemoryDiagram({ onRefreshStats }: MemoryDiagramProps) {
     const currentId = ++renderIdRef.current;
 
     try {
-      const res = await fetch(`${BACKEND_URL}/memory-diagram`);
+      const res = await backendFetch("/memory-diagram");
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail ?? `Request failed (${res.status})`);
