@@ -35,8 +35,6 @@ export type UsePersonaplexSessionOptions = {
 
 import { backendFetch } from "../../../backendApi";
 
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
-
 export type TranscriptEntry = { role: "user" | "ai"; text: string; retrievalLog?: string };
 
 const CHAT_FETCH_TIMEOUT_MS = 90_000;
