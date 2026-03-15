@@ -51,7 +51,7 @@ import { Orb, OrbState } from "./components/Orb";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConnectButton } from "./components/ConnectButton";
 import { AuthButton, type AuthUser } from "./components/AuthButton";
-import { authMe, setStoredToken } from "../../backendApi";
+import { authMe } from "../../backendApi";
 import { JournalGallery } from "./components/JournalGallery";
 
 /** Default journaling assistant prompt (base; personalization is always \"high\" / memory-connected) */
@@ -118,6 +118,9 @@ export const Personaplex = () => {
   const [isIngesting, setIsIngesting] = useState(false);
   const [memoryStats, setMemoryStats] = useState<{ gist_facts_count: number; episodic_log_count: number } | null>(null);
   const [isWipingMemory, setIsWipingMemory] = useState(false);
+  type BackendSummary = { id: number; document: string; session_id: string; timestamp: string };
+  const [backendSummaries, setBackendSummaries] = useState<BackendSummary[] | null>(null);
+  const [backendSummariesLoading, setBackendSummariesLoading] = useState(false);
   const [showLiveTranscription, setShowLiveTranscription] = useState(true);
   type RecItem = { title: string; author?: string; reason?: string; url?: string };
   const [recommendations, setRecommendations] = useState<{ books: RecItem[]; podcasts: RecItem[]; articles: RecItem[]; research: RecItem[] }>({ books: [], podcasts: [], articles: [], research: [] });
@@ -192,7 +195,7 @@ export const Personaplex = () => {
   useEffect(() => {
     authMe()
       .then((u: { username: string; user_id: number } | null) => u && setAuthUser({ username: u.username, user_id: u.user_id }))
-      .catch(() => setStoredToken(null));
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -291,6 +294,26 @@ export const Personaplex = () => {
       fetchMemoryStats();
     }
   }, [view, fetchMemoryStats]);
+
+  const fetchBackendSummaries = useCallback(() => {
+    if (!authUser) return;
+    setBackendSummariesLoading(true);
+    backendFetch("/memory/summaries")
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
+      .then((data: { summaries?: BackendSummary[] }) => {
+        setBackendSummaries(data.summaries ?? []);
+      })
+      .catch(() => setBackendSummaries(null))
+      .finally(() => setBackendSummariesLoading(false));
+  }, [authUser]);
+
+  useEffect(() => {
+    if (view === "history" && authUser) {
+      fetchBackendSummaries();
+    } else if (!authUser) {
+      setBackendSummaries(null);
+    }
+  }, [view, authUser, fetchBackendSummaries]);
 
   const fetchRecommendations = useCallback((showLoadingUnlessCached = false) => {
     try {
@@ -473,13 +496,14 @@ export const Personaplex = () => {
       setToastMessage("Journal added to memory and saved to History.");
       setTimeout(() => setToastMessage(null), 5000);
       fetchMemoryStats();
+      fetchBackendSummaries();
     } catch (err) {
       setToastMessage(err instanceof Error ? err.message : "Failed to add to memory");
       setTimeout(() => setToastMessage(null), 4000);
     } finally {
       setIsIngesting(false);
     }
-  }, [priorJournalText, fetchMemoryStats, saveEntry]);
+  }, [priorJournalText, fetchMemoryStats, saveEntry, fetchBackendSummaries]);
 
   const handleWipeMemory = useCallback(() => {
     if (!window.confirm("Wipe all data from the vector DB? This cannot be undone. The AI will have no prior journal memory until you add entries again.")) return;
@@ -490,6 +514,7 @@ export const Personaplex = () => {
       })
       .then(() => {
         fetchMemoryStats();
+        fetchBackendSummaries();
         setToastMessage("Memory wiped.");
         setTimeout(() => setToastMessage(null), 3000);
       })
@@ -498,7 +523,7 @@ export const Personaplex = () => {
         setTimeout(() => setToastMessage(null), 4000);
       })
       .finally(() => setIsWipingMemory(false));
-  }, [fetchMemoryStats]);
+  }, [fetchMemoryStats, fetchBackendSummaries]);
 
   const {
     status,
@@ -771,6 +796,7 @@ export const Personaplex = () => {
               });
               const data = ingestRes.ok ? await ingestRes.json().catch(() => ({})) : { ok: false };
               fetchMemoryStats();
+              if (authUser) fetchBackendSummaries();
               setToastMessage(data?.ok === false ? "Imported journal, but syncing to memory failed." : "Imported journal and synced to memory.");
             } catch {
               setToastMessage("Imported journal, but syncing to memory failed.");
@@ -1189,6 +1215,42 @@ export const Personaplex = () => {
                   </div>
                 </div>
               </div>
+              {authUser && (
+                <div className="px-4 pt-2 pb-4 md:px-6">
+                  <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-2">
+                    Synced memory (all devices)
+                  </h3>
+                  {backendSummariesLoading ? (
+                    <p className="text-xs text-slate-500">Loading…</p>
+                  ) : backendSummaries && backendSummaries.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                      {[...backendSummaries]
+                        .sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""))
+                        .map((s) => {
+                          const dateStr =
+                            s.timestamp?.slice(0, 10) && !Number.isNaN(Date.parse(s.timestamp))
+                              ? (() => {
+                                  const d = new Date(s.timestamp);
+                                  return d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric" });
+                                })()
+                              : "—";
+                          const preview = (s.document || "").slice(0, 120) + ((s.document || "").length > 120 ? "…" : "");
+                          return (
+                            <div
+                              key={s.id}
+                              className="rounded-xl bg-slate-900/60 border border-slate-700/50 p-4 min-h-[120px]"
+                            >
+                              <p className="text-sm font-medium text-slate-300 tracking-wide mb-2">{dateStr}</p>
+                              <p className="text-sm text-slate-400 leading-relaxed line-clamp-3">{preview || "No preview"}</p>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-500">No synced memory yet. End a session while logged in to sync.</p>
+                  )}
+                </div>
+              )}
               <div className="flex-1 min-h-0">
                 <JournalGallery
                   entries={entries}

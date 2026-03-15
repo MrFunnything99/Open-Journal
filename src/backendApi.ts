@@ -98,7 +98,10 @@ export async function authMe(): Promise<{ user_id: number; username: string } | 
   const res = await fetch(`${BACKEND_URL}/auth/me`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    if (res.status === 401) setStoredToken(null);
+    return null;
+  }
   const data = await res.json().catch(() => null);
   return data;
 }

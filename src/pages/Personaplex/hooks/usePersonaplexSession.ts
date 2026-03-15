@@ -842,6 +842,15 @@ export const usePersonaplexSession = ({
 
   const disconnect = useCallback(() => {
     log("Disconnect");
+    const sessionId = backendSessionIdRef.current;
+    if (sessionId) {
+      backendFetch("/end-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      }).catch(() => {});
+      backendSessionIdRef.current = null;
+    }
     isConnectedRef.current = false;
     if (pendingManualCommitTimeoutRef.current) {
       clearTimeout(pendingManualCommitTimeoutRef.current);
