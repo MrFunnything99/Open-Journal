@@ -86,7 +86,8 @@ async def insert_text(text: str) -> bool:
         await rag.ainsert(text.strip())
         return True
     except Exception as e:
-        print("[backend] LightRAG ainsert error:", e)
+        if "history_messages" not in str(e):
+            print("[backend] LightRAG ainsert error:", e)
         return False
 
 

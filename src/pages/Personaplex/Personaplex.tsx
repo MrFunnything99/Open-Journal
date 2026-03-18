@@ -335,38 +335,52 @@ export const Personaplex = () => {
     }
   }, [view, authUser, fetchBackendSummaries]);
 
-  const fetchRecommendations = useCallback((showLoadingUnlessCached = false) => {
+  const fetchRecommendations = useCallback((showLoadingUnlessCached = false, retryCount = 0) => {
+    const doFetch = (isRetry: boolean) => {
+      const ac = new AbortController();
+      const timeoutId = setTimeout(() => ac.abort(), 125000);
+      backendFetch("/recommendations", { signal: ac.signal })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
+        .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
+          const next = {
+            books: data.books ?? [],
+            podcasts: data.podcasts ?? [],
+            articles: data.articles ?? [],
+            research: data.research ?? [],
+          };
+          setRecommendations(next);
+          try {
+            localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
+          } catch {
+            /* ignore */
+          }
+        })
+        .catch(() => {
+          if (!isRetry && retryCount < 1) {
+            setTimeout(() => fetchRecommendations(showLoadingUnlessCached, 1), 2500);
+            return;
+          }
+          setRecommendations({ books: [], podcasts: [], articles: [], research: [] });
+        })
+        .finally(() => {
+          clearTimeout(timeoutId);
+          setRecommendationsLoading(false);
+        });
+    };
+
     try {
       const cached = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
       if (cached && showLoadingUnlessCached) {
         const parsed = JSON.parse(cached) as { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] };
-          if (parsed && (parsed.books?.length || parsed.podcasts?.length || parsed.articles?.length || parsed.research?.length)) {
-            setRecommendations({
-              books: parsed.books ?? [],
-              podcasts: parsed.podcasts ?? [],
-              articles: parsed.articles ?? [],
-              research: parsed.research ?? [],
-            });
+        if (parsed && (parsed.books?.length || parsed.podcasts?.length || parsed.articles?.length || parsed.research?.length)) {
+          setRecommendations({
+            books: parsed.books ?? [],
+            podcasts: parsed.podcasts ?? [],
+            articles: parsed.articles ?? [],
+            research: parsed.research ?? [],
+          });
           setRecommendationsLoading(true);
-          const ac = new AbortController();
-          const timeoutId = setTimeout(() => ac.abort(), 125000);
-          backendFetch("/recommendations", { signal: ac.signal })
-            .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
-            .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
-              const next = {
-                books: data.books ?? [],
-                podcasts: data.podcasts ?? [],
-                articles: data.articles ?? [],
-                research: data.research ?? [],
-              };
-              setRecommendations(next);
-              localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
-            })
-            .catch(() => {})
-            .finally(() => {
-              clearTimeout(timeoutId);
-              setRecommendationsLoading(false);
-            });
+          doFetch(retryCount >= 1);
           return;
         }
       }
@@ -374,29 +388,7 @@ export const Personaplex = () => {
       /* ignore cache parse errors */
     }
     setRecommendationsLoading(true);
-    const ac = new AbortController();
-    const timeoutId = setTimeout(() => ac.abort(), 125000);
-    backendFetch("/recommendations", { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
-      .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
-        const next = {
-          books: data.books ?? [],
-          podcasts: data.podcasts ?? [],
-          articles: data.articles ?? [],
-          research: data.research ?? [],
-        };
-        setRecommendations(next);
-        try {
-          localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
-        } catch {
-          /* ignore */
-        }
-      })
-      .catch(() => setRecommendations({ books: [], podcasts: [], articles: [], research: [] }))
-      .finally(() => {
-        clearTimeout(timeoutId);
-        setRecommendationsLoading(false);
-      });
+    doFetch(retryCount >= 1);
   }, []);
 
   useEffect(() => {
@@ -2042,7 +2034,7 @@ export const Personaplex = () => {
         <div className="pt-1">
           <p className="text-[10px] text-slate-600 flex items-center justify-center gap-2 flex-wrap">
             <a
-              href="https://github.com/MrFunnything99/Selfmeridian"
+              href="https://github.com/MrFunnything99/Open-Journal"
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1 text-slate-500 hover:text-violet-400 transition-colors"
