@@ -1,4 +1,4 @@
-# Open-Journal Python Backend
+# Selfmeridian Python Backend
 
 Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** for vector memory and **LightRAG** for knowledge-graph RAG.
 
@@ -64,7 +64,7 @@ On macOS, the system Python SQLite may not support extensions; install `pysqlite
 **Deploy from repo root** (not from `backend/`):
 
 ```bash
-cd /path/to/Open-Journal
+cd /path/to/Selfmeridian
 fly deploy
 ```
 

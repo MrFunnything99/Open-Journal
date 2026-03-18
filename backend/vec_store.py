@@ -1,5 +1,5 @@
 """
-SQLite + sqlite-vec storage for Open-Journal: gist_facts, episodic_log, consumed_content.
+SQLite + sqlite-vec storage for Selfmeridian: gist_facts, episodic_log, consumed_content.
 Replaces ChromaDB with a single SQLite DB and vec0 virtual tables for vector search.
 """
 from __future__ import annotations

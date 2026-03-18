@@ -16,6 +16,6 @@ body:
     attributes:
       label: Question
       description: What is your question?
-      placeholder: Your question about OpenJournal.
+      placeholder: Your question about Selfmeridian.
     validations:
       required: true

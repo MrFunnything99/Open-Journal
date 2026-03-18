@@ -1,5 +1,5 @@
 """
-LightRAG bridge for Open-Journal: index journal content and run RAG queries (hybrid/local/global).
+LightRAG bridge for Selfmeridian: index journal content and run RAG queries (hybrid/local/global).
 Uses the same Gemini embedding and LLM as the rest of the app. Data is stored under data/lightrag/.
 """
 from __future__ import annotations

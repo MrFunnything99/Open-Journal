@@ -1,4 +1,4 @@
-# OpenJournal
+# Selfmeridian
 
 A lightweight AI voice journaling application. Speak naturally to an AI assistant that guides self-reflection through probing questions. Includes memory (facts & summaries), a people graph, recommendations (books, podcasts, articles), and calendar day summaries. Voice uses ElevenLabs; the journaling agent and memory use a Python backend (Gemini, Grok, SQLite + vector store).
 

@@ -1,5 +1,5 @@
-# Fly.io app: monolith (FastAPI + built React frontend).
-# Deploy from repo root:  cd /path/to/Open-Journal  &&  fly deploy
+# Fly.io app: monolith (FastAPI + built React frontend) for Selfmeridian.
+# Deploy from repo root:  cd /path/to/Selfmeridian  &&  fly deploy
 # See https://fly.io/docs/reference/configuration/
 
 app = "backend-cold-meadow-9174"

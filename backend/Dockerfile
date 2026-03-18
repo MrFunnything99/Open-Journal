@@ -36,4 +36,6 @@ COPY backend/ .
 COPY --from=frontend-build /app/dist ./static
 
 ENV PORT=8080
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Fly.io will set PORT; default to 8080 if not provided.
+# Use a shell entrypoint so uvicorn reads the runtime PORT value.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

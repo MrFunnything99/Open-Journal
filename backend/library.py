@@ -1,5 +1,5 @@
 """
-Library for Open-Journal: gist_facts (semantic) and episodic_log (episodic) memory,
+Library for Selfmeridian: gist_facts (semantic) and episodic_log (episodic) memory,
 and consumed_content (library). Uses SQLite + sqlite-vec for vector storage.
 """
 from __future__ import annotations
@@ -1762,7 +1762,7 @@ def _semantic_scholar_search_papers(
         query_str = q.strip()
         params = urllib.parse.urlencode({"query": query_str, "limit": max_per_query, "fields": fields})
         url = f"{base}?{params}"
-        headers = {"User-Agent": "OpenJournal/1.0 (research recommendations)"}
+        headers = {"User-Agent": "Selfmeridian/1.0 (research recommendations)"}
         if api_key:
             headers["x-api-key"] = api_key
         try:
@@ -1823,7 +1823,7 @@ def _pmc_pubmed_search_papers(
 
     base_esearch = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     base_efetch = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-    common = {"tool": "OpenJournal", "email": "research@openjournal.app"}
+    common = {"tool": "Selfmeridian", "email": "research@selfmeridian.com"}
     seen_urls: set[str] = set()
     out: list[dict] = []
     for q in queries:
@@ -1833,7 +1833,7 @@ def _pmc_pubmed_search_papers(
         try:
             params_esearch = {**common, "db": "pubmed", "term": query_str, "retmax": max_per_query, "retmode": "json"}
             url_esearch = base_esearch + "?" + urllib.parse.urlencode(params_esearch)
-            req = urllib.request.Request(url_esearch, headers={"User-Agent": "OpenJournal/1.0"})
+            req = urllib.request.Request(url_esearch, headers={"User-Agent": "Selfmeridian/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
         except Exception as e:
@@ -1850,7 +1850,7 @@ def _pmc_pubmed_search_papers(
         try:
             params_efetch = {**common, "db": "pubmed", "id": ids_str, "retmode": "xml"}
             url_efetch = base_efetch + "?" + urllib.parse.urlencode(params_efetch)
-            req = urllib.request.Request(url_efetch, headers={"User-Agent": "OpenJournal/1.0"})
+            req = urllib.request.Request(url_efetch, headers={"User-Agent": "Selfmeridian/1.0"})
             with urllib.request.urlopen(req, timeout=12) as resp:
                 root = ET.fromstring(resp.read())
         except Exception as e:

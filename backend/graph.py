@@ -1,5 +1,5 @@
 """
-LangGraph for Open-Journal: Interviewer (chat) and Librarian (end-session).
+LangGraph for Selfmeridian: Interviewer (chat) and Librarian (end-session).
 """
 from __future__ import annotations
 

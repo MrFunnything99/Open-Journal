@@ -745,7 +745,7 @@ export const Personaplex = () => {
 
           if (lowerName.endsWith(".json")) {
             const parsed = JSON.parse(text) as unknown;
-            if (!isExportPayload(parsed)) throw new Error("Not a valid OpenJournal export file");
+            if (!isExportPayload(parsed)) throw new Error("Not a valid Selfmeridian export file");
             const count = importEntriesFromExport(parsed);
             if (count === 0) {
               setToastMessage("No valid entries in file.");
@@ -849,7 +849,7 @@ export const Personaplex = () => {
       <header className="flex-none relative z-10 grid grid-cols-[1fr_auto_1fr] items-center gap-2 px-4 sm:px-6 py-3 sm:py-4">
         <div className="flex items-center gap-2 sm:gap-4 min-w-0">
           <h1 className="text-base sm:text-xl font-light tracking-widest text-slate-300 uppercase truncate">
-            OpenJournal
+            Selfmeridian
           </h1>
           <ConnectionStatus status={status} />
           {errorMessage && (
@@ -2009,7 +2009,7 @@ export const Personaplex = () => {
         <div className="pt-1">
           <p className="text-[10px] text-slate-600 flex items-center justify-center gap-2 flex-wrap">
             <a
-              href="https://github.com/MrFunnything99/Open-Journal"
+              href="https://github.com/MrFunnything99/Selfmeridian"
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1 text-slate-500 hover:text-violet-400 transition-colors"

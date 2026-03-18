@@ -1,5 +1,5 @@
 """
-FastAPI backend for Open-Journal: /chat and /end-session.
+FastAPI backend for Selfmeridian: /chat and /end-session.
 """
 from __future__ import annotations
 
@@ -141,7 +141,7 @@ async def lifespan(app: FastAPI):
     pass
 
 
-app = FastAPI(title="Open-Journal Backend", lifespan=lifespan)
+app = FastAPI(title="Selfmeridian Backend", lifespan=lifespan)
 # Explicit origins so CORS works with credentials; "*" cannot be used when credentials=True
 _extra_origins = [s.strip() for s in os.getenv("CORS_ORIGINS", "").split(",") if s.strip()]
 _cors_origins = [

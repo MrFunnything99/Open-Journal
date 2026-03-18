@@ -837,7 +837,7 @@ export const usePersonaplexSession = ({
     }
 
     setStatus("connected");
-    speak("Hello, I am your OpenJournal assistant. How can I help you?");
+    speak("Hello, I am your Selfmeridian assistant. How can I help you?");
   }, [speak]);
 
   const disconnect = useCallback(() => {
