@@ -1,114 +1,207 @@
 # Selfmeridian
 
-A lightweight AI voice journaling application. Speak naturally to an AI assistant that guides self-reflection through probing questions. Includes memory (facts & summaries), a people graph, recommendations (books, podcasts, articles), and calendar day summaries. Voice uses ElevenLabs; the journaling agent and memory use a Python backend (Gemini, Grok, SQLite + vector store).
+Selfmeridian is an AI journaling app that lets someone talk, type, or upload past journal entries and turn them into searchable memory, personalized recommendations, and long-term reflection tools.
+
+It is designed to work as both:
+
+- a clear introduction to what the app does and why it is built this way
+- a practical reference for architecture, data flow, environment variables, and deployment
 
 **By:** John S., Sherelle M., Aniyah T., Dominique S., Andy C., Jackeline G.
 
 ---
 
-## Features
+## What This App Does
 
-- **Voice journaling** — Real-time speech-to-text (ElevenLabs Scribe v2) and text-to-speech. Say "Start" or "Hi" to begin; the agent asks reflective questions and remembers context.
-- **Session modes** — Journal (default), Recommendations (talk about books/media and save notes), Extreme (more probing), Therapy.
-- **Memory** — Facts and session summaries stored in a vector DB; editable in the Memory tab. Optional LightRAG knowledge graph.
-- **People graph** — View and edit people and relationships extracted from journal entries; auto-grouping and thoughts.
-- **Recommendations** — AI-suggested books, podcasts, articles, and research; mark as consumed and add notes. Podcast links via Listen Notes (optional).
-- **Library** — Your saved books/media; library interview to populate, and notes tied to recommendations.
-- **Calendar** — Browse by month; get an AI-generated day summary for a selected date.
-- **Journal history & ingest** — Paste or upload past journal entries; optional date inference and ingest into history/memory.
+At a high level, Selfmeridian helps a user:
+
+1. Talk to an AI journaling assistant.
+2. Save that conversation in local history.
+3. Extract useful memory from the journal entry.
+4. Use that memory later for better conversations and recommendations.
+
+### In plain English
+
+Think of the app as three systems working together:
+
+- **Conversation system**: lets the user talk or type to the AI.
+- **Memory system**: pulls out important facts, topics, people, and summaries from journal entries.
+- **Recommendation system**: uses what the user has journaled about to suggest books, podcasts, articles, and research papers.
+
+The goal is not just "chat with an AI." The goal is to build a journal that becomes more useful over time.
+
+---
+
+## How To Read This README
+
+If you want a fast conceptual overview, start with:
+
+- `What This App Does`
+- `How It Works`
+- `Quick Start`
+- `Common Workflows`
+
+If you want the implementation and deployment details, jump to:
+
+- `Architecture`
+- `Project Structure`
+- `Environment Variables`
+- `Backend API`
+- `Deployment on Fly.io`
+
+---
+
+## Core Features
+
+- **Voice journaling**: Speak naturally using ElevenLabs speech-to-text and text-to-speech.
+- **Text journaling**: Type messages directly to the AI assistant.
+- **Automatic memory sync**: Journal entries in History are synced to backend memory so recommendations and later chats can use them.
+- **Memory view**: Inspect or edit stored facts and summaries.
+- **People graph**: Extract and visualize relationships and recurring people from journals.
+- **Recommendations**: Generate book, podcast, article, and research suggestions based on journal content and consumed items. You can record what you’ve read or listened to (and whether you liked it) either by talking about it in the Recommendations session mode or by marking items as consumed in the UI; that feedback is stored and used to improve future suggestions.
+- **Library**: Track what you’ve consumed and add notes; the recommendation engine uses this to avoid repeats and to better match your tastes. Richer feedback (via the interviewer or manually) leads to more personalized results—and there’s room to explore more sophisticated personalization algorithms in future versions.
+- **Calendar summaries**: Generate a summary for a specific day from journal history and stored memory.
+- **Import / export**: Upload old journals or download the journal archive.
+- **Optional login**: The app can be used without an account, but users can also log in for account-based persistence.
+
+---
+
+## How It Works
+
+### Plain-language overview
+
+When a user journals:
+
+1. The browser records what they said or typed.
+2. The AI responds.
+3. The transcript is saved in the History tab.
+4. The backend tries to extract:
+   - key facts
+   - important events
+   - people
+   - topics
+   - emotions
+   - a compact summary
+5. That extracted data is stored in a SQLite database with vector search.
+6. Later, the app uses that stored memory to personalize chat and recommendations.
+
+### System diagram
+
+```mermaid
+flowchart LR
+    U[User] --> FE[React Frontend]
+    FE --> VOICE[ElevenLabs Voice APIs]
+    FE --> API[FastAPI Backend]
+    API --> CHAT[Grok / XAI for chat]
+    API --> GEM[Gemini for memory extraction and embeddings]
+    API --> DB[(SQLite + sqlite-vec)]
+    API --> REC[Recommendations Engine]
+    DB --> REC
+    DB --> API
+    API --> FE
+```
+
+### Journal-to-memory flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Frontend
+    participant Backend
+    participant Gemini
+    participant DB as SQLite+vec
+
+    User->>Frontend: Speak / type / upload journal
+    Frontend->>Backend: /api/chat or /api/ingest-history
+    Backend->>Gemini: Extract summary, facts, topics, people
+    Gemini-->>Backend: Structured output
+    Backend->>DB: Save summary + facts + metadata
+    Frontend->>Backend: /api/recommendations
+    Backend->>DB: Retrieve memory context
+    Backend-->>Frontend: Personalized recommendations
+```
 
 ---
 
 ## Tech Stack
 
-| Layer | Technologies |
-|-------|--------------|
-| **Frontend** | React 18, Vite, Tailwind CSS, React Router |
-| **Voice** | ElevenLabs TTS + Realtime Speech-to-Text (Scribe v2) |
-| **Node API** (voice/interview/reformat) | TypeScript serverless-style routes (`api/*`), run locally via `scripts/api-server.ts` or Vercel serverless |
-| **Backend** | Python 3, FastAPI, LangGraph, SQLite + sqlite-vec, LightRAG (optional), Gemini (embeddings, memory, date inference), Grok/XAI (chat) |
+| Layer | Main Tools | What It Does |
+|---|---|---|
+| Frontend | React, Vite, Tailwind, React Router | UI, session controls, history, memory, recommendations |
+| Voice | ElevenLabs | Speech-to-text and text-to-speech |
+| Main backend | FastAPI, LangGraph | Chat routes, memory sync, recommendations, auth, ingest |
+| Memory layer | SQLite, sqlite-vec | Persistent journal memory and vector search |
+| AI models | Gemini, Grok/XAI | Gemini for extraction/embeddings; Grok for conversational chat |
+| Optional extras | LightRAG, Tavily, Semantic Scholar, Listen Notes | RAG, web/news search, paper lookup, podcast links |
 
----
+### Important note about OpenRouter
 
-## Project Structure
+OpenRouter is **not the main path** for this project right now.
 
-```
-├── api/                    # Node API routes (Vercel serverless or dev proxy)
-│   ├── interviewer.ts      # OpenRouter LLM for interviewer flow
-│   ├── voice.ts            # ElevenLabs TTS
-│   ├── voices.ts           # List voices
-│   ├── scribe-token.ts     # ElevenLabs Scribe token for real-time STT
-│   ├── transcribe.ts       # Transcription
-│   └── reformat.ts         # Journal reformat
-├── backend/                # Python FastAPI backend (chat, memory, recommendations, etc.)
-│   ├── main.py             # Routes and app
-│   ├── graph.py            # LangGraph chat/librarian
-│   ├── library.py          # Memory, recommendations, library, LightRAG
-│   ├── vec_store.py        # SQLite + sqlite-vec
-│   ├── lightrag_bridge.py  # LightRAG integration
-│   ├── requirements.txt
-│   ├── Dockerfile
-│   └── fly.toml            # Fly.io deployment
-├── scripts/
-│   └── api-server.ts       # Local dev server for /api/* (interviewer, voice, etc.)
-├── src/
-│   ├── app.tsx
-│   ├── pages/
-│   │   └── Personaplex/     # Main UI (orb, settings, session, history, memory, recommendations, calendar)
-│   └── ...
-├── public/
-├── .env.example
-├── package.json
-├── vite.config.ts
-└── vercel.json             # Frontend deploy (Vercel)
-```
+- The current main app flow uses:
+  - **Gemini** for embeddings, memory extraction, and some supporting tasks
+  - **Grok/XAI** for the core journaling chat experience
+- There are still some older or convenience-oriented Node routes in the repo where a developer could choose to use OpenRouter if they want to experiment locally.
+- If you are just running or deploying the main app, think of **Gemini + Grok** as the primary setup.
 
 ---
 
 ## Quick Start
 
-### 1. Install dependencies
+### What you need
+
+- **Node.js 18+**
+- **Python 3.11 recommended**
+- API keys for:
+  - `GEMINI_API_KEY`
+  - `XAI_API_KEY`
+  - `ELEVENLABS_API_KEY`
+
+Python 3.11 is strongly recommended because some optional libraries are awkward on Python 3.9.
+
+### 1. Install frontend dependencies
+
+From the project root:
 
 ```bash
 npm install
 ```
 
-### 2. Configure environment
+### 2. Create your environment file
 
-Copy `.env.example` to `.env` in the project root and set:
+Copy `.env.example` to `.env` in the project root.
 
-**Required for voice and Node API (interviewer/reformat):**
+Minimum useful setup:
 
-- `OPENROUTER_API_KEY` — [OpenRouter](https://openrouter.ai/keys) (for interviewer/reformat if used via Node)
-- `ELEVENLABS_API_KEY` — [ElevenLabs](https://elevenlabs.io/app/settings/api-keys) (TTS + Scribe)
+```env
+GEMINI_API_KEY=your_gemini_key
+XAI_API_KEY=your_xai_key
+ELEVENLABS_API_KEY=your_elevenlabs_key
+```
 
-**Required for Python backend (chat, memory, recommendations):**
+If you want login support:
 
-- `GEMINI_API_KEY` — Embeddings, memory extraction, date inference
-- `XAI_API_KEY` — Grok for `/chat` interviewer
+```env
+JWT_SECRET=some_long_random_secret
+```
 
-**Optional:**
+### 3. Start the Python backend
 
-- `VITE_BACKEND_URL` — Python backend URL (default `http://localhost:8000`). Set to your Fly backend URL in production.
-- `API_PORT`, `VITE_API_URL` — If port 3001 is in use (e.g. `API_PORT=3002`, `VITE_API_URL=http://localhost:3002`)
-- `LISTENNOTES_API_KEY` — Podcast episode links in recommendations
-- `CORS_ORIGINS` — Comma-separated origins for the Python backend (production); default list includes common dev and one Vercel URL
-
-### 3. Run the Python backend
+From `backend/`:
 
 ```bash
-cd backend
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
-# Optional: on macOS if sqlite-vec fails, use: pip install pysqlite3
 .venv/bin/python -m uvicorn main:app --reload --port 8000
 ```
 
-- API: http://localhost:8000  
-- Docs: http://localhost:8000/docs  
+Useful URLs:
 
-### 4. Run the frontend and Node API (dev)
+- API: `http://localhost:8000`
+- API docs: `http://localhost:8000/docs`
+
+### 4. Start the frontend
 
 In a second terminal from the project root:
 
@@ -116,86 +209,319 @@ In a second terminal from the project root:
 npm run dev
 ```
 
-This starts:
+Then open:
 
-- **Vite** on port 5173 (proxies `/api` to the Node API server)
-- **Node API server** on port 3001 (serves `/api/interviewer`, `/api/voice`, `/api/voices`, `/api/scribe-token`, `/api/transcribe`, `/api/reformat`)
+`http://localhost:5173`
 
-Open http://localhost:5173. The app will use:
+### 5. Start journaling
 
-- `http://localhost:8000` for chat, memory, recommendations, library, calendar, ingest (Python backend)
-- `http://localhost:3001/api/*` for voice and interviewer (via Vite proxy)
+Once the frontend and backend are running:
 
-### 5. Build for production
+1. Open the app.
+2. Connect or type.
+3. Journal normally.
+4. Open History or Recommendations.
 
-```bash
-npm run build
+The app should sync unsynced history into backend memory automatically.
+
+---
+
+## Common Workflows
+
+### A. Voice journaling
+
+1. The user clicks connect.
+2. The frontend gets a temporary speech token.
+3. Speech is transcribed.
+4. The backend generates a response.
+5. The transcript is added to History.
+6. The transcript is synced to memory.
+
+### B. Uploading old journal entries
+
+1. The user uploads a text or JSON file.
+2. The app saves it into History.
+3. The backend ingests it into the vector store.
+4. Recommendations and later chats can use it.
+
+### C. Personalized recommendations
+
+1. The frontend makes sure History is synced.
+2. The backend reads memory from SQLite.
+3. The recommendation engine builds queries based on the user's themes and on **consumed-media feedback** (what you’ve marked as read/listened to and whether you liked it).
+4. The app returns books, podcasts, articles, and research papers.
+
+You can give that feedback in two ways: by talking about books and media in the **Recommendations** session mode (the interviewer records what you’ve consumed and your reactions) or by **manually** marking recommendations as consumed and liking/disliking them. The more you use either path, the better the suggestions get. This is also a promising area for future work—e.g. richer personalization, diversity, and exploration algorithms.
+
+---
+
+## Architecture
+
+### High-level view
+
+Selfmeridian is a **monolith on Fly.io**:
+
+- FastAPI serves the API
+- FastAPI also serves the built React frontend
+- SQLite stores persistent memory
+- The app uses same-origin `/api` requests in production
+
+### Monolith deployment diagram
+
+```mermaid
+flowchart TD
+    Browser --> Fly[Fly.io App]
+    Fly --> FastAPI[FastAPI server]
+    FastAPI --> Static[Built React frontend]
+    FastAPI --> Routes[/API routes/]
+    Routes --> SQLite[(SQLite + sqlite-vec)]
+    Routes --> Gemini[Gemini APIs]
+    Routes --> Grok[Grok / XAI API]
+    Routes --> ElevenLabs[ElevenLabs API]
 ```
 
-Output is in `dist/`. Preview with `npm run preview`.
+### Key architectural ideas
+
+- **History and memory are different**:
+  - History is the transcript the user sees in the browser.
+  - Memory is the extracted, compressed information the backend saves for later use.
+- **Personalization comes from memory**, not raw history cards.
+- **Anonymous mode is supported**:
+  - If the user is not logged in, the app uses an instance ID.
+  - If the user logs in, account-based persistence can be used.
 
 ---
 
-## Environment Variables Reference
+## Project Structure
 
-| Variable | Where | Purpose |
-|----------|--------|--------|
-| `OPENROUTER_API_KEY` | Root `.env` | OpenRouter for Node interviewer/reformat |
-| `ELEVENLABS_API_KEY` | Root `.env` | ElevenLabs TTS + Scribe |
-| `XAI_API_KEY` | Root `.env` | Grok for Python `/chat` |
-| `GEMINI_API_KEY` | Root `.env` (or backend) | Gemini for embeddings, memory, date inference |
-| `VITE_BACKEND_URL` | Root `.env` (build-time) | Python backend URL (e.g. Fly); default `http://localhost:8000` |
-| `API_PORT` | Root `.env` | Node API server port (default 3001) |
-| `VITE_API_URL` | Root `.env` | URL for Vite proxy to Node API (default `http://localhost:3001`) |
-| `LISTENNOTES_API_KEY` | Root `.env` | Optional; podcast links in recommendations |
-| `CORS_ORIGINS` | Backend (e.g. Fly secrets) | Allowed CORS origins for backend (comma-separated) |
-| `GEMINI_CHAT_MODEL` | Backend | Optional; default used for some backend tasks |
-| `GEMINI_INFER_ENTRY_DATE_MODEL` | Backend | Optional; model for `/infer-entry-date` (default `gemini-3.1-flash-lite-preview`) |
+```text
+.
+├── src/
+│   ├── app.tsx
+│   └── pages/Personaplex/
+│       ├── Personaplex.tsx
+│       ├── components/
+│       ├── hooks/
+│       └── utils/
+├── backend/
+│   ├── main.py
+│   ├── auth.py
+│   ├── graph.py
+│   ├── library.py
+│   ├── vec_store.py
+│   ├── lightrag_bridge.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── api/
+│   ├── voice.ts
+│   ├── voices.ts
+│   ├── scribe-token.ts
+│   ├── transcribe.ts
+│   └── reformat.ts
+├── scripts/
+│   └── api-server.ts
+├── public/
+├── .env.example
+├── fly.toml
+├── package.json
+└── README.md
+```
+
+### What the main files do
+
+- `src/pages/Personaplex/Personaplex.tsx`
+  - Main UI, recommendations, history, memory tab behavior
+- `src/pages/Personaplex/hooks/usePersonaplexSession.ts`
+  - Live session handling for conversation and voice
+- `src/pages/Personaplex/hooks/useJournalHistory.ts`
+  - Browser-side journal history and sync tracking
+- `backend/main.py`
+  - FastAPI routes and deployment entrypoint
+- `backend/graph.py`
+  - LangGraph conversation/librarian flow
+- `backend/library.py`
+  - Extraction, memory logic, and recommendation helpers
+- `backend/vec_store.py`
+  - SQLite + vector DB storage layer
+
+More backend-only detail (run, endpoints, Fly volume) is in **`backend/README.md`**.
 
 ---
 
-## Deployment
+## Environment Variables
 
-### Frontend (Vercel)
+### Required for the main app
 
-- **Root directory:** `.` (project root)
-- **Build:** `npm run build`  
-- **Output:** `dist`
-- **Environment variables:** Set `VITE_BACKEND_URL` to your Python backend URL (e.g. `https://your-app.fly.dev`). Also set `OPENROUTER_API_KEY` and `ELEVENLABS_API_KEY` if your Vercel app serves the `/api` routes (interviewer, voice, etc.).
-- **Rewrites:** `vercel.json` sends non-`/api` traffic to `index.html` for SPA routing.
+| Variable | Purpose |
+|---|---|
+| `GEMINI_API_KEY` | Memory extraction, embeddings, date inference |
+| `XAI_API_KEY` | Grok chat model for `/api/chat` |
+| `ELEVENLABS_API_KEY` | Voice transcription and voice playback |
 
-### Backend (Fly.io)
+### Common optional variables
 
-- From `backend/`: `fly launch` (if not already), then `fly deploy`.
-- Set secrets, e.g.:  
-  `fly secrets set GEMINI_API_KEY=... XAI_API_KEY=...`  
-  Optionally: `fly secrets set CORS_ORIGINS="https://your-vercel-app.vercel.app"`
-- The app listens on port 8080 (see `fly.toml`). Docs: `https://your-app.fly.dev/docs`.
+| Variable | Purpose |
+|---|---|
+| `JWT_SECRET` | Enables login / refresh-token auth |
+| `GEMINI_CHAT_MODEL` | Override backend Gemini model for helper tasks |
+| `GEMINI_EMBEDDING_MODEL` | Override embedding model |
+| `EMBEDDING_DIM` | Must match the embedding model output size |
+| `LIGHTRAG_ENABLED` | Turn LightRAG on or off |
+| `VECTOR_DB_PATH` | SQLite DB path, especially important in production |
+| `TAVILY_API_KEY` | Better article/news recommendations |
+| `SEMANTIC_SCHOLAR_API_KEY` | Better research paper recommendations |
+| `LISTENNOTES_API_KEY` | Podcast link enrichment |
+
+### Legacy / convenience variables
+
+| Variable | Purpose |
+|---|---|
+| `OPENROUTER_API_KEY` | Optional for older local Node routes or experiments; not the main production path |
+| `API_PORT` | Local Node API dev port |
+| `VITE_API_URL` | Local proxy target |
+| `VITE_BACKEND_URL` | Frontend build-time backend URL if needed |
 
 ---
 
 ## Backend API Overview
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/chat` | Send user text; get interviewer response (Grok) with memory context |
-| POST | `/end-session` | End session; librarian extracts and saves to memory |
-| POST | `/ingest-history` | Ingest past journal text (optional date inference) |
-| POST | `/infer-entry-date` | Infer date from entry text (and optional filename) |
-| GET | `/memory-stats` | Vector store stats |
-| GET/POST/DELETE | `/memory/facts`, `/memory/summaries` | List, create, delete memory facts/summaries |
-| GET | `/memory-diagram` | Mermaid diagram of memory |
-| POST | `/memory-wipe` | Wipe vector memory |
-| GET | `/brain/people-graph`, `/brain/people`, `/brain/people/{id}` | People graph and CRUD |
-| POST | `/brain/people/auto-groups` | Auto-group people |
-| GET | `/recommendations` | Books, podcasts, articles, research suggestions |
-| POST | `/recommendations/consumed` | Mark items consumed, add notes |
-| GET/POST/DELETE | `/library` | Library items |
-| POST | `/library-notes` | Save notes for library/recommendations |
-| POST | `/library-interview` | Conversational library interview |
-| POST | `/calendar-day-summary` | Day summary for a given date |
-| GET | `/lightrag-context` | Optional RAG context (LightRAG) |
-| GET | `/health` | Health check |
+### Core routes
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/chat` | Main journaling conversation |
+| `POST` | `/api/end-session` | Extract and save memory from the active session |
+| `POST` | `/api/ingest-history` | Import past journal text into memory |
+| `POST` | `/api/infer-entry-date` | Guess the date of an imported journal |
+| `GET` | `/api/memory-stats` | Quick memory counts |
+| `GET` | `/api/recommendations` | Personalized content recommendations |
+| `POST` | `/api/recommendations/consumed` | Mark recommended content as consumed |
+| `GET` | `/api/library` | Read stored library items |
+| `POST` | `/api/library-notes` | Save notes about books/media |
+| `POST` | `/api/calendar-day-summary` | Generate a day summary |
+| `GET` | `/api/health` | Health check |
+
+### Memory editing routes
+
+| Method | Path |
+|---|---|
+| `GET` | `/api/memory/facts` |
+| `GET` | `/api/memory/summaries` |
+| `POST` | `/api/memory/facts` |
+| `POST` | `/api/memory/summaries` |
+| `PATCH` | `/api/memory/facts/{id}` |
+| `PATCH` | `/api/memory/summaries/{id}` |
+| `DELETE` | `/api/memory/facts/{id}` |
+| `DELETE` | `/api/memory/summaries/{id}` |
+
+### Auth routes
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/register` | Register with email or username |
+| `POST` | `/api/login` | Login |
+| `POST` | `/api/refresh` | Refresh access token |
+| `POST` | `/api/logout` | Clear refresh cookie |
+| `GET` | `/api/me` | Current user |
+
+---
+
+## Deployment on Fly.io
+
+Selfmeridian is deployed as a single app on Fly.io.
+
+### Why this matters
+
+That means:
+
+- one deploy target
+- one domain
+- no frontend/backend CORS setup in production
+- FastAPI serves both API and built frontend
+
+### Deploy
+
+From the project root:
+
+```bash
+fly deploy
+```
+
+### Important production settings
+
+- The app must listen on `0.0.0.0`
+- The app should use Fly's `PORT` env var
+- SQLite should use a mounted volume in production
+
+### Persistent memory on Fly
+
+Fly containers are ephemeral by default, so the SQLite database must live on a volume.
+
+Create the volume:
+
+```bash
+fly volumes create data --size 1 --region iad
+```
+
+Set the DB path:
+
+```bash
+fly secrets set VECTOR_DB_PATH=/data/open_journal.db
+```
+
+Then redeploy:
+
+```bash
+fly deploy
+```
+
+---
+
+## Troubleshooting
+
+| Issue | What to check |
+|-------|----------------|
+| **Recommendations feel generic** | Entries may be in History but not yet synced to backend memory. Open the Recommendations tab (sync runs automatically), or ensure `VECTOR_DB_PATH` is set and persistent (e.g. Fly volume). |
+| **Memory stats stay at 0** | Backend needs `GEMINI_API_KEY` and `XAI_API_KEY`. On Fly.io, set `VECTOR_DB_PATH` to a path on a mounted volume so the SQLite DB persists across deploys. |
+| **502 or app unreachable on Fly.io** | App must listen on `0.0.0.0` and use the `PORT` env var (see `backend/Dockerfile`). |
+| **524 (timeout) in production** | Cloudflare (or another proxy) closes the connection when the origin doesn’t respond in time (~100s). The backend now times out ingest/recommendations before that. If you still see 524: increase the proxy’s **origin read timeout** to at least 100s, or use **DNS-only (grey cloud)** for this host so requests hit Fly.io directly. |
+| **Voice or API not working locally** | Ensure both the Python backend (port 8000) and `npm run dev` (frontend + Node API proxy) are running. |
+
+---
+
+## Implementation notes
+
+### Recommendations are only as good as memory
+
+If recommendations seem generic, it usually means one of these is true:
+
+- the transcript was saved in browser history but not ingested into backend memory
+- extraction returned no usable facts or summary for that entry
+- the DB path is wrong or not persistent
+
+### Current model responsibilities
+
+- **Grok / XAI**: main journaling conversation
+- **Gemini**: embeddings, extraction, date inference, and helper generation
+- **ElevenLabs**: speech input/output
+
+### Optional or experimental pieces
+
+- **OpenRouter**: optional convenience for legacy Node-side experimentation
+- **LightRAG**: optional enrichment layer, not required for core memory sync
+
+---
+
+## Suggested Reading Order
+
+If you are onboarding teammates or reading the project for the first time:
+
+1. Read `What This App Does`
+2. Read `How It Works`
+3. Run `Quick Start`
+4. Review `Architecture`
+5. Review `Project Structure`
+6. Dive into `backend/main.py`, `backend/library.py`, and `useJournalHistory.ts`
 
 ---
 

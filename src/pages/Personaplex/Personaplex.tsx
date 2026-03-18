@@ -86,7 +86,7 @@ export const Personaplex = () => {
   // Personalization is always \"high\": the agent should actively connect past memories and journals to the current conversation when relevant.
   const personalization = 1;
   const intrusiveness = 0.5;
-  const [sessionMode, setSessionMode] = useState<"journal" | "recommendations" | "extreme" | "therapy">("journal");
+  const [sessionMode, setSessionMode] = useState<"journal" | "recommendations">("journal");
   const [voices, setVoices] = useState<VoiceOption[]>(FALLBACK_VOICES);
   const [selectedVoiceId, setSelectedVoiceId] = useState(DEFAULT_VOICE_ID);
   // Fixed voice settings: speed 1.0, moderate stability to reduce ElevenLabs variability/errors.
@@ -659,8 +659,9 @@ export const Personaplex = () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: transcriptText }),
       })
-        .then((r) => {
-          if (r.ok && id) markEntrySynced(id);
+        .then(async (r) => {
+          const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };
+          if (data?.ok !== false && id) markEntrySynced(id);
           fetchMemoryStats();
         })
         .catch(() => {});
@@ -750,7 +751,8 @@ export const Personaplex = () => {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ text, entry_date: inferredDate }),
                 });
-                if (r.ok) {
+                const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };
+                if (data?.ok !== false) {
                   synced += 1;
                   if (entryId) markEntrySynced(entryId);
                 }
@@ -809,7 +811,8 @@ export const Personaplex = () => {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ text: transcriptText, entry_date: entry?.date }),
                 });
-                if (r.ok) synced += 1;
+                const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };
+                if (data?.ok !== false) synced += 1;
               } catch {
                 /* continue with next entry */
               }
@@ -845,7 +848,7 @@ export const Personaplex = () => {
                 body: JSON.stringify({ text: content, entry_date: inferredDate }),
               });
               const data = ingestRes.ok ? await ingestRes.json().catch(() => ({})) : { ok: false };
-              if (ingestRes.ok && entryId) markEntrySynced(entryId);
+              if (data?.ok !== false && entryId) markEntrySynced(entryId);
               fetchMemoryStats();
               if (authUser) fetchBackendSummaries();
               setToastMessage(data?.ok === false ? "Imported journal, but syncing to memory failed." : "Imported journal and synced to memory.");
@@ -989,29 +992,17 @@ export const Personaplex = () => {
                 <select
                   id="personaplex-session-mode"
                   value={sessionMode}
-                  onChange={(e) => setSessionMode(e.target.value as "journal" | "recommendations" | "extreme" | "therapy")}
+                  onChange={(e) => setSessionMode(e.target.value as "journal" | "recommendations")}
                   disabled={isConnected}
                   className="w-full px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
-                  aria-label="Interview mode: journal, recommendations, extreme, or therapy"
+                  aria-label="Interview mode: journal or recommendations"
                 >
-                  <option value="journal">Regular interview (journal entries)</option>
-                  <option value="recommendations">Recommendations (talk about your books)</option>
-                  <option value="extreme">Extreme (intrusive reflection)</option>
-                  <option value="therapy">Therapy mode</option>
+                  <option value="journal">Interview (journal entries)</option>
+                  <option value="recommendations">Interview (consumed media)</option>
                 </select>
                 {sessionMode === "recommendations" && (
                   <p className="text-xs text-slate-500 mt-1">
                     Same speech-to-text; agent asks about your library and saves short notes for better recommendations.
-                  </p>
-                )}
-                {sessionMode === "extreme" && (
-                  <p className="text-xs text-slate-500 mt-1">
-                    Asks direct, private questions to help you reflect and feel better. No advice—just reflection.
-                  </p>
-                )}
-                {sessionMode === "therapy" && (
-                  <p className="text-xs text-slate-500 mt-1">
-                    Supportive, reflective listening. No advice—just space to explore.
                   </p>
                 )}
               </div>

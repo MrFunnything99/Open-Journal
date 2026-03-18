@@ -14,7 +14,7 @@ export type VoiceSettings = {
   speed?: number;
 };
 
-export type SessionMode = "journal" | "recommendations" | "extreme" | "therapy";
+export type SessionMode = "journal" | "recommendations";
 
 export type UsePersonaplexSessionOptions = {
   systemPrompt: string;
@@ -44,7 +44,7 @@ async function fetchInterviewerQuestion(
   sessionId: string | null,
   personalization: number,
   intrusiveness: number,
-  mode: "journal" | "recommendations" | "extreme" | "therapy"
+  mode: "journal" | "recommendations"
 ): Promise<{ question: string; sessionId: string; retrievalLog?: string; notesSaved?: { item_id: string; note: string }[] }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), CHAT_FETCH_TIMEOUT_MS);
@@ -843,8 +843,12 @@ export const usePersonaplexSession = ({
     }
 
     setStatus("connected");
-    speak("Hello, I am your Selfmeridian assistant. How can I help you?");
-  }, [speak]);
+    const greeting =
+      sessionMode === "recommendations"
+        ? "Hello, I am your librarian. How can I help you?"
+        : "Hello, I am your journal assistant. How can I help you?";
+    speak(greeting);
+  }, [speak, sessionMode]);
 
   const disconnect = useCallback(() => {
     log("Disconnect");

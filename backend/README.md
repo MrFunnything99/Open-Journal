@@ -1,6 +1,6 @@
 # Selfmeridian Python Backend
 
-Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** for vector memory and **LightRAG** for knowledge-graph RAG.
+Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** for vector memory and **LightRAG** for knowledge-graph RAG. The main app uses **Gemini** (embeddings, memory extraction) and **Grok/XAI** (chat); OpenRouter is optional and used only in some Node-side routes if you enable it.
 
 ## Setup (1-time)
 
@@ -30,7 +30,7 @@ Copy `.env.example` to `.env` in the project root and set:
 - `LIGHTRAG_ENABLED` – set to `false` to disable LightRAG indexing (optional)
 - `VECTOR_DB_PATH` – full path to SQLite DB file (optional; for production so the vector DB persists)
 - `TAVILY_API_KEY` – optional; when set, News & article recommendations use [Tavily Search](https://docs.tavily.com/welcome) (topic=news) for real article URLs
-- `SEMANTIC_SCHOLAR_API_KEY` – optional; research recommendations use [Semantic Scholar](https://www.semanticscholar.org/product/api) + PubMed. Without the key we throttle S2 requests (~4s between calls) to avoid 429; with a key you get higher rate limits.
+- `SEMANTIC_SCHOLAR_API_KEY` – **currently unused**; Semantic Scholar + PubMed are commented out. Research (and all recommendation categories) use Gemini with Google Search grounding for now.
 - `JWT_SECRET` – optional; when set, simple login (username + password, no email) is enabled. Logged-in users get persistent data; anonymous users can still use the app but their data is forgotten after 1 hour (client-side ephemeral instance). Use a long random string.
 
 On macOS, the system Python SQLite may not support extensions; install `pysqlite3` so sqlite-vec works (`pip install pysqlite3`).

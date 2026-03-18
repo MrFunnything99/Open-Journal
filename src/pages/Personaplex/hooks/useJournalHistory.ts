@@ -151,9 +151,10 @@ export const useJournalHistory = () => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: text.trim(), entry_date: entry.date }),
         });
-        if (r.ok) syncedIds.push(entry.id);
+        const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };
+        if (data && data.ok !== false) syncedIds.push(entry.id);
       } catch {
-        /* skip failed */
+        /* skip failed (e.g. 524 timeout); entry stays unsynced and will retry later */
       }
     }
     if (syncedIds.length > 0) {

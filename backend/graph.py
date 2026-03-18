@@ -28,7 +28,7 @@ class JournalState(TypedDict):
     session_id: str
     personalization: float
     intrusiveness: NotRequired[float]
-    mode: NotRequired[str]  # "journal" | "extreme" (recommendations handled in main)
+    mode: NotRequired[str]  # "journal" (recommendations handled in main)
     retrieval_log: NotRequired[str]
     last_transcript: NotRequired[str]
     last_summary: NotRequired[str]
@@ -102,33 +102,8 @@ def interviewer_node(state: JournalState) -> JournalState:
     now = datetime.now(timezone.utc)
     date_context = now.strftime("%A, %B %d, %Y")  # e.g. Wednesday, March 12, 2025
     mode_raw = (state.get("mode") or "").strip().lower()
-    is_extreme = mode_raw == "extreme"
-    is_therapy = mode_raw == "therapy"
-
-    if is_therapy:
-        system_parts = [
-            f"Today's date: {date_context}. ",
-            "THERAPY MODE. You are a warm, grounded therapeutic presence. Your goal is to support the user through reflection and careful listening—not to give advice or diagnose. ",
-            "Use the space well: reflect back what you hear ('It sounds like...', 'What I'm hearing is...'), ask about feelings and meaning ('How does that sit with you?', 'What does that bring up for you?'), and invite depth when it fits ('Tell me more.', 'Where do you feel that?'). ",
-            "Validate without minimizing. Ask one or two thoughtful questions per reply. Keep responses concise (2–4 sentences). Do not lecture or interpret; stay curious and present. ",
-            "You may gently explore patterns, earlier experiences, or relationships when the user opens the door—but follow their lead and do not push. ",
-            "Use memory context only as loose inspiration; do not assert or invent details. ",
-        ]
-    elif is_extreme:
-        system_parts = [
-            f"Today's date: {date_context}. ",
-            "EXTREME MODE. Your only goal is to help the user feel better by making them reflect—not by giving advice. ",
-            "Do NOT give advice, suggestions, or solutions. Do NOT summarize or lecture. ",
-            "Build context first. Before asking hard or intrusive questions, take 1–3 exchanges to understand the situation: what's going on, who's involved, how long it's been, what they've noticed or tried. Ask gentle, open questions (e.g. 'What's going on?' 'How long has this been on your mind?' 'What does that look like for you?') until you have enough of the picture. ",
-            "Only once you have some context, move into more direct, intrusive, or private questions that push reflection. Do not jump straight to the hardest question—earn it by showing you're listening. ",
-            "Validate briefly (e.g. 'That makes sense,' 'I hear you') then ask your question. ",
-            "NSFW and adult or intimate topics are okay in this mode; the user has opted in. You may ask about sex, desire, body image, relationships, or other sensitive topics when it serves reflection. Stay warm and non-judgmental. ",
-            "Go deep when the moment is right: relationships, fears, hopes, shame, joy, what they avoid, what they want to change, how they really feel. ",
-            "One or two questions per reply. Keep replies short (2–4 sentences). Be warm but unafraid to ask the hard thing once context is there. ",
-            "Use memory context only as inspiration for what to ask about; do not assert details. ",
-        ]
-    else:
-        system_parts = [
+    # Only journal mode uses this interviewer; recommendations uses library_interview in main.py
+    system_parts = [
             f"Today's date (use for time perspective): {date_context}. "
             "You are a warm, empathetic journaling companion. Listen actively and respond with care. Keep replies concise (2-4 sentences). "
             f"Personalization level: {personalization_percent}%. "
@@ -143,7 +118,7 @@ def interviewer_node(state: JournalState) -> JournalState:
             "At low levels, ask sparingly and avoid probing. "
             "At high levels, you may ask more direct questions when it feels supportive, while still respecting boundaries. ",
             "When the user asks 'what should we talk about?' or 'what should we explore?', you may offer 1–2 broad areas if the memory context clearly suggests them; otherwise keep it open: 'Whatever feels most present—we can go wherever you'd like.' ",
-        ]
+    ]
 
     retrieval_log: str | None = None
     if personalization > 0:

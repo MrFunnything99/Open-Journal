@@ -93,6 +93,25 @@ def _call_gemini(prompt: str) -> str:
         return ""
 
 
+def _call_gemini_with_google_search(prompt: str) -> str:
+    """
+    Same as _call_gemini but with Google Search grounding so the model can use real-time web results.
+    Falls back to _call_gemini if grounding is unavailable (e.g. SDK or model support).
+    """
+    try:
+        from google.genai import types
+        client = _get_embeddings_client()
+        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        config = types.GenerateContentConfig(tools=[grounding_tool])
+        result = client.models.generate_content(model=model, contents=prompt, config=config)
+        text = _gemini_response_to_text(result)
+        return text.strip()
+    except Exception as e:
+        print("[backend] _call_gemini_with_google_search fallback to plain _call_gemini:", e)
+        return _call_gemini(prompt)
+
+
 def run_library_interview(
     messages: list[dict],
     library_items: list[dict],
@@ -1344,7 +1363,7 @@ JOURNAL SESSION SUMMARIES (all themes over time):
 
 Rules: Do NOT suggest books they have already consumed. Use their reflections and tastes from podcasts, articles, and research too—e.g. if they liked a paper or podcast on a topic, that can inform book picks. For each book give title, author, and a short "reason" (one sentence) tied to their life or journal themes. No URLs.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "..."}}, ...]"""
-    text = _call_gemini(prompt)
+    text = _call_gemini_with_google_search(prompt)
     return _parse_recommendation_json(text, [])
 
 
@@ -1526,7 +1545,7 @@ JOURNAL SESSION SUMMARIES (all themes):
 
 Rules: Use "author" for the show name and "title" for the episode. Provide direct "url" (Spotify or Apple Podcasts episode link) when you know it; otherwise leave "url" empty. Do NOT suggest items they have already consumed. For each give a short "reason" (one sentence).
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    text = _call_gemini(prompt)
+    text = _call_gemini_with_google_search(prompt)
     return _parse_recommendation_json(text, [])
 
 
@@ -1772,7 +1791,7 @@ JOURNAL SESSION SUMMARIES (all themes):
 
 CRITICAL: Every article MUST have a "url" that is a real, working link to the actual article page—no 404s. Use only URLs you are certain exist (exact paths from nytimes.com, theatlantic.com, healthline.com, bbc.com, nature.com, apa.org, etc.). Do NOT guess or construct URLs. If you cannot provide a verified working URL for an article, do NOT include it. For each give title, author/source, reason, and url.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    text = _call_gemini(prompt)
+    text = _call_gemini_with_google_search(prompt)
     return _parse_recommendation_json(text, [])
 
 
@@ -1993,7 +2012,7 @@ Return ONLY a JSON array of {len(papers)} strings, one reason per paper, same or
 
 
 def _research_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
-    """Research paper recommendations using Semantic Scholar and PMC/PubMed (E-Utilities). Falls back to LLM-only if APIs return nothing."""
+    """Research paper recommendations using Gemini with Google Search grounding. (Semantic Scholar + PubMed APIs are commented out for now.)"""
     recent_section = ""
     if recent_summaries_blob:
         recent_section = f"""
@@ -2029,41 +2048,39 @@ Return ONLY a JSON array of 2–3 query strings, no markdown. Example: ["mindful
     except Exception as e:
         print("[backend] Research agent query parsing:", e)
 
-    consumed_lower = (consumed or "").lower()
-    seen_titles: set[str] = set()
-    out: list[dict] = []
+    # Semantic Scholar and PubMed APIs commented out for now; using Gemini (with Google Search grounding) for research recommendations.
+    # consumed_lower = (consumed or "").lower()
+    # seen_titles: set[str] = set()
+    # out: list[dict] = []
+    # # 2) Semantic Scholar (broad academic)
+    # for item in _semantic_scholar_search_papers(queries, max_per_query=5):
+    #     title = (item.get("title") or "").strip()
+    #     if not title or title.lower() in consumed_lower:
+    #         continue
+    #     key = title.lower()[:80]
+    #     if key in seen_titles:
+    #         continue
+    #     seen_titles.add(key)
+    #     out.append(item)
+    # # 3) PMC/PubMed (biomedical)
+    # for item in _pmc_pubmed_search_papers(queries, max_per_query=4):
+    #     title = (item.get("title") or "").strip()
+    #     if not title or title.lower() in consumed_lower:
+    #         continue
+    #     key = title.lower()[:80]
+    #     if key in seen_titles:
+    #         continue
+    #     seen_titles.add(key)
+    #     out.append(item)
+    # out = out[:5]
+    # if out:
+    #     reasons = _generate_research_reasons(out, facts_blob, summaries_blob, consumed)
+    #     for i, item in enumerate(out):
+    #         item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "Relevant to your interests.")
+    #     print(f"[backend] Research: API path returning {len(out)} papers (Semantic Scholar + PubMed).")
+    #     return out
 
-    # 2) Semantic Scholar (broad academic)
-    for item in _semantic_scholar_search_papers(queries, max_per_query=5):
-        title = (item.get("title") or "").strip()
-        if not title or title.lower() in consumed_lower:
-            continue
-        key = title.lower()[:80]
-        if key in seen_titles:
-            continue
-        seen_titles.add(key)
-        out.append(item)
-
-    # 3) PMC/PubMed (biomedical)
-    for item in _pmc_pubmed_search_papers(queries, max_per_query=4):
-        title = (item.get("title") or "").strip()
-        if not title or title.lower() in consumed_lower:
-            continue
-        key = title.lower()[:80]
-        if key in seen_titles:
-            continue
-        seen_titles.add(key)
-        out.append(item)
-
-    out = out[:5]
-    if out:
-        reasons = _generate_research_reasons(out, facts_blob, summaries_blob, consumed)
-        for i, item in enumerate(out):
-            item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "Relevant to your interests.")
-        print(f"[backend] Research: API path returning {len(out)} papers (Semantic Scholar + PubMed).")
-        return out
-
-    # 4) Fallback: LLM-only with real-URL rule
+    # Use Gemini with Google Search grounding for research suggestions (no external APIs for now)
     prompt = f"""You are a research curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections, suggest 3–5 academic or scientific research papers they might find relevant. Use their tastes from books, podcasts, and articles too.
 
 FACTS AND THEMES FROM THEIR JOURNALS:
@@ -2075,7 +2092,7 @@ JOURNAL SESSION SUMMARIES (all themes):
 
 Rules: Do NOT suggest papers they have already consumed. For each paper give: "title", "author" (e.g. "Smith et al." or journal and year), "reason" (one sentence), and "url" (working link: https://doi.org/..., https://pubmed.ncbi.nlm.nih.gov/PMID/, or https://www.semanticscholar.org/paper/...). Do not guess URLs; only include papers where you are sure of the URL.
 Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    text = _call_gemini(prompt)
+    text = _call_gemini_with_google_search(prompt)
     return _parse_recommendation_json(text, [])
 
 

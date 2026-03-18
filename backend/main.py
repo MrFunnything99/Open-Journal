@@ -739,7 +739,7 @@ async def chat(req: ChatRequest, request: Request, current_user: Optional[Curren
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     mode = (req.mode or "journal").strip().lower()
-    if mode not in ("journal", "recommendations", "extreme", "therapy"):
+    if mode not in ("journal", "recommendations"):
         mode = "journal"
 
     if mode == "recommendations":
@@ -939,12 +939,15 @@ async def end_session(req: EndSessionRequest, request: Request, current_user: Op
     return EndSessionResponse(ok=True, session_id=session_id)
 
 
+# Stay under common proxy timeouts (e.g. Cloudflare 100–120s) to avoid 524
+INGEST_HISTORY_TIMEOUT_SEC = 55
+
 @api_router.post("/ingest-history", response_model=IngestHistoryResponse)
 async def ingest_history(req: IngestHistoryRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Ingest a prior journal text into SQLite+sqlite-vec and LightRAG.
     Treats `text` as a single-session transcript. LightRAG gets same summary+facts as vec_store.
-    Returns 200 always (so CORS headers are sent); ok=False on failure.
+    Returns 200 always (so CORS headers are sent); ok=False on failure or timeout.
     """
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     session_id = req.session_id or f"import-{uuid.uuid4()}"
@@ -953,7 +956,10 @@ async def ingest_history(req: IngestHistoryRequest, request: Request, current_us
         if not text:
             return IngestHistoryResponse(ok=True, session_id=session_id)
         entry_date = (req.entry_date or "").strip() or None
-        extracted = await asyncio.to_thread(save_session_data, session_id, text, entry_date, instance_id)
+        extracted = await asyncio.wait_for(
+            asyncio.to_thread(save_session_data, session_id, text, entry_date, instance_id),
+            timeout=INGEST_HISTORY_TIMEOUT_SEC,
+        )
         summary = extracted.get("summary") or ""
         facts = extracted.get("facts") or []
         if summary or facts:
@@ -975,6 +981,9 @@ async def ingest_history(req: IngestHistoryRequest, request: Request, current_us
             asyncio.create_task(_bg_lightrag())
 
         return IngestHistoryResponse(ok=True, session_id=session_id)
+    except asyncio.TimeoutError:
+        print("[backend] ingest_history timed out after", INGEST_HISTORY_TIMEOUT_SEC, "s")
+        return IngestHistoryResponse(ok=False, session_id=session_id)
     except Exception as e:
         import traceback
         print("[backend] ingest_history error:", e)
@@ -1441,13 +1450,14 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
     return {"ok": ok}
 
 
-RECOMMENDATIONS_TIMEOUT_SEC = 120
+# Keep under typical proxy origin timeout (e.g. Cloudflare 100s) to avoid 524
+RECOMMENDATIONS_TIMEOUT_SEC = 90
 
 @api_router.get("/recommendations", response_model=RecommendationsResponse)
 async def get_recommendations(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Generate personalized book, podcast, and article recommendations from journal memory
-    and what the user has already consumed/liked. May take 30–90s; runs with a timeout to avoid connection resets.
+    and what the user has already consumed/liked. May take 30–90s; timeout keeps response before proxy limit.
     """
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     try:
