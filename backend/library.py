@@ -51,16 +51,42 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return [emb.values for emb in result.embeddings]
 
 
+def _gemini_response_to_text(result) -> str:
+    """
+    Extract full text from a GenerateContentResponse, including parts that have thought=True.
+    The SDK's .text property skips thought parts, which can leave extraction (e.g. JSON) empty.
+    """
+    text = getattr(result, "text", "") or ""
+    if text and text.strip():
+        return text.strip()
+    try:
+        if not getattr(result, "candidates", None) or not result.candidates:
+            return ""
+        c0 = result.candidates[0]
+        if not getattr(c0, "content", None) or not getattr(c0.content, "parts", None):
+            return ""
+        out = []
+        for part in c0.content.parts:
+            ptext = getattr(part, "text", None)
+            if isinstance(ptext, str) and ptext.strip():
+                out.append(ptext)
+        return "\n".join(out).strip() if out else ""
+    except Exception as e:
+        print("[backend] _gemini_response_to_text fallback error:", e)
+        return ""
+
+
 def _call_gemini(prompt: str) -> str:
     """
     Call the primary Gemini chat model (Flash 3.1 by default) with a single text prompt.
     Returns the response text (empty string on failure).
+    Uses full response text including thought parts so JSON extraction is not lost.
     """
     try:
         client = _get_embeddings_client()
         model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
         result = client.models.generate_content(model=model, contents=prompt)
-        text = getattr(result, "text", "") or ""
+        text = _gemini_response_to_text(result)
         return text.strip()
     except Exception as e:
         print("[backend] _call_gemini error:", e)
@@ -420,8 +446,22 @@ Rules:
         if text.startswith("json"):
             text = text[4:]
     text = text.strip()
+    # If model returned reasoning + JSON, extract the first complete JSON object
+    json_str = text
+    if "{" in text and "}" in text:
+        start = text.find("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        json_str = text[start : i + 1]
+                        break
     try:
-        data = json.loads(text)
+        data = json.loads(json_str)
     except json.JSONDecodeError as e:
         print("[backend] _extract_session_data JSON error:", e)
         return {"summary": "", "facts": [], "metadata": {}}
@@ -833,6 +873,8 @@ def save_session_data(session_id: str, transcript: str, entry_date: str | None =
     summary = data.get("summary", "")
     facts = data.get("facts", [])
     metadata = data.get("metadata") or {}
+    if not summary and not facts:
+        print("[backend] save_session_data: extraction returned no summary or facts (check Gemini response)")
 
     ts = datetime.utcnow().isoformat() + "Z"
     if entry_date:
@@ -849,6 +891,7 @@ def save_session_data(session_id: str, transcript: str, entry_date: str | None =
         summary_emb = _embed_texts([summary])[0]
         metadata_json = json.dumps(metadata) if metadata else None
         vec_store.add_episodic(session_id, ts, summary, summary_emb, metadata_json=metadata_json, instance_id=instance_id or "")
+        print("[backend] save_session_data: saved 1 episodic summary")
 
     # Deduplicate facts: if a new fact is very similar to an existing one, update it instead of inserting
     GIST_SIMILARITY_THRESHOLD = 0.85  # cosine similarity above this => update existing fact
@@ -869,6 +912,7 @@ def save_session_data(session_id: str, transcript: str, entry_date: str | None =
                         continue
             vec_store.add_gist(session_id, ts, fact, emb, instance_id=instance_id or "")
             n_existing += 1
+        print("[backend] save_session_data: saved %d gist facts" % len(facts))
 
     return {"summary": summary, "facts": facts}
 

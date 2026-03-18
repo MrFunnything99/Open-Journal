@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional
 
 import jwt
 from fastapi import Request, HTTPException, Depends, Response
@@ -129,7 +129,7 @@ async def get_current_user(request: Request) -> CurrentUser:
     return CurrentUser(user_id=int(sub), email=email)
 
 
-async def get_current_user_optional(request: Request) -> CurrentUser | None:
+async def get_current_user_optional(request: Request) -> Optional[CurrentUser]:
     """Dependency: return CurrentUser if valid Bearer token present, else None (allows anonymous with X-Instance-ID)."""
     auth = request.headers.get("Authorization") or ""
     if not auth.startswith("Bearer "):

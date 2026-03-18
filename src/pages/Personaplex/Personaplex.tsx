@@ -254,6 +254,8 @@ export const Personaplex = () => {
   const {
     entries,
     saveEntry,
+    markEntrySynced,
+    syncUnsyncedEntries,
     deleteEntry,
     getFormattedDate,
     exportAllJournals,
@@ -303,6 +305,15 @@ export const Personaplex = () => {
       fetchMemoryStats();
     }
   }, [view, fetchMemoryStats]);
+
+  const hasRunInitialSyncRef = useRef(false);
+  useEffect(() => {
+    if (entries.length === 0 || hasRunInitialSyncRef.current) return;
+    hasRunInitialSyncRef.current = true;
+    syncUnsyncedEntries().then((n) => {
+      if (n > 0) fetchMemoryStats();
+    });
+  }, [entries.length, syncUnsyncedEntries, fetchMemoryStats]);
 
   const fetchBackendSummaries = useCallback(() => {
     if (!authUser) return;
@@ -389,26 +400,39 @@ export const Personaplex = () => {
   }, []);
 
   useEffect(() => {
-    if (view === "recommendations") {
-      try {
-        const cached = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
-        if (cached) {
-          const parsed = JSON.parse(cached) as { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] };
-          if (parsed && Array.isArray(parsed.books) && Array.isArray(parsed.podcasts) && Array.isArray(parsed.articles)) {
-            setRecommendations({
-              books: parsed.books ?? [],
-              podcasts: parsed.podcasts ?? [],
-              articles: parsed.articles ?? [],
-              research: Array.isArray(parsed.research) ? parsed.research : [],
-            });
+    if (view !== "recommendations") return;
+    syncUnsyncedEntries()
+      .then((n) => {
+        if (n > 0) {
+          fetchMemoryStats();
+          try {
+            localStorage.removeItem(RECOMMENDATIONS_CACHE_KEY);
+          } catch {
+            /* ignore */
           }
         }
-      } catch {
-        /* ignore */
-      }
-      fetchRecommendations(true);
-    }
-  }, [view, fetchRecommendations]);
+      })
+      .then(() => {
+        try {
+          const cached = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
+          if (cached) {
+            const parsed = JSON.parse(cached) as { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] };
+            if (parsed && Array.isArray(parsed.books) && Array.isArray(parsed.podcasts) && Array.isArray(parsed.articles)) {
+              setRecommendations({
+                books: parsed.books ?? [],
+                podcasts: parsed.podcasts ?? [],
+                articles: parsed.articles ?? [],
+                research: Array.isArray(parsed.research) ? parsed.research : [],
+              });
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        fetchRecommendations(true);
+      })
+      .catch(() => fetchRecommendations(true));
+  }, [view, syncUnsyncedEntries, fetchMemoryStats, fetchRecommendations]);
 
   useEffect(() => {
     if (view === "recommendations" && (recommendations.books.length > 0 || recommendations.podcasts.length > 0 || recommendations.articles.length > 0 || recommendations.research.length > 0)) {
@@ -501,7 +525,8 @@ export const Personaplex = () => {
         return;
       }
       setPriorJournalText("");
-      saveEntry([{ role: "user", text: textToIngest }], inferredDate);
+      const id = saveEntry([{ role: "user", text: textToIngest }], inferredDate);
+      if (id) markEntrySynced(id);
       setToastMessage("Journal added to memory and saved to History.");
       setTimeout(() => setToastMessage(null), 5000);
       fetchMemoryStats();
@@ -512,7 +537,7 @@ export const Personaplex = () => {
     } finally {
       setIsIngesting(false);
     }
-  }, [priorJournalText, fetchMemoryStats, saveEntry, fetchBackendSummaries]);
+  }, [priorJournalText, fetchMemoryStats, saveEntry, markEntrySynced, fetchBackendSummaries]);
 
   const handleWipeMemory = useCallback(() => {
     if (!window.confirm("Wipe all data from the vector DB? This cannot be undone. The AI will have no prior journal memory until you add entries again.")) return;
@@ -625,14 +650,27 @@ export const Personaplex = () => {
 
   const handleDisconnect = useCallback(() => {
     if (transcript.length > 0) {
-      saveEntry(transcript);
-      setToastMessage("Journal entry saved.");
+      const id = saveEntry(transcript);
+      const transcriptText = transcript
+        .map((e) => (e.role === "user" ? "User: " + e.text : "Assistant: " + e.text))
+        .join("\n\n");
+      backendFetch("/ingest-history", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: transcriptText }),
+      })
+        .then((r) => {
+          if (r.ok && id) markEntrySynced(id);
+          fetchMemoryStats();
+        })
+        .catch(() => {});
+      setToastMessage("Journal entry saved and synced to memory.");
       setTimeout(() => setToastMessage(null), 3000);
     }
     setTranscript([]);
     setInterimTranscript("");
     disconnect();
-  }, [disconnect, transcript, saveEntry]);
+  }, [disconnect, transcript, saveEntry, markEntrySynced, fetchMemoryStats]);
 
   useEffect(() => {
     if (!isConnected) {
@@ -705,14 +743,17 @@ export const Personaplex = () => {
               } catch {
                 /* use import time as fallback */
               }
-              saveEntry([{ role: "user", text }], inferredDate);
+              const entryId = saveEntry([{ role: "user", text }], inferredDate);
               try {
                 const r = await backendFetch("/ingest-history", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ text, entry_date: inferredDate }),
                 });
-                if (r.ok) synced += 1;
+                if (r.ok) {
+                  synced += 1;
+                  if (entryId) markEntrySynced(entryId);
+                }
               } catch {
                 /* continue */
               }
@@ -796,7 +837,7 @@ export const Personaplex = () => {
             } catch {
               /* use import time as fallback */
             }
-            saveEntry([{ role: "user", text: content }], inferredDate);
+            const entryId = saveEntry([{ role: "user", text: content }], inferredDate);
             try {
               const ingestRes = await backendFetch("/ingest-history", {
                 method: "POST",
@@ -804,6 +845,7 @@ export const Personaplex = () => {
                 body: JSON.stringify({ text: content, entry_date: inferredDate }),
               });
               const data = ingestRes.ok ? await ingestRes.json().catch(() => ({})) : { ok: false };
+              if (ingestRes.ok && entryId) markEntrySynced(entryId);
               fetchMemoryStats();
               if (authUser) fetchBackendSummaries();
               setToastMessage(data?.ok === false ? "Imported journal, but syncing to memory failed." : "Imported journal and synced to memory.");
@@ -824,7 +866,7 @@ export const Personaplex = () => {
       };
       reader.readAsText(file);
     },
-    [importEntriesFromExport, isExportPayload, fetchMemoryStats, saveEntry]
+    [importEntriesFromExport, isExportPayload, fetchMemoryStats, saveEntry, markEntrySynced]
   );
 
   useEffect(() => {

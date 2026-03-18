@@ -321,6 +321,12 @@ export const usePersonaplexSession = ({
         const nextWithAi: TranscriptEntry[] = [...nextWithUser, { role: "ai", text: question, ...(retrievalLog != null ? { retrievalLog } : {}) }];
         transcriptRef.current = nextWithAi;
         onTranscriptUpdate(() => nextWithAi);
+        // Auto-sync session to memory after each exchange (background, non-blocking)
+        backendFetch("/end-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        }).catch(() => {});
         if (speakRef.current) {
           await speakRef.current(question);
         } else {

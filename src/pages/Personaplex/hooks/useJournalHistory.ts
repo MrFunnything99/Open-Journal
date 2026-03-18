@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { backendFetch } from "../../../backendApi";
 
 export type ChatMessage = { role: "user" | "ai"; text: string; retrievalLog?: string };
 
@@ -7,6 +8,8 @@ export type JournalEntry = {
   date: string;
   preview: string;
   fullTranscript: ChatMessage[];
+  /** True after this entry has been sent to /ingest-history so recommendations use it */
+  syncedToMemory?: boolean;
 };
 
 const STORAGE_KEY = "openjournal-history";
@@ -89,11 +92,14 @@ function normalizeEntry(raw: unknown): JournalEntry | null {
   const id = typeof o.id === "string" ? o.id : generateId();
   const date = typeof o.date === "string" ? o.date : new Date().toISOString();
   const preview = typeof o.preview === "string" ? o.preview : transcriptToPreview(fullTranscript);
-  return { id, date, preview, fullTranscript };
+  const syncedToMemory = o.syncedToMemory === true;
+  return { id, date, preview, fullTranscript, syncedToMemory };
 }
 
 export const useJournalHistory = () => {
   const [entries, setEntries] = useState<JournalEntry[]>([]);
+  const entriesRef = useRef<JournalEntry[]>(entries);
+  entriesRef.current = entries;
 
   useEffect(() => {
     setEntries(loadFromStorage());
@@ -104,7 +110,7 @@ export const useJournalHistory = () => {
   }, [entries]);
 
   const saveEntry = useCallback((transcript: ChatMessage[], dateOverride?: string) => {
-    if (transcript.length === 0) return;
+    if (transcript.length === 0) return "";
     const id = generateId();
     const date =
       dateOverride && !Number.isNaN(Date.parse(dateOverride))
@@ -116,9 +122,46 @@ export const useJournalHistory = () => {
       date,
       preview,
       fullTranscript: transcript,
+      syncedToMemory: false,
     };
     setEntries((prev) => [entry, ...prev]);
     return id;
+  }, []);
+
+  const markEntrySynced = useCallback((id: string) => {
+    setEntries((prev) =>
+      prev.map((e) => (e.id === id ? { ...e, syncedToMemory: true } : e))
+    );
+  }, []);
+
+  /** Send every history entry that isn't yet synced to the backend. Returns count of newly synced. */
+  const syncUnsyncedEntries = useCallback(async (): Promise<number> => {
+    const list = entriesRef.current;
+    const unsynced = list.filter((e) => !e.syncedToMemory);
+    if (unsynced.length === 0) return 0;
+    const syncedIds: string[] = [];
+    for (const entry of unsynced) {
+      const text = entry.fullTranscript
+        .map((m) => (m.role === "user" ? "User: " + m.text : "Assistant: " + m.text))
+        .join("\n\n");
+      if (!text.trim()) continue;
+      try {
+        const r = await backendFetch("/ingest-history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: text.trim(), entry_date: entry.date }),
+        });
+        if (r.ok) syncedIds.push(entry.id);
+      } catch {
+        /* skip failed */
+      }
+    }
+    if (syncedIds.length > 0) {
+      setEntries((prev) =>
+        prev.map((e) => (syncedIds.includes(e.id) ? { ...e, syncedToMemory: true } : e))
+      );
+    }
+    return syncedIds.length;
   }, []);
 
   const clearHistory = useCallback(() => {
@@ -158,6 +201,8 @@ export const useJournalHistory = () => {
   return {
     entries,
     saveEntry,
+    markEntrySynced,
+    syncUnsyncedEntries,
     clearHistory,
     deleteEntry,
     getFormattedDate,

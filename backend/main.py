@@ -723,7 +723,7 @@ async def api_scribe_token():
 
 
 @api_router.get("/memory-diagram", response_model=MemoryDiagramResponse)
-async def memory_diagram(request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def memory_diagram(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Legacy endpoint for memory diagram; retained for compatibility but not used by Brain UI.
     """
@@ -734,7 +734,7 @@ async def memory_diagram(request: Request, current_user: CurrentUser | None = De
 
 
 @api_router.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def chat(req: ChatRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """User sends text; Interviewer responds. State updated in memory. mode=recommendations uses library interview (books, notes)."""
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     session_id = get_or_create_session(req.session_id)
@@ -840,7 +840,7 @@ def _get_or_create_library_interview_session(session_id: Optional[str]) -> str:
 
 
 @api_router.post("/library-interview", response_model=LibraryInterviewResponse)
-async def library_interview(req: LibraryInterviewRequest, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def library_interview(req: LibraryInterviewRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     One turn of the library interview: user message + optional library snapshot.
     Agent asks about books and may save short notes; notes_saved lists any updates.
@@ -902,7 +902,7 @@ async def library_interview(req: LibraryInterviewRequest, request: Request, curr
 
 
 @api_router.post("/end-session", response_model=EndSessionResponse)
-async def end_session(req: EndSessionRequest, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def end_session(req: EndSessionRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """Trigger Librarian: extract, embed, save to SQLite+sqlite-vec (and LightRAG when enabled)."""
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     session_id = get_or_create_session(req.session_id)
@@ -931,7 +931,8 @@ async def end_session(req: EndSessionRequest, request: Request, current_user: Cu
                 from lightrag_bridge import insert_text as lightrag_insert
                 await lightrag_insert(doc)
             except Exception as e:
-                print("[backend] LightRAG insert after end_session:", e)
+                if "GenericAlias" not in str(e) and "NoneType" not in str(e):
+                    print("[backend] LightRAG insert after end_session:", e)
 
         asyncio.create_task(_bg_lightrag())
 
@@ -939,7 +940,7 @@ async def end_session(req: EndSessionRequest, request: Request, current_user: Cu
 
 
 @api_router.post("/ingest-history", response_model=IngestHistoryResponse)
-async def ingest_history(req: IngestHistoryRequest, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def ingest_history(req: IngestHistoryRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Ingest a prior journal text into SQLite+sqlite-vec and LightRAG.
     Treats `text` as a single-session transcript. LightRAG gets same summary+facts as vec_store.
@@ -968,7 +969,8 @@ async def ingest_history(req: IngestHistoryRequest, request: Request, current_us
                     from lightrag_bridge import insert_text as lightrag_insert
                     await lightrag_insert(doc)
                 except Exception as e:
-                    print("[backend] LightRAG insert after ingest:", e)
+                    if "GenericAlias" not in str(e) and "NoneType" not in str(e):
+                        print("[backend] LightRAG insert after ingest:", e)
 
             asyncio.create_task(_bg_lightrag())
 
@@ -1118,7 +1120,7 @@ async def infer_entry_date(req: InferEntryDateRequest):
 
 
 @api_router.get("/memory-stats", response_model=MemoryStats)
-async def memory_stats(request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def memory_stats(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Lightweight stats endpoint; scoped to current user or anonymous instance.
     """
@@ -1134,7 +1136,7 @@ async def memory_stats(request: Request, current_user: CurrentUser | None = Depe
 
 
 @api_router.get("/memory/facts")
-async def get_memory_facts(request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def get_memory_facts(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """List all gist facts with ids for Memory UI (view/edit/delete)."""
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     try:
@@ -1146,7 +1148,7 @@ async def get_memory_facts(request: Request, current_user: CurrentUser | None = 
 
 
 @api_router.get("/memory/summaries")
-async def get_memory_summaries(request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def get_memory_summaries(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """List all episodic summaries with ids for Memory UI."""
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     try:
@@ -1204,7 +1206,7 @@ async def delete_memory_summary_route(summary_id: int):
 
 
 @api_router.post("/memory/facts")
-async def create_memory_fact(req: MemoryFactCreate, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def create_memory_fact(req: MemoryFactCreate, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """Add a user-created fact; returns new id."""
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     try:
@@ -1216,7 +1218,7 @@ async def create_memory_fact(req: MemoryFactCreate, request: Request, current_us
 
 
 @api_router.post("/memory/summaries")
-async def create_memory_summary(req: MemorySummaryCreate, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def create_memory_summary(req: MemorySummaryCreate, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """Add a user-created summary; returns new id."""
     instance_id = str(current_user.id) if current_user else _instance_id(request)
     try:
@@ -1442,7 +1444,7 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
 RECOMMENDATIONS_TIMEOUT_SEC = 120
 
 @api_router.get("/recommendations", response_model=RecommendationsResponse)
-async def get_recommendations(request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def get_recommendations(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Generate personalized book, podcast, and article recommendations from journal memory
     and what the user has already consumed/liked. May take 30–90s; runs with a timeout to avoid connection resets.
@@ -1478,7 +1480,7 @@ class CalendarDayResponse(BaseModel):
 
 
 @api_router.post("/calendar-day-summary", response_model=CalendarDayResponse)
-async def calendar_day_summary(req: CalendarDayRequest, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def calendar_day_summary(req: CalendarDayRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     For a given date, combine raw journal transcript (if any) with DB memory for that day
     and return an AI-generated day summary/highlights.
@@ -1509,7 +1511,7 @@ async def calendar_day_summary(req: CalendarDayRequest, request: Request, curren
 
 
 @api_router.post("/recommendations/consumed", response_model=ConsumedResponse)
-async def mark_consumed(req: ConsumedRequest, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def mark_consumed(req: ConsumedRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Record that the user has read/listened to a recommendation. Stored in the vector store
     so future recommendations avoid repeats and better match their tastes.
@@ -1534,7 +1536,7 @@ async def mark_consumed(req: ConsumedRequest, request: Request, current_user: Cu
 
 
 @api_router.get("/library")
-async def get_library(request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def get_library(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Return consumed items grouped by type for the Library UI.
     """
@@ -1548,7 +1550,7 @@ async def get_library(request: Request, current_user: CurrentUser | None = Depen
 
 
 @api_router.patch("/library/{item_id}")
-async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Update date_completed and/or note for a library item by id.
     """
@@ -1569,7 +1571,7 @@ async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Req
 
 
 @api_router.delete("/library/{item_id}")
-async def delete_library_item(item_id: str, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def delete_library_item(item_id: str, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Remove a library item from the consumed collection.
     """
@@ -1583,7 +1585,7 @@ async def delete_library_item(item_id: str, request: Request, current_user: Curr
 
 
 @api_router.post("/library-notes", response_model=LibraryNoteResponse)
-async def library_notes(req: LibraryNoteRequest, request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def library_notes(req: LibraryNoteRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Library helper endpoint: user can paste titles or notes about books, podcasts,
     articles, or research they've read. An agent organizes this into structured
@@ -1618,7 +1620,7 @@ async def lightrag_context(q: str = "", mode: str = "hybrid"):
 
 
 @api_router.post("/memory-wipe")
-async def memory_wipe(request: Request, current_user: CurrentUser | None = Depends(get_current_user_optional)):
+async def memory_wipe(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
     """
     Wipe gist and episodic memory for the current user/instance. Consumed library is kept.
     """
