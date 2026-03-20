@@ -122,6 +122,8 @@ export const Personaplex = () => {
   const [backendSummaries, setBackendSummaries] = useState<BackendSummary[] | null>(null);
   const [backendSummariesLoading, setBackendSummariesLoading] = useState(false);
   const [showLiveTranscription, setShowLiveTranscription] = useState(true);
+  const [inputMode, setInputMode] = useState<"voice" | "text">("voice");
+  const [typedInput, setTypedInput] = useState("");
   type RecItem = { title: string; author?: string; reason?: string; url?: string };
   const [recommendations, setRecommendations] = useState<{ books: RecItem[]; podcasts: RecItem[]; articles: RecItem[]; research: RecItem[] }>({ books: [], podcasts: [], articles: [], research: [] });
   const [recommendationsLoading, setRecommendationsLoading] = useState(false);
@@ -1046,13 +1048,44 @@ export const Personaplex = () => {
                   </span>
                 </div>
               </div>
+              <div className="mt-3 space-y-1.5">
+                <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
+                  Input mode
+                </label>
+                <div className="inline-flex rounded-lg border border-slate-700/50 bg-slate-900/70 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setInputMode("voice")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                      inputMode === "voice"
+                        ? "bg-violet-600/80 text-white"
+                        : "text-slate-300 hover:bg-slate-700/60"
+                    }`}
+                    aria-pressed={inputMode === "voice"}
+                  >
+                    Voice
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setInputMode("text")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                      inputMode === "text"
+                        ? "bg-violet-600/80 text-white"
+                        : "text-slate-300 hover:bg-slate-700/60"
+                    }`}
+                    aria-pressed={inputMode === "text"}
+                  >
+                    Text
+                  </button>
+                </div>
+              </div>
             </div>
 
             {/* Center column - Orb (order 2 on mobile) */}
-            <div className="order-2 lg:order-none flex flex-col items-center justify-center gap-2 sm:gap-4 min-h-0 py-2 sm:py-4 lg:py-0 min-w-0 w-full">
-              <div className="flex-none flex flex-col items-center gap-3">
+            <div className="order-2 lg:order-none relative flex flex-col items-center justify-center gap-2 sm:gap-4 min-h-0 py-2 sm:py-4 lg:py-0 min-w-0 w-full">
+              <div className={`flex-1 flex flex-col items-center justify-center gap-3 transition-transform duration-300 ease-out ${inputMode === "text" && isConnected ? "lg:-translate-y-10" : ""}`}>
                 <Orb state={orbState} thinkingProgress={thinkingProgress} />
-                {isVoiceMemoMode && isConnected && (
+                {inputMode === "voice" && isVoiceMemoMode && isConnected && (
                   isVoiceMemoRecording ? (
                     <button
                       type="button"
@@ -1079,7 +1112,7 @@ export const Personaplex = () => {
                     </button>
                   ) : null
                 )}
-                {!isVoiceMemoMode && isConnected && isUserSpeaking && !isAiSpeaking && (
+                {inputMode === "voice" && !isVoiceMemoMode && isConnected && isUserSpeaking && !isAiSpeaking && (
                   <button
                     type="button"
                     onClick={commitManual}
@@ -1089,6 +1122,36 @@ export const Personaplex = () => {
                   </button>
                 )}
               </div>
+              {inputMode === "text" && view === "session" && isConnected && (
+                <div className="w-full max-w-2xl mt-2 lg:mt-0 lg:absolute lg:bottom-0 rounded-xl border border-slate-700/50 bg-slate-900/50 p-3">
+                  <label htmlFor="typed-session-input" className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">
+                    Type to AI
+                  </label>
+                  <div className="flex flex-col gap-2">
+                    <textarea
+                      id="typed-session-input"
+                      value={typedInput}
+                      onChange={(e) => setTypedInput(e.target.value)}
+                      placeholder="Type your message..."
+                      rows={5}
+                      className="h-28 w-full resize-none overflow-y-auto rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50"
+                    />
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-slate-500">
+                        Send behavior will be added next.
+                      </span>
+                      <button
+                        type="button"
+                        disabled
+                        className="px-4 py-2 rounded-lg bg-violet-500/80 text-white text-sm font-medium opacity-50 cursor-not-allowed"
+                        title="Send wiring comes in next step"
+                      >
+                        Send
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Right column - Transcript (order 3 on mobile) */}
