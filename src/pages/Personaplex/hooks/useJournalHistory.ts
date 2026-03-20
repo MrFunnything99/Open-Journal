@@ -128,6 +128,39 @@ export const useJournalHistory = () => {
     return id;
   }, []);
 
+  /**
+   * Create or update one active history entry while a live session is running.
+   * Returns the stable entry id so callers can keep updating the same card.
+   */
+  const saveOrUpdateEntry = useCallback(
+    (entryId: string | null, transcript: ChatMessage[], dateOverride?: string) => {
+      if (transcript.length === 0) return entryId ?? "";
+      const date =
+        dateOverride && !Number.isNaN(Date.parse(dateOverride))
+          ? dateOverride
+          : new Date().toISOString();
+      const preview = transcriptToPreview(transcript);
+      const id = entryId || generateId();
+      setEntries((prev) => {
+        const idx = prev.findIndex((e) => e.id === id);
+        const nextEntry: JournalEntry = {
+          id,
+          date,
+          preview,
+          fullTranscript: transcript,
+          // Any update means this entry should be re-synced.
+          syncedToMemory: false,
+        };
+        if (idx === -1) return [nextEntry, ...prev];
+        const copy = [...prev];
+        copy[idx] = nextEntry;
+        return copy;
+      });
+      return id;
+    },
+    []
+  );
+
   const markEntrySynced = useCallback((id: string) => {
     setEntries((prev) =>
       prev.map((e) => (e.id === id ? { ...e, syncedToMemory: true } : e))
@@ -202,6 +235,7 @@ export const useJournalHistory = () => {
   return {
     entries,
     saveEntry,
+    saveOrUpdateEntry,
     markEntrySynced,
     syncUnsyncedEntries,
     clearHistory,

@@ -255,6 +255,7 @@ export const Personaplex = () => {
   const {
     entries,
     saveEntry,
+    saveOrUpdateEntry,
     markEntrySynced,
     syncUnsyncedEntries,
     deleteEntry,
@@ -612,6 +613,8 @@ export const Personaplex = () => {
   const [thinkingProgress, setThinkingProgress] = useState(0);
   const thinkingStartRef = useRef<number | null>(null);
   const thinkingRafRef = useRef<number | null>(null);
+  const activeSessionEntryIdRef = useRef<string | null>(null);
+  const lastAutoSavedSignatureRef = useRef("");
 
   useEffect(() => {
     if (!isProcessing) {
@@ -641,12 +644,27 @@ export const Personaplex = () => {
   }, [isProcessing]);
 
   const handleConnect = useCallback(() => {
+    activeSessionEntryIdRef.current = null;
+    lastAutoSavedSignatureRef.current = "";
     connect();
   }, [connect]);
 
+  // Autosave after every completed AI turn so abrupt disconnects still preserve history.
+  useEffect(() => {
+    if (transcript.length === 0) return;
+    const last = transcript[transcript.length - 1];
+    if (!last || last.role !== "ai") return;
+    const signature = `${transcript.length}|${last.text}`;
+    if (signature === lastAutoSavedSignatureRef.current) return;
+    lastAutoSavedSignatureRef.current = signature;
+    const id = saveOrUpdateEntry(activeSessionEntryIdRef.current, transcript);
+    if (id) activeSessionEntryIdRef.current = id;
+  }, [transcript, saveOrUpdateEntry]);
+
   const handleDisconnect = useCallback(() => {
     if (transcript.length > 0) {
-      const id = saveEntry(transcript);
+      const id = saveOrUpdateEntry(activeSessionEntryIdRef.current, transcript);
+      if (id) activeSessionEntryIdRef.current = id;
       const transcriptText = transcript
         .map((e) => (e.role === "user" ? "User: " + e.text : "Assistant: " + e.text))
         .join("\n\n");
@@ -664,10 +682,12 @@ export const Personaplex = () => {
       setToastMessage("Journal entry saved and synced to memory.");
       setTimeout(() => setToastMessage(null), 3000);
     }
+    activeSessionEntryIdRef.current = null;
+    lastAutoSavedSignatureRef.current = "";
     setTranscript([]);
     setInterimTranscript("");
     disconnect();
-  }, [disconnect, transcript, saveEntry, markEntrySynced, fetchMemoryStats]);
+  }, [disconnect, transcript, saveOrUpdateEntry, markEntrySynced, fetchMemoryStats]);
 
   useEffect(() => {
     if (!isConnected) {
