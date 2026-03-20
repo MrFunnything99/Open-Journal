@@ -670,7 +670,7 @@ def update_gist(fact_id: int, document: str, embedding: list[float]) -> bool:
     conn.execute("DELETE FROM vec_gist WHERE doc_id = ?", (fact_id,))
     conn.execute(
         """
-        INSERT INTO vec_gist (doc_id, embedding, session_id, timestamp, document)
+        INSERT OR REPLACE INTO vec_gist (doc_id, embedding, session_id, timestamp, document)
         SELECT ?, ?, session_id, timestamp, ? FROM memory_facts WHERE id = ?
         """,
         (fact_id, blob, document, fact_id),
@@ -700,7 +700,7 @@ def update_episodic(
     conn.execute("DELETE FROM vec_episodic WHERE doc_id = ?", (summary_id,))
     conn.execute(
         """
-        INSERT INTO vec_episodic (doc_id, embedding, session_id, timestamp, document)
+        INSERT OR REPLACE INTO vec_episodic (doc_id, embedding, session_id, timestamp, document)
         SELECT ?, ?, session_id, timestamp, ? FROM memory_episodic WHERE id = ?
         """,
         (summary_id, blob, document, summary_id),

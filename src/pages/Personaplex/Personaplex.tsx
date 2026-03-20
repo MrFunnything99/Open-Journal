@@ -125,6 +125,7 @@ export const Personaplex = () => {
   type RecItem = { title: string; author?: string; reason?: string; url?: string };
   const [recommendations, setRecommendations] = useState<{ books: RecItem[]; podcasts: RecItem[]; articles: RecItem[]; research: RecItem[] }>({ books: [], podcasts: [], articles: [], research: [] });
   const [recommendationsLoading, setRecommendationsLoading] = useState(false);
+  const recommendationsInFlightRef = useRef(false);
   const [consumedIds, setConsumedIds] = useState<Set<string>>(new Set());
   const [removingKeys, setRemovingKeys] = useState<Set<string>>(new Set());
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
@@ -336,9 +337,11 @@ export const Personaplex = () => {
   }, [view, authUser, fetchBackendSummaries]);
 
   const fetchRecommendations = useCallback((showLoadingUnlessCached = false, retryCount = 0) => {
+    if (recommendationsInFlightRef.current) return;
     const doFetch = (isRetry: boolean) => {
       const ac = new AbortController();
       const timeoutId = setTimeout(() => ac.abort(), 125000);
+      recommendationsInFlightRef.current = true;
       backendFetch("/recommendations", { signal: ac.signal })
         .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
         .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
@@ -364,6 +367,7 @@ export const Personaplex = () => {
         })
         .finally(() => {
           clearTimeout(timeoutId);
+          recommendationsInFlightRef.current = false;
           setRecommendationsLoading(false);
         });
     };
