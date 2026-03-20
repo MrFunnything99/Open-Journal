@@ -560,6 +560,7 @@ export const Personaplex = () => {
     connect,
     disconnect,
     commitManual,
+    submitTextTurn,
     isConnected,
     isUserSpeaking,
     isAiSpeaking,
@@ -666,6 +667,11 @@ export const Personaplex = () => {
     setInterimTranscript("");
     disconnect();
   }, [disconnect, transcript, saveEntry, markEntrySynced, fetchMemoryStats]);
+
+  const handleSendTypedInput = useCallback(() => {
+    const sent = submitTextTurn(typedInput);
+    if (sent) setTypedInput("");
+  }, [submitTextTurn, typedInput]);
 
   useEffect(() => {
     if (!isConnected) {
@@ -1138,13 +1144,14 @@ export const Personaplex = () => {
                     />
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-xs text-slate-500">
-                        Send behavior will be added next.
+                        Send a typed turn to continue the session.
                       </span>
                       <button
                         type="button"
-                        disabled
-                        className="px-4 py-2 rounded-lg bg-violet-500/80 text-white text-sm font-medium opacity-50 cursor-not-allowed"
-                        title="Send wiring comes in next step"
+                        onClick={handleSendTypedInput}
+                        disabled={!typedInput.trim() || isProcessing || isAiSpeaking}
+                        className="px-4 py-2 rounded-lg bg-violet-500/80 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
+                        title="Send message"
                       >
                         Send
                       </button>

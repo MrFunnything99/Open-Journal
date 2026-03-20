@@ -685,6 +685,20 @@ export const usePersonaplexSession = ({
     }, 1500);
   }, [stopRecording, processUserInput]);
 
+  const submitTextTurn = useCallback(
+    (text: string): boolean => {
+      const cleaned = text.trim();
+      if (!cleaned) return false;
+      if (!isConnectedRef.current || isProcessingRef.current || isAiSpeakingRef.current) return false;
+      // Ensure we do not keep live mic capture active when a typed turn is submitted.
+      stopRecording();
+      onInterimTranscript("");
+      processUserInput(cleaned);
+      return true;
+    },
+    [processUserInput, onInterimTranscript, stopRecording]
+  );
+
   const startVoiceMemoRecording = useCallback(async () => {
     if (!isConnectedRef.current || isProcessingRef.current || isVoiceMemoRecording) return;
     try {
@@ -915,6 +929,7 @@ export const usePersonaplexSession = ({
     connect,
     disconnect,
     commitManual,
+    submitTextTurn,
     isConnected: status === "connected",
     isUserSpeaking,
     isAiSpeaking,
