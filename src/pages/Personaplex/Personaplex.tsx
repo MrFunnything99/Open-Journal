@@ -561,6 +561,8 @@ export const Personaplex = () => {
     disconnect,
     commitManual,
     submitTextTurn,
+    cancelUserCapture,
+    resumeVoiceCapture,
     isConnected,
     isUserSpeaking,
     isAiSpeaking,
@@ -596,6 +598,7 @@ export const Personaplex = () => {
       [fetchLibrary]
     ),
     showLiveTranscription,
+    allowVoiceCapture: inputMode === "voice",
   });
 
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
@@ -672,6 +675,31 @@ export const Personaplex = () => {
     const sent = submitTextTurn(typedInput);
     if (sent) setTypedInput("");
   }, [submitTextTurn, typedInput]);
+
+  const handleInputModeChange = useCallback((mode: "voice" | "text") => {
+    setInputMode(mode);
+  }, []);
+  const isModeToggleLocked = isAiSpeaking || isProcessing;
+
+  const previousInputModeRef = useRef<"voice" | "text">(inputMode);
+  useEffect(() => {
+    if (!isConnected) {
+      previousInputModeRef.current = inputMode;
+      return;
+    }
+    if (previousInputModeRef.current === inputMode) return;
+    if (inputMode === "text") cancelUserCapture();
+    else resumeVoiceCapture();
+    previousInputModeRef.current = inputMode;
+  }, [inputMode, isConnected, cancelUserCapture, resumeVoiceCapture]);
+
+  useEffect(() => {
+    if (!isConnected) return;
+    if (inputMode !== "voice") return;
+    if (isAiSpeaking || isProcessing) return;
+    // If user switched to voice while AI was still talking, start listening as soon as it's safe.
+    resumeVoiceCapture();
+  }, [inputMode, isConnected, isAiSpeaking, isProcessing, resumeVoiceCapture]);
 
   useEffect(() => {
     if (!isConnected) {
@@ -1058,32 +1086,43 @@ export const Personaplex = () => {
                 <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider">
                   Input mode
                 </label>
-                <div className="inline-flex rounded-lg border border-slate-700/50 bg-slate-900/70 p-1">
+                <div
+                  className={`inline-flex rounded-lg border border-slate-700/50 bg-slate-900/70 p-1 transition-opacity ${
+                    isModeToggleLocked ? "opacity-60" : "opacity-100"
+                  }`}
+                >
                   <button
                     type="button"
-                    onClick={() => setInputMode("voice")}
+                    onClick={() => handleInputModeChange("voice")}
+                    disabled={isModeToggleLocked}
                     className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
                       inputMode === "voice"
                         ? "bg-violet-600/80 text-white"
                         : "text-slate-300 hover:bg-slate-700/60"
                     }`}
                     aria-pressed={inputMode === "voice"}
+                    title={isModeToggleLocked ? "Wait for AI to finish before switching modes" : "Use voice input"}
                   >
                     Voice
                   </button>
                   <button
                     type="button"
-                    onClick={() => setInputMode("text")}
+                    onClick={() => handleInputModeChange("text")}
+                    disabled={isModeToggleLocked}
                     className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
                       inputMode === "text"
                         ? "bg-violet-600/80 text-white"
                         : "text-slate-300 hover:bg-slate-700/60"
                     }`}
                     aria-pressed={inputMode === "text"}
+                    title={isModeToggleLocked ? "Wait for AI to finish before switching modes" : "Use text input"}
                   >
                     Text
                   </button>
                 </div>
+                {isModeToggleLocked && (
+                  <p className="text-[11px] text-slate-500">Input mode locks until AI finishes.</p>
+                )}
               </div>
             </div>
 
@@ -1138,6 +1177,12 @@ export const Personaplex = () => {
                       id="typed-session-input"
                       value={typedInput}
                       onChange={(e) => setTypedInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSendTypedInput();
+                        }
+                      }}
                       placeholder="Type your message..."
                       rows={5}
                       className="h-28 w-full resize-none overflow-y-auto rounded-lg bg-slate-900/80 border border-slate-700/50 text-slate-200 text-sm px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50"
@@ -1149,7 +1194,7 @@ export const Personaplex = () => {
                       <button
                         type="button"
                         onClick={handleSendTypedInput}
-                        disabled={!typedInput.trim() || isProcessing || isAiSpeaking}
+                        disabled={!isConnected || !typedInput.trim() || isProcessing || isAiSpeaking}
                         className="px-4 py-2 rounded-lg bg-violet-500/80 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
                         title="Send message"
                       >
@@ -1178,9 +1223,11 @@ export const Personaplex = () => {
               >
                 {transcript.length === 0 && !interimTranscript ? (
                   <p className="text-sm text-slate-500 italic">
-                    {isVoiceMemoMode
-                      ? "Tap Record, speak, then tap Done. Your words will appear here."
-                      : "Conversation will appear here as you speak. Tap Done recording to finish your turn."}
+                    {inputMode === "text"
+                      ? "Type your message, then press Send. The conversation will appear here."
+                      : isVoiceMemoMode
+                        ? "Tap Record, speak, then tap Done. Your words will appear here."
+                        : "Conversation will appear here as you speak. Tap Done recording to finish your turn."}
                   </p>
                 ) : (
                   <>
@@ -2096,7 +2143,9 @@ export const Personaplex = () => {
             ? "Connect to begin your journaling session."
             : isProcessing
               ? "Thinking..."
-              : "Speak naturally. The AI is listening."}
+              : inputMode === "text"
+                ? "Type your message to the AI."
+                : "Speak naturally. The AI is listening."}
         </p>
         <p className="text-[10px] text-slate-600 max-w-xl mx-auto">
           This is a prototype. Please avoid sharing highly sensitive personal information until our data pipeline is more secure. For private or stress testing, run the app locally and use local LLMs.

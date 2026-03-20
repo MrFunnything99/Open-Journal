@@ -31,6 +31,8 @@ export type UsePersonaplexSessionOptions = {
   onNotesSaved?: (notes: { item_id: string; note: string }[]) => void;
   /** If true, show live partial transcription while the user is speaking (desktop flow). If false, only show text after the turn is committed. */
   showLiveTranscription?: boolean;
+  /** If false, session should not open microphone/listening capture (text mode). */
+  allowVoiceCapture?: boolean;
 };
 
 import { backendFetch } from "../../../backendApi";
@@ -251,6 +253,7 @@ export const usePersonaplexSession = ({
   onInterimTranscript,
   onNotesSaved,
   showLiveTranscription = true,
+  allowVoiceCapture = true,
 }: UsePersonaplexSessionOptions) => {
   const [status, setStatus] = useState<PersonaplexConnectionStatus>("disconnected");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -494,6 +497,7 @@ export const usePersonaplexSession = ({
   }, []);
 
   const startRecording = useCallback(() => {
+    if (!allowVoiceCapture) return;
     if (!isConnectedRef.current || isProcessingRef.current || isListeningRef.current) return;
 
     const start = async () => {
@@ -652,7 +656,7 @@ export const usePersonaplexSession = ({
     };
 
     start();
-  }, [processUserInput, onInterimTranscript, stopRecording, stopAiPlayback, showLiveTranscription]);
+  }, [processUserInput, onInterimTranscript, stopRecording, stopAiPlayback, showLiveTranscription, allowVoiceCapture]);
 
   const commitManual = useCallback(() => {
     const w = wsRef.current;
@@ -698,6 +702,32 @@ export const usePersonaplexSession = ({
     },
     [processUserInput, onInterimTranscript, stopRecording]
   );
+
+  const cancelUserCapture = useCallback(() => {
+    if (startRecordingTimeoutRef.current) {
+      clearTimeout(startRecordingTimeoutRef.current);
+      startRecordingTimeoutRef.current = null;
+    }
+    pendingReconnectRef.current = false;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      const recorder = mediaRecorderRef.current;
+      recorder.onstop = null;
+      voiceMemoStreamRef.current?.getTracks().forEach((t) => t.stop());
+      recorder.stop();
+      mediaRecorderRef.current = null;
+      voiceMemoStreamRef.current = null;
+      voiceMemoChunksRef.current = [];
+      setIsVoiceMemoRecording(false);
+    }
+    stopRecording();
+    onInterimTranscript("");
+  }, [onInterimTranscript, stopRecording]);
+
+  const resumeVoiceCapture = useCallback(() => {
+    if (!isConnectedRef.current || isProcessingRef.current || isAiSpeakingRef.current) return;
+    if (isVoiceMemoMode) return;
+    startRecording();
+  }, [startRecording]);
 
   const startVoiceMemoRecording = useCallback(async () => {
     if (!isConnectedRef.current || isProcessingRef.current || isVoiceMemoRecording) return;
@@ -795,6 +825,7 @@ export const usePersonaplexSession = ({
   }, [onInterimTranscript, processUserInput]);
 
   const startRecordingAfterAI = useCallback((playbackFailed?: boolean) => {
+    if (!allowVoiceCapture) return;
     if (!isConnectedRef.current) return;
     if (isVoiceMemoMode) return;
     if (isListeningRef.current) return; // mic never stopped; no need to start again
@@ -808,7 +839,7 @@ export const usePersonaplexSession = ({
       log("Starting recording (mic open)");
       startRecording();
     }, delay);
-  }, [startRecording]);
+  }, [startRecording, allowVoiceCapture]);
   startRecordingAfterAIRef.current = startRecordingAfterAI;
 
   const speak = useCallback(
@@ -930,6 +961,8 @@ export const usePersonaplexSession = ({
     disconnect,
     commitManual,
     submitTextTurn,
+    cancelUserCapture,
+    resumeVoiceCapture,
     isConnected: status === "connected",
     isUserSpeaking,
     isAiSpeaking,
