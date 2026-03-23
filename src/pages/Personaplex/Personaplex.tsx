@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { Dispatch, SetStateAction } from "react";
 import { backendFetch } from "../../backendApi";
 import { usePersonaplexSession, type TranscriptEntry } from "./hooks/usePersonaplexSession";
 
@@ -82,6 +83,93 @@ const FALLBACK_VOICES: VoiceOption[] = [
   { voice_id: "N2lVS1w4EtoT3dr4eOWO", name: "Sam" },
 ];
 
+type PersonaplexView = "session" | "history" | "recommendations" | "calendar";
+
+/** Shared nav for session / history / recommendations / calendar — 44px min touch targets on small screens */
+function PersonaplexNavButtons({
+  view,
+  setView,
+}: {
+  view: PersonaplexView;
+  setView: Dispatch<SetStateAction<PersonaplexView>>;
+}) {
+  const base =
+    "inline-flex items-center justify-center rounded-lg text-sm font-medium transition-colors gap-1.5 " +
+    "min-h-[44px] min-w-[44px] px-2 sm:px-2.5 md:min-h-0 md:min-w-0 md:px-3 md:py-2";
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setView("session")}
+        className={`${base} ${
+          view === "session" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
+        }`}
+        title="Journaling session"
+        aria-label="Journaling session"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          className="h-5 w-5 md:h-4 md:w-4 shrink-0 sm:hidden"
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+          aria-hidden
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={2}
+            d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
+          />
+        </svg>
+        <span className="hidden sm:inline">Session</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => setView("history")}
+        className={`${base} ${
+          view === "history" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
+        }`}
+        title="Journal history"
+        aria-label="Journal history"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 md:h-4 md:w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+        </svg>
+        <span className="hidden sm:inline">History</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => setView("recommendations")}
+        className={`${base} ${
+          view === "recommendations" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
+        }`}
+        title="Personalized recommendations"
+        aria-label="Personalized recommendations"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 md:h-4 md:w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+        </svg>
+        <span className="hidden sm:inline">Recommendations</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => setView("calendar")}
+        className={`${base} ${
+          view === "calendar" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
+        }`}
+        title="Calendar — day highlights"
+        aria-label="Calendar"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 md:h-4 md:w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
+        <span className="hidden sm:inline">Calendar</span>
+      </button>
+    </>
+  );
+}
+
 export const Personaplex = () => {
   // Personalization is always \"high\": the agent should actively connect past memories and journals to the current conversation when relevant.
   const personalization = 1;
@@ -127,6 +215,7 @@ export const Personaplex = () => {
   type RecItem = { title: string; author?: string; reason?: string; url?: string };
   const [recommendations, setRecommendations] = useState<{ books: RecItem[]; podcasts: RecItem[]; articles: RecItem[]; research: RecItem[] }>({ books: [], podcasts: [], articles: [], research: [] });
   const [recommendationsLoading, setRecommendationsLoading] = useState(false);
+  const recommendationsInFlightRef = useRef(false);
   const [consumedIds, setConsumedIds] = useState<Set<string>>(new Set());
   const [removingKeys, setRemovingKeys] = useState<Set<string>>(new Set());
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
@@ -256,6 +345,7 @@ export const Personaplex = () => {
   const {
     entries,
     saveEntry,
+    saveOrUpdateEntry,
     markEntrySynced,
     syncUnsyncedEntries,
     deleteEntry,
@@ -338,9 +428,11 @@ export const Personaplex = () => {
   }, [view, authUser, fetchBackendSummaries]);
 
   const fetchRecommendations = useCallback((showLoadingUnlessCached = false, retryCount = 0) => {
+    if (recommendationsInFlightRef.current) return;
     const doFetch = (isRetry: boolean) => {
       const ac = new AbortController();
       const timeoutId = setTimeout(() => ac.abort(), 125000);
+      recommendationsInFlightRef.current = true;
       backendFetch("/recommendations", { signal: ac.signal })
         .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
         .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
@@ -366,6 +458,7 @@ export const Personaplex = () => {
         })
         .finally(() => {
           clearTimeout(timeoutId);
+          recommendationsInFlightRef.current = false;
           setRecommendationsLoading(false);
         });
     };
@@ -614,6 +707,8 @@ export const Personaplex = () => {
   const [thinkingProgress, setThinkingProgress] = useState(0);
   const thinkingStartRef = useRef<number | null>(null);
   const thinkingRafRef = useRef<number | null>(null);
+  const activeSessionEntryIdRef = useRef<string | null>(null);
+  const lastAutoSavedSignatureRef = useRef("");
 
   useEffect(() => {
     if (!isProcessing) {
@@ -643,12 +738,27 @@ export const Personaplex = () => {
   }, [isProcessing]);
 
   const handleConnect = useCallback(() => {
+    activeSessionEntryIdRef.current = null;
+    lastAutoSavedSignatureRef.current = "";
     connect();
   }, [connect]);
 
+  // Autosave after every completed AI turn so abrupt disconnects still preserve history.
+  useEffect(() => {
+    if (transcript.length === 0) return;
+    const last = transcript[transcript.length - 1];
+    if (!last || last.role !== "ai") return;
+    const signature = `${transcript.length}|${last.text}`;
+    if (signature === lastAutoSavedSignatureRef.current) return;
+    lastAutoSavedSignatureRef.current = signature;
+    const id = saveOrUpdateEntry(activeSessionEntryIdRef.current, transcript);
+    if (id) activeSessionEntryIdRef.current = id;
+  }, [transcript, saveOrUpdateEntry]);
+
   const handleDisconnect = useCallback(() => {
     if (transcript.length > 0) {
-      const id = saveEntry(transcript);
+      const id = saveOrUpdateEntry(activeSessionEntryIdRef.current, transcript);
+      if (id) activeSessionEntryIdRef.current = id;
       const transcriptText = transcript
         .map((e) => (e.role === "user" ? "User: " + e.text : "Assistant: " + e.text))
         .join("\n\n");
@@ -666,10 +776,12 @@ export const Personaplex = () => {
       setToastMessage("Journal entry saved and synced to memory.");
       setTimeout(() => setToastMessage(null), 3000);
     }
+    activeSessionEntryIdRef.current = null;
+    lastAutoSavedSignatureRef.current = "";
     setTranscript([]);
     setInterimTranscript("");
     disconnect();
-  }, [disconnect, transcript, saveEntry, markEntrySynced, fetchMemoryStats]);
+  }, [disconnect, transcript, saveOrUpdateEntry, markEntrySynced, fetchMemoryStats]);
 
   const handleSendTypedInput = useCallback(() => {
     const sent = submitTextTurn(typedInput);
@@ -918,75 +1030,55 @@ export const Personaplex = () => {
         <div className="absolute bottom-1/4 right-1/4 w-[400px] h-[400px] rounded-full bg-cyan-500/5 blur-3xl" />
       </div>
 
-      {/* Header */}
-      <header className="flex-none relative z-10 grid grid-cols-[1fr_auto_1fr] items-center gap-2 px-4 sm:px-6 py-3 sm:py-4">
-        <div className="flex items-center gap-2 sm:gap-4 min-w-0">
-          <h1 className="text-base sm:text-xl font-light tracking-widest text-slate-300 uppercase truncate">
-            Selfmeridian
-          </h1>
-          <ConnectionStatus status={status} />
-          {errorMessage && (
-            <span className="text-sm text-red-400">{errorMessage}</span>
-          )}
+      {/* Header: mobile stacks rows so Online/Disconnect never overlap; nav uses 44px min touch targets */}
+      <header className="flex-none relative z-10 px-4 sm:px-6 py-3 sm:py-4">
+        {/* Mobile — two rows, no 3-col grid overflow */}
+        <div className="flex flex-col gap-3 md:hidden">
+          <div className="flex items-center justify-between gap-3 min-w-0">
+            <h1 className="text-base font-light tracking-widest text-slate-300 uppercase truncate min-w-0">
+              Selfmeridian
+            </h1>
+            <div className="flex items-center justify-end gap-1.5 shrink-0">
+              <PersonaplexNavButtons view={view} setView={setView} />
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <ConnectionStatus status={status} className="shrink-0" />
+            <ConnectButton
+              status={status}
+              onConnect={handleConnect}
+              onDisconnect={handleDisconnect}
+              className="min-h-[44px] shrink-0"
+            />
+            <AuthButton user={authUser} onUserChange={setAuthUser} className="shrink-0 [&_button]:min-h-[44px]" />
+            {errorMessage && (
+              <span className="text-sm text-red-400 w-full basis-full">{errorMessage}</span>
+            )}
+          </div>
         </div>
-        <div className="flex justify-center items-center gap-2 mt-1.5">
-          <ConnectButton
-            status={status}
-            onConnect={handleConnect}
-            onDisconnect={handleDisconnect}
-          />
-          <AuthButton user={authUser} onUserChange={setAuthUser} />
-        </div>
-        <div className="flex items-center justify-end gap-1 sm:gap-2">
-          <button
-            type="button"
-            onClick={() => setView("session")}
-            className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
-              view === "session" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
-            }`}
-            title="Journaling session"
-          >
-            <span className="hidden sm:inline">Session</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setView("history")}
-            className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
-              view === "history" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
-            }`}
-            title="Journal history"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 sm:h-5 sm:w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
-            </svg>
-            <span className="hidden sm:inline">History</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setView("recommendations")}
-            className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
-              view === "recommendations" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
-            }`}
-            title="Personalized recommendations"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 sm:h-5 sm:w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
-            </svg>
-            <span className="hidden sm:inline">Recommendations</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setView("calendar")}
-            className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
-              view === "calendar" ? "bg-violet-600/80 text-white" : "bg-slate-700/50 text-slate-300 hover:bg-slate-600/50"
-            }`}
-            title="Calendar — day highlights"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 sm:h-5 sm:w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-            </svg>
-            <span className="hidden sm:inline">Calendar</span>
-          </button>
+
+        {/* Tablet/desktop — original 3-column layout */}
+        <div className="hidden md:grid md:grid-cols-[1fr_auto_1fr] md:items-center md:gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+            <h1 className="text-base sm:text-xl font-light tracking-widest text-slate-300 uppercase truncate">
+              Selfmeridian
+            </h1>
+            <ConnectionStatus status={status} />
+            {errorMessage && (
+              <span className="text-sm text-red-400">{errorMessage}</span>
+            )}
+          </div>
+          <div className="flex justify-center items-center gap-2">
+            <ConnectButton
+              status={status}
+              onConnect={handleConnect}
+              onDisconnect={handleDisconnect}
+            />
+            <AuthButton user={authUser} onUserChange={setAuthUser} />
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            <PersonaplexNavButtons view={view} setView={setView} />
+          </div>
         </div>
       </header>
 

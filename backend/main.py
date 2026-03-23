@@ -589,6 +589,7 @@ async def api_me(current_user: CurrentUser = Depends(get_current_user)):
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
 ELEVENLABS_SCRIBE_TOKEN_URL = "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe"
+ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 FALLBACK_VOICES = [
     {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
@@ -607,6 +608,12 @@ class VoiceRequest(BaseModel):
     text: str
     voiceId: Optional[str] = None
     voice_settings: Optional[Dict[str, float]] = None
+
+
+class TranscribeRequest(BaseModel):
+    """Batch STT for voice-memo flow (iOS Safari, etc.). Same contract as api/transcribe.ts."""
+    audio: str
+    format: Optional[str] = None
 
 
 @api_router.post("/voice")
@@ -1649,6 +1656,91 @@ async def health():
 
 # Mount API under /api
 app.include_router(api_router, prefix="/api")
+
+
+@app.post("/api/transcribe", include_in_schema=False)
+async def api_transcribe(req: TranscribeRequest):
+    """
+    Batch speech-to-text (ElevenLabs scribe_v2). Voice memo / iOS Safari posts here.
+    Registered on the main app (not only APIRouter) so POST is never shadowed by the SPA
+    catch-all GET /{full_path} (which would otherwise yield 405 Method Not Allowed).
+    """
+    import base64 as b64
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY is not configured")
+    audio_b64 = (req.audio or "").strip()
+    if not audio_b64:
+        raise HTTPException(status_code=400, detail="audio (base64) is required")
+    try:
+        raw = b64.b64decode(audio_b64, validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 audio")
+    if len(raw) < 100:
+        raise HTTPException(status_code=400, detail="Audio too short to transcribe")
+
+    model_id = "scribe_v2"
+    boundary = f"----SelfmeridianBoundary{uuid.uuid4().hex[:24]}"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="model_id"\r\n\r\n'
+        f"{model_id}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode("utf-8") + raw + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    content_type = f"multipart/form-data; boundary={boundary}"
+
+    request = urllib.request.Request(
+        ELEVENLABS_STT_URL,
+        data=body,
+        method="POST",
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": content_type,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as resp:
+            raw_text = resp.read().decode("utf-8")
+            status_code = resp.status
+    except urllib.error.HTTPError as e:
+        status_code = e.code
+        try:
+            raw_text = e.read().decode("utf-8")
+        except Exception:
+            raw_text = ""
+    except Exception as e:
+        print("[backend] /api/transcribe error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    data: dict = {}
+    if raw_text.strip():
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            print("[backend] /api/transcribe non-JSON:", raw_text[:300])
+    if status_code < 200 or status_code >= 300:
+        err_detail = data.get("detail")
+        if isinstance(err_detail, dict):
+            msg = err_detail.get("message") or str(err_detail)
+        elif isinstance(err_detail, str):
+            msg = err_detail
+        else:
+            msg = (
+                data.get("message")
+                or (raw_text.strip()[:300] if raw_text.strip() else None)
+                or f"ElevenLabs STT failed ({status_code})"
+            )
+        raise HTTPException(status_code=500, detail=str(msg))
+    text = data.get("text")
+    transcript = str(text).strip() if text is not None else ""
+    return {"text": transcript}
+
 
 # Serve built frontend (monolith: only when static dir exists, e.g. Docker build)
 STATIC_DIR = Path(__file__).resolve().parent / "static"

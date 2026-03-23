@@ -17,6 +17,15 @@ LIGHTRAG_ENABLED = os.getenv("LIGHTRAG_ENABLED", "true").lower() in ("true", "1"
 
 _rag = None
 _rag_ready = False
+_lightrag_runtime_disabled = False
+
+
+def _disable_lightrag_runtime(reason: str) -> None:
+    """Disable LightRAG for this process after a hard runtime incompatibility."""
+    global _lightrag_runtime_disabled
+    if not _lightrag_runtime_disabled:
+        print("[backend] LightRAG disabled for this process:", reason)
+    _lightrag_runtime_disabled = True
 
 
 def _embed_texts_sync(texts: list[str]) -> list[list[float]]:
@@ -48,7 +57,7 @@ async def _get_rag():
     global _rag, _rag_ready
     if _rag_ready and _rag is not None:
         return _rag
-    if not LIGHTRAG_ENABLED:
+    if not LIGHTRAG_ENABLED or _lightrag_runtime_disabled:
         return None
     try:
         from lightrag import LightRAG, QueryParam
@@ -69,7 +78,14 @@ async def _get_rag():
         llm_model_func=_llm_async,
         llm_model_name=os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash"),
     )
-    await rag.initialize_storages()
+    try:
+        await rag.initialize_storages()
+    except Exception as e:
+        # Known compatibility breakage in some lightrag-hku versions.
+        if "DocProcessingStatus.__init__()" in str(e) and "error_msg" in str(e):
+            _disable_lightrag_runtime("DocProcessingStatus schema mismatch")
+            return None
+        raise
     _rag = rag
     _rag_ready = True
     return rag
@@ -83,9 +99,13 @@ async def insert_text(text: str) -> bool:
     if rag is None:
         return False
     try:
-        await rag.ainsert(text.strip())
+        # Keep this strictly best-effort so background indexing cannot degrade UX.
+        await asyncio.wait_for(rag.ainsert(text.strip()), timeout=20)
         return True
     except Exception as e:
+        if "DocProcessingStatus.__init__()" in str(e) and "error_msg" in str(e):
+            _disable_lightrag_runtime("DocProcessingStatus schema mismatch")
+            return False
         if "history_messages" not in str(e):
             print("[backend] LightRAG ainsert error:", e)
         return False

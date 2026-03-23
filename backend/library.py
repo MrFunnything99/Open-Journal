@@ -917,8 +917,7 @@ def save_session_data(session_id: str, transcript: str, entry_date: str | None =
     if facts:
         fact_embs = _embed_texts(facts)
         n_existing = vec_store.gist_count(instance_id=instance_id or "")
-        for fact in facts:
-            emb = fact_embs[facts.index(fact)]
+        for fact, emb in zip(facts, fact_embs):
             if n_existing > 0:
                 nearest = vec_store.query_gist_nearest(emb, k=1)
                 if nearest:
