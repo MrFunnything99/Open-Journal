@@ -1,10 +1,18 @@
 import { FC, useCallback, useEffect, useId, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
+import type { ChatMessage } from "../hooks/useJournalHistory";
 
 type Props = {
   onToast: (msg: string) => void;
   /** Opens the full voice session panel (ChatGPT-style “voice mode” control). */
   onOpenSessionPanel?: () => void;
+  /** Persist to The Brain → Knowledge base → Journals (uses date for folder layout + memory ingest). */
+  saveEntry?: (transcript: ChatMessage[], dateIso: string) => string;
+  syncUnsyncedEntries?: () => Promise<number>;
+  /**
+   * Chat tab: keep the composer higher (not flush to the bottom) and reserve space beneath it for extra UI.
+   */
+  elevateComposerLayout?: boolean;
 };
 
 type UiMessage = {
@@ -25,7 +33,84 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+/** Transcription APIs use the filename extension to detect container format. */
+function defaultFilenameForMicBlob(mimeType: string): string {
+  const mt = (mimeType || "").toLowerCase();
+  if (mt.includes("mp4") || mt.includes("m4a") || mt.includes("aac") || mt === "audio/mp4") {
+    return "dictation.m4a";
+  }
+  if (mt.includes("webm")) return "dictation.webm";
+  if (mt.includes("wav")) return "dictation.wav";
+  if (mt.includes("mpeg") || mt.includes("mp3")) return "dictation.mp3";
+  if (mt.includes("ogg") || mt.includes("opus")) return "dictation.ogg";
+  if (mt.includes("flac")) return "dictation.flac";
+  return "dictation.webm";
+}
+
+function effectiveRecorderMime(recorder: MediaRecorder): string {
+  const t = recorder.mimeType?.trim();
+  if (t) return t;
+  // Safari (iOS and desktop) often emits MP4/AAC but leaves mimeType empty when WebM isn't used.
+  if (typeof navigator !== "undefined" && navigator.vendor === "Apple Computer, Inc.") {
+    return "audio/mp4";
+  }
+  return "audio/webm";
+}
+
 const CHAT_TIMEOUT_MS = 90_000;
+
+type HomeInteractionMode = "conversation" | "journal" | "autobiography";
+
+const HOME_MODES: HomeInteractionMode[] = ["conversation", "journal", "autobiography"];
+
+const HOME_MODE_META: Record<
+  HomeInteractionMode,
+  { label: string; sublabel: string; description: string }
+> = {
+  conversation: {
+    label: "Conversation",
+    sublabel: "Chat freely",
+    description:
+      "Your default AI assistant. Chat freely, ask questions, and explore ideas—enhanced with your personal context.",
+  },
+  journal: {
+    label: "Journal",
+    sublabel: "Reflect",
+    description:
+      "A space for free-flow reflection. Write naturally, process your thoughts, and receive optional AI feedback or gentle structure.",
+  },
+  autobiography: {
+    label: "Autobiography",
+    sublabel: "Track your life",
+    description:
+      "A structured way to track and understand your life. Reflect on your day, habits, goals, and past experiences through guided conversation.",
+  },
+};
+
+function toDateInputValue(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function toTimeInputValue(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** Local date + time inputs → ISO UTC (matches Brain / ingest `entry.date`). */
+function dateAndTimeToIso(dateStr: string, timeStr: string): string {
+  const d = dateStr.trim();
+  const t = (timeStr.trim() || "00:00").slice(0, 5);
+  const dp = d.split("-").map((x) => parseInt(x, 10));
+  const tp = t.split(":").map((x) => parseInt(x, 10));
+  const y = dp[0]!;
+  const mo = dp[1]!;
+  const day = dp[2]!;
+  const h = tp[0] ?? 0;
+  const mi = tp[1] ?? 0;
+  if ([y, mo, day, h, mi].some((n) => Number.isNaN(n))) return new Date().toISOString();
+  return new Date(y, mo - 1, day, h, mi, 0, 0).toISOString();
+}
 
 function WaveformIcon({ className }: { className?: string }) {
   return (
@@ -37,7 +122,13 @@ function WaveformIcon({ className }: { className?: string }) {
   );
 }
 
-export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
+export const VoiceMemoTab: FC<Props> = ({
+  onToast,
+  onOpenSessionPanel,
+  saveEntry,
+  syncUnsyncedEntries,
+  elevateComposerLayout = false,
+}) => {
   const idPrefix = useId();
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [draft, setDraft] = useState("");
@@ -53,8 +144,13 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
   const [validationModel, setValidationModel] = useState("openai/gpt-5.4");
   const [modelUsed, setModelUsed] = useState("");
   const [validating, setValidating] = useState(false);
+  /** Local date/time for journal entry (separate inputs); set when transcript first arrives. */
+  const [journalEntryDate, setJournalEntryDate] = useState("");
+  const [journalEntryTime, setJournalEntryTime] = useState("");
+  const [savingJournal, setSavingJournal] = useState(false);
   /** After first text send: hero fades, composer stays at bottom, sidebar + thread layout. */
   const [isChatActive, setIsChatActive] = useState(false);
+  const [homeInteractionMode, setHomeInteractionMode] = useState<HomeInteractionMode>("conversation");
   const listRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -157,11 +253,11 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
     setError(null);
     try {
       const b64 = await blobToBase64(blob);
-      // Whisper uses the filename extension to detect format; MediaRecorder blobs have no name.
+      // Transcription uses the filename extension to detect format; MediaRecorder blobs have no name.
       const filename =
         blob instanceof File && blob.name?.trim()
           ? blob.name.trim()
-          : "dictation.webm";
+          : defaultFilenameForMicBlob(mimeType);
       const res = await backendFetch("/voice-memo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -182,12 +278,17 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
       const line = (data.polished_text ?? data.raw_transcript ?? "").trim();
       if (line) {
         setIsChatActive(true);
-        setRawTranscript((data.raw_transcript ?? line).trim());
-        setReviewText((data.raw_transcript ?? line).trim());
+        const capturedAt = new Date();
+        const rawBody = ((data.raw_transcript ?? "").trim() || line).trim();
+        const reviewBody = (data.raw_transcript ?? line).trim();
+        setRawTranscript(rawBody);
+        setReviewText(reviewBody);
         setValidatedJournal("");
         setValidationFeedback("");
         setValidationNotes([]);
         setModelUsed("");
+        setJournalEntryDate(toDateInputValue(capturedAt));
+        setJournalEntryTime(toTimeInputValue(capturedAt));
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Transcription failed");
@@ -239,8 +340,46 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
     setValidationFeedback("");
     setValidationNotes([]);
     setModelUsed("");
+    setJournalEntryDate("");
+    setJournalEntryTime("");
     setError(null);
   }, []);
+
+  const saveToJournal = useCallback(async () => {
+    if (!saveEntry || savingJournal) return;
+    const body = (validatedJournal.trim() || reviewText.trim());
+    if (!body) {
+      onToast("Nothing to save yet.");
+      return;
+    }
+    if (!journalEntryDate.trim() || !journalEntryTime.trim()) {
+      onToast("Set entry date and time before saving.");
+      return;
+    }
+    const transcript: ChatMessage[] = [{ role: "user", text: body }];
+    const dateIso = dateAndTimeToIso(journalEntryDate, journalEntryTime);
+    setSavingJournal(true);
+    try {
+      const id = saveEntry(transcript, dateIso);
+      if (!id) {
+        onToast("Could not save.");
+        return;
+      }
+      void syncUnsyncedEntries?.();
+      onToast("Saved to your journal. Open The Brain → Knowledge base to view.");
+    } finally {
+      setSavingJournal(false);
+    }
+  }, [
+    saveEntry,
+    syncUnsyncedEntries,
+    savingJournal,
+    validatedJournal,
+    reviewText,
+    journalEntryDate,
+    journalEntryTime,
+    onToast,
+  ]);
 
   const startRecording = useCallback(async () => {
     if (micPhase !== "idle" || sending) return;
@@ -259,9 +398,10 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
       };
       mr.onstop = () => {
         stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(chunksRef.current, { type: mr.mimeType || "audio/webm" });
+        const mime = effectiveRecorderMime(mr);
+        const blob = new Blob(chunksRef.current, { type: mime });
         mediaRecorderRef.current = null;
-        void processMicAudio(blob, blob.type || "audio/webm");
+        void processMicAudio(blob, mime);
       };
       mr.start();
       mediaRecorderRef.current = mr;
@@ -391,7 +531,9 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div
             ref={listRef}
-            className="relative min-h-0 flex-1 overflow-y-auto"
+            className={`relative min-h-0 flex-1 overflow-y-auto ${
+              elevateComposerLayout && !isChatActive ? "max-h-[min(52vh,520px)] md:max-h-[min(48vh,560px)]" : ""
+            }`}
             role="log"
             aria-live="polite"
           >
@@ -405,8 +547,11 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
                 <h1 className="max-w-lg text-3xl font-light leading-tight tracking-tight text-white md:text-4xl">
                   The space to be heard.
                 </h1>
-                <p className="mt-10 max-w-md text-sm leading-relaxed text-white/60">
-                  SelfMeridian is your private space to reflect, grow, and cultivate a deeper connection with yourself.
+                <p
+                  key={homeInteractionMode}
+                  className="mt-10 max-w-md animate-hero-mode-desc text-sm leading-relaxed text-white/70 md:text-[0.95rem]"
+                >
+                  {HOME_MODE_META[homeInteractionMode].description}
                 </p>
               </div>
             </div>
@@ -425,6 +570,34 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
                     <p className="mt-2 text-sm text-white/70">
                       {"Transcribe -> human review/edit -> AI reformat + validation. You can loop this as many times as you want."}
                     </p>
+                    {saveEntry && (
+                      <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
+                        <div className="flex flex-col gap-1">
+                          <label className="text-xs text-white/60" htmlFor={`${idPrefix}-journal-date`}>
+                            Entry date
+                          </label>
+                          <input
+                            id={`${idPrefix}-journal-date`}
+                            type="date"
+                            value={journalEntryDate}
+                            onChange={(e) => setJournalEntryDate(e.target.value)}
+                            className="rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                          />
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <label className="text-xs text-white/60" htmlFor={`${idPrefix}-journal-time`}>
+                            Entry time
+                          </label>
+                          <input
+                            id={`${idPrefix}-journal-time`}
+                            type="time"
+                            value={journalEntryTime}
+                            onChange={(e) => setJournalEntryTime(e.target.value)}
+                            className="rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                          />
+                        </div>
+                      </div>
+                    )}
                     <textarea
                       value={reviewText}
                       onChange={(e) => setReviewText(e.target.value)}
@@ -448,6 +621,21 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
                       </select>
                     </div>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
+                      {saveEntry && (
+                        <button
+                          type="button"
+                          onClick={() => void saveToJournal()}
+                          disabled={
+                            savingJournal ||
+                            !journalEntryDate.trim() ||
+                            !journalEntryTime.trim() ||
+                            !(validatedJournal.trim() || reviewText.trim())
+                          }
+                          className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
+                        >
+                          {savingJournal ? "Saving…" : "Save to journal"}
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => void runJournalValidation()}
@@ -568,9 +756,9 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
           </div>
 
           <div
-            className={`flex flex-none bg-transparent px-3 pb-5 pt-2 transition-[padding] duration-500 ease-out md:px-4 ${
-              isChatActive ? "border-t border-white/[0.07]" : ""
-            }`}
+            className={`flex flex-none flex-col bg-transparent px-3 pt-2 transition-[padding] duration-500 ease-out md:px-4 ${
+              elevateComposerLayout ? "pb-2" : "pb-5"
+            } ${isChatActive ? "border-t border-white/[0.07]" : ""}`}
           >
             <div className="mx-auto w-full max-w-[48rem]">
               {!isChatActive && error && (
@@ -586,7 +774,49 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
               >
                 {composerInner}
               </div>
+
+              <div
+                className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3"
+                role="radiogroup"
+                aria-label="How you want to use the assistant"
+              >
+                {HOME_MODES.map((mode) => {
+                  const selected = homeInteractionMode === mode;
+                  const meta = HOME_MODE_META[mode];
+                  return (
+                    <button
+                      key={mode}
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      onClick={() => setHomeInteractionMode(mode)}
+                      className={`group flex flex-col items-stretch rounded-2xl border px-4 py-3.5 text-left transition-all duration-300 ease-out focus:outline-none focus-visible:ring-2 focus-visible:ring-white/25 focus-visible:ring-offset-2 focus-visible:ring-offset-transparent ${
+                        selected
+                          ? "border-white/30 bg-white/[0.14] text-white shadow-[0_0_24px_-4px_rgba(255,255,255,0.12)] ring-1 ring-white/15"
+                          : "border-white/10 bg-white/[0.04] text-white/45 hover:border-white/20 hover:bg-white/[0.08] hover:text-white/75 hover:shadow-[0_0_20px_-6px_rgba(255,255,255,0.08)]"
+                      }`}
+                    >
+                      <span className={`text-sm font-semibold tracking-tight ${selected ? "text-white" : "text-white/80"}`}>
+                        {meta.label}
+                      </span>
+                      <span
+                        className={`mt-1 text-xs font-medium leading-snug transition-colors duration-300 ${
+                          selected ? "text-white/75" : "text-white/50 group-hover:text-white/65"
+                        }`}
+                      >
+                        {meta.sublabel}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
+            {elevateComposerLayout && !isChatActive ? (
+              <div
+                className="mx-auto mt-4 w-full max-w-[48rem] flex-none min-h-[6.5rem] sm:min-h-[7.5rem]"
+                aria-hidden
+              />
+            ) : null}
           </div>
         </div>
       </div>

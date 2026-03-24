@@ -152,33 +152,6 @@ async function fetchVoiceAudio(
   return { base64: data.audio, format: data.format ?? "mp3" };
 }
 
-async function fetchScribeToken(): Promise<string> {
-  const res = await fetch("/api/scribe-token");
-  const rawText = await res.text();
-  let data: { error?: string; token?: string } = {};
-  if (rawText.trim()) {
-    try {
-      data = JSON.parse(rawText) as { error?: string; token?: string };
-    } catch {
-      throw new Error(
-        res.status === 404
-          ? "Scribe token API not found. Run 'npm run dev'."
-          : `Scribe token API error (${res.status})`
-      );
-    }
-  }
-
-  if (!res.ok) {
-    throw new Error(data.error || `Scribe token API failed (${res.status})`);
-  }
-
-  if (!data.token || typeof data.token !== "string") {
-    throw new Error(data.error || "No token in response");
-  }
-
-  return data.token;
-}
-
 async function fetchTranscribe(audioBase64: string): Promise<string> {
   const res = await fetch("/api/transcribe", {
     method: "POST",
@@ -200,45 +173,20 @@ async function fetchTranscribe(audioBase64: string): Promise<string> {
   return (data.text ?? "").trim();
 }
 
-function float32ToPcmBase64(float32: Float32Array, targetRate?: number, sourceRate?: number): string {
-  let samples = float32;
-  if (targetRate && sourceRate && targetRate !== sourceRate) {
-    const ratio = sourceRate / targetRate;
-    const outLen = Math.floor(float32.length / ratio);
-    const resampled = new Float32Array(outLen);
-    for (let i = 0; i < outLen; i++) {
-      const srcIdx = i * ratio;
-      const lo = Math.floor(srcIdx);
-      const hi = Math.min(lo + 1, float32.length - 1);
-      const frac = srcIdx - lo;
-      resampled[i] = (float32[lo] ?? 0) * (1 - frac) + (float32[hi] ?? 0) * frac;
-    }
-    samples = resampled;
-  }
-  const pcm = new Int16Array(samples.length);
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i] ?? 0));
-    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  const bytes = new Uint8Array(pcm.buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]!);
-  }
-  return btoa(binary);
+function pickMediaRecorderMime(): string {
+  if (typeof MediaRecorder === "undefined") return "";
+  if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) return "audio/webm;codecs=opus";
+  if (MediaRecorder.isTypeSupported("audio/webm")) return "audio/webm";
+  return "";
 }
 
-const SCRIBE_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
-const SCRIBE_MODEL = "scribe_v2_realtime";
-
-function createSilentPcmBase64(numSamples: number): string {
-  const pcm = new Int16Array(numSamples);
-  const bytes = new Uint8Array(pcm.buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]!);
+function effectiveMimeForLiveRecorder(recorder: MediaRecorder): string {
+  const t = recorder.mimeType?.trim();
+  if (t) return t;
+  if (typeof navigator !== "undefined" && navigator.vendor === "Apple Computer, Inc.") {
+    return "audio/mp4";
   }
-  return btoa(binary);
+  return "audio/webm";
 }
 
 export const usePersonaplexSession = ({
@@ -268,11 +216,11 @@ export const usePersonaplexSession = ({
   const voiceMemoStreamRef = useRef<MediaStream | null>(null);
   const voiceMemoChunksRef = useRef<Blob[]>([]);
   const lastFailedPlaybackRef = useRef<{ blob: Blob; mime: string } | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const liveSttRecorderRef = useRef<MediaRecorder | null>(null);
+  const liveSttChunksRef = useRef<Blob[]>([]);
+  const liveSttMimeRef = useRef<string>("audio/webm");
+  const liveSttIntentRef = useRef<"idle" | "commit" | "cancel">("idle");
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const currentPlaybackSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const transcriptRef = useRef<TranscriptEntry[]>([]);
@@ -280,10 +228,6 @@ export const usePersonaplexSession = ({
   const isListeningRef = useRef(false);
   const startRecordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isAiSpeakingRef = useRef(false);
-  const targetRateRef = useRef<number>(16000);
-  const manualBufferRef = useRef<string[]>([]);
-  const pendingManualCommitRef = useRef(false);
-  const pendingManualCommitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const manualModeRef = useRef(manualMode);
   manualModeRef.current = manualMode;
   const isConnectedRef = useRef(false);
@@ -450,50 +394,17 @@ export const usePersonaplexSession = ({
     [selectedVoiceId]
   );
 
-  const stopAiPlayback = useCallback(() => {
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current.currentTime = 0;
-      currentAudioRef.current = null;
-    }
-    if (currentPlaybackSourceRef.current) {
-      try {
-        currentPlaybackSourceRef.current.stop();
-      } catch {
-        /* already stopped */
-      }
-      currentPlaybackSourceRef.current = null;
-    }
-    isAiSpeakingRef.current = false;
-    setIsAiSpeaking(false);
-    log("AI playback stopped");
-  }, []);
-
   const stopRecording = useCallback(() => {
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.close();
-      wsRef.current = null;
-    }
-    const proc = processorRef.current;
-    if (proc) {
-      proc.disconnect();
-      processorRef.current = null;
-    }
-    const src = sourceRef.current;
-    if (src) {
-      src.disconnect();
-      sourceRef.current = null;
-    }
-    const stream = streamRef.current;
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop());
+    const mr = liveSttRecorderRef.current;
+    if (mr && mr.state !== "inactive") {
+      liveSttIntentRef.current = "cancel";
+      mr.stop();
+    } else {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
+      isListeningRef.current = false;
+      setIsUserSpeaking(false);
     }
-    audioContextRef.current?.close();
-    audioContextRef.current = null;
-    isListeningRef.current = false;
-    setIsUserSpeaking(false);
   }, []);
 
   const startRecording = useCallback(() => {
@@ -516,178 +427,88 @@ export const usePersonaplexSession = ({
         }
         streamRef.current = stream;
 
-        const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const ctx = new AudioContextClass();
-        audioContextRef.current = ctx;
+        const mime = pickMediaRecorderMime();
+        const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        liveSttMimeRef.current = effectiveMimeForLiveRecorder(recorder);
+        liveSttChunksRef.current = [];
+        liveSttIntentRef.current = "idle";
 
-        const sourceRate = ctx.sampleRate;
-        // Force 16kHz for best mobile compatibility - ElevenLabs recommends it for speech
-        const targetRate = 16000;
-        const audioFormat = "pcm_16000";
-
-        const token = await fetchScribeToken();
-        targetRateRef.current = targetRate;
-
-        // Manual turn-taking: user ends turn with button, no hands-free phrases.
-        const commitStrategy = "manual";
-        log("WebSocket params: commit_strategy =", commitStrategy, "sourceRate =", sourceRate);
-        const params = new URLSearchParams({
-          token,
-          model_id: SCRIBE_MODEL,
-          commit_strategy: commitStrategy,
-          audio_format: audioFormat,
-          language_code: "en",
-        });
-        const ws = new WebSocket(`${SCRIBE_WS_URL}?${params}`);
-        wsRef.current = ws;
-
-        ws.onerror = () => {
-          setErrorMessage("Live transcription connection failed");
-          setStatus("error");
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) liveSttChunksRef.current.push(e.data);
         };
 
-        ws.onclose = () => {
-          wsRef.current = null;
-        };
+        recorder.onstop = async () => {
+          liveSttRecorderRef.current = null;
+          streamRef.current?.getTracks().forEach((t) => t.stop());
+          streamRef.current = null;
+          isListeningRef.current = false;
+          setIsUserSpeaking(false);
 
-        ws.onmessage = (event) => {
+          const intent = liveSttIntentRef.current;
+          liveSttIntentRef.current = "idle";
+          const chunks = [...liveSttChunksRef.current];
+          liveSttChunksRef.current = [];
+
+          if (intent === "cancel") {
+            onInterimTranscript("");
+            return;
+          }
+          if (intent !== "commit") {
+            onInterimTranscript("");
+            return;
+          }
+          if (chunks.length === 0) {
+            setErrorMessage("No speech captured");
+            onInterimTranscript("");
+            return;
+          }
+
           try {
-            const msg = JSON.parse(event.data) as { message_type?: string; text?: string; error?: string };
-            const type = msg.message_type;
-
-            if (type === "partial_transcript" && typeof msg.text === "string") {
-              // While user is speaking, optionally show the latest partial text as live transcription.
-              if (!isAiSpeakingRef.current && showLiveTranscription) {
-                onInterimTranscript(msg.text);
-              }
-            } else if (type === "committed_transcript" && typeof msg.text === "string") {
-              const text = msg.text.trim();
-              if (text) {
-                // Manual mode: buffer committed chunks until the user taps Done, then send once.
-                if (isAiSpeakingRef.current) {
-                  log("IGNORED committed_transcript (AI still speaking):", text.slice(0, 50));
-                  return;
-                }
-                manualBufferRef.current.push(text);
-                if (pendingManualCommitRef.current) {
-                  if (pendingManualCommitTimeoutRef.current) {
-                    clearTimeout(pendingManualCommitTimeoutRef.current);
-                    pendingManualCommitTimeoutRef.current = null;
-                  }
-                  const fullText = manualBufferRef.current.join(" ").trim();
-                  manualBufferRef.current = [];
-                  pendingManualCommitRef.current = false;
-                  stopRecording();
-                  if (fullText) {
-                    log("Processing (user clicked Done):", fullText.slice(0, 50));
-                    processUserInput(fullText);
-                  } else {
-                    onInterimTranscript("");
-                  }
-                } else {
-                  log("Buffered chunk (waiting for Done click)");
-                  if (showLiveTranscription) {
-                    onInterimTranscript(manualBufferRef.current.join(" "));
-                  }
-                }
-              }
-            } else if (type === "error" || type === "auth_error" || type === "quota_exceeded") {
-              const err = msg.error ?? "Transcription error";
-              console.error("[Personaplex] Scribe error:", err);
-              setErrorMessage(err);
-              stopRecording();
-              if (isAiSpeakingRef.current) {
-                pendingReconnectRef.current = true;
-              } else {
-                startRecording();
-              }
+            if (showLiveTranscription) onInterimTranscript("Transcribing...");
+            const blob = new Blob(chunks, { type: liveSttMimeRef.current });
+            const b64 = await blobToWavBase64(blob);
+            const text = (await fetchTranscribe(b64)).trim();
+            onInterimTranscript("");
+            if (text) {
+              await processUserInput(text);
+            } else {
+              setErrorMessage("No speech detected");
             }
-          } catch {
-            // ignore parse errors
-          }
-        };
-
-        ws.onopen = () => {
-          setErrorMessage(null);
-          try {
-            const source = ctx.createMediaStreamSource(stream);
-            sourceRef.current = source;
-
-            const bufferSize = 4096;
-            const processor = ctx.createScriptProcessor(bufferSize, 1, 1);
-            processorRef.current = processor;
-
-            processor.onaudioprocess = (e) => {
-              const w = wsRef.current;
-              if (!w || w.readyState !== WebSocket.OPEN) return;
-
-              const input = e.inputBuffer.getChannelData(0);
-              const base64 = float32ToPcmBase64(input, targetRate, sourceRate);
-
-              w.send(
-                JSON.stringify({
-                  message_type: "input_audio_chunk",
-                  audio_base_64: base64,
-                  sample_rate: targetRate,
-                  commit: false,
-                })
-              );
-            };
-
-            source.connect(processor);
-            processor.connect(ctx.destination);
-
-            isListeningRef.current = true;
-            setIsUserSpeaking(true);
-            manualBufferRef.current = [];
-            onInterimTranscript("Listening...");
           } catch (err) {
-            console.error("[Personaplex] Mic access error:", err);
-            setErrorMessage("Microphone access denied or unavailable");
-            setStatus("error");
-            ws.close();
+            console.error("[Personaplex] Live STT / OpenAI transcribe error:", err);
+            const msg = err instanceof Error ? err.message : "Transcription failed";
+            setErrorMessage(msg);
+            onInterimTranscript("");
+            if (isAiSpeakingRef.current) {
+              pendingReconnectRef.current = true;
+            }
           }
         };
+
+        liveSttRecorderRef.current = recorder;
+        recorder.start();
+        isListeningRef.current = true;
+        setIsUserSpeaking(true);
+        setErrorMessage(null);
+        if (showLiveTranscription) onInterimTranscript("Listening…");
+        else onInterimTranscript("");
       } catch (err) {
-        console.error("[Personaplex] Scribe token error:", err);
-        setErrorMessage(err instanceof Error ? err.message : "Could not start live transcription");
+        console.error("[Personaplex] Live STT start error:", err);
+        setErrorMessage(err instanceof Error ? err.message : "Could not start recording");
         setStatus("error");
       }
     };
 
-    start();
-  }, [processUserInput, onInterimTranscript, stopRecording, stopAiPlayback, showLiveTranscription, allowVoiceCapture]);
+    void start();
+  }, [processUserInput, onInterimTranscript, showLiveTranscription, allowVoiceCapture]);
 
   const commitManual = useCallback(() => {
-    const w = wsRef.current;
-    if (!w || w.readyState !== WebSocket.OPEN || !isListeningRef.current) return;
+    const mr = liveSttRecorderRef.current;
+    if (!mr || mr.state !== "recording" || !isListeningRef.current) return;
     if (isAiSpeakingRef.current) return;
-
-    pendingManualCommitRef.current = true;
-
-    const rate = targetRateRef.current;
-    const silentChunk = createSilentPcmBase64(1024);
-    w.send(
-      JSON.stringify({
-        message_type: "input_audio_chunk",
-        audio_base_64: silentChunk,
-        sample_rate: rate,
-        commit: true,
-      })
-    );
-    log("Manual commit sent (buffered chunks:", manualBufferRef.current.length, ")");
-
-    pendingManualCommitTimeoutRef.current = setTimeout(() => {
-      pendingManualCommitTimeoutRef.current = null;
-      if (pendingManualCommitRef.current && manualBufferRef.current.length > 0) {
-        pendingManualCommitRef.current = false;
-        const fullText = manualBufferRef.current.join(" ").trim();
-        manualBufferRef.current = [];
-        stopRecording();
-        if (fullText) processUserInput(fullText);
-      }
-    }, 1500);
-  }, [stopRecording, processUserInput]);
+    liveSttIntentRef.current = "commit";
+    mr.stop();
+  }, []);
 
   const submitTextTurn = useCallback(
     (text: string): boolean => {
@@ -907,10 +728,6 @@ export const usePersonaplexSession = ({
       backendSessionIdRef.current = null;
     }
     isConnectedRef.current = false;
-    if (pendingManualCommitTimeoutRef.current) {
-      clearTimeout(pendingManualCommitTimeoutRef.current);
-      pendingManualCommitTimeoutRef.current = null;
-    }
     if (startRecordingTimeoutRef.current) {
       clearTimeout(startRecordingTimeoutRef.current);
       startRecordingTimeoutRef.current = null;
@@ -946,8 +763,6 @@ export const usePersonaplexSession = ({
     isAiSpeakingRef.current = false;
     isProcessingRef.current = false;
     isListeningRef.current = false;
-    manualBufferRef.current = [];
-    pendingManualCommitRef.current = false;
     pendingReconnectRef.current = false;
     lastFailedPlaybackRef.current = null;
     setLastPlaybackFailed(false);

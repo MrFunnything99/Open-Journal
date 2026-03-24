@@ -380,7 +380,7 @@ class TranscribeRequest(BaseModel):
 
 
 class VoiceMemoRequest(BaseModel):
-    """Voice Memo tab: base64 audio → Whisper (or ElevenLabs) → Gemini polish."""
+    """Voice Memo tab: base64 audio → OpenAI transcription (or ElevenLabs) → Gemini polish."""
     audio: str
     filename: Optional[str] = None
     mime_type: Optional[str] = None
@@ -441,12 +441,17 @@ def _guess_audio_filename(filename: Optional[str], mime_type: Optional[str]) -> 
     return "recording.webm"
 
 
-def _build_openai_whisper_multipart(audio_bytes: bytes, filename: str) -> tuple[str, bytes]:
-    boundary = f"----SelfMeridianWhisper{uuid.uuid4().hex[:20]}"
+def _openai_transcription_model() -> str:
+    return (os.getenv("OPENAI_TRANSCRIPTION_MODEL") or "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+
+
+def _build_openai_transcription_multipart(audio_bytes: bytes, filename: str, model: str) -> tuple[str, bytes]:
+    boundary = f"----SelfMeridianSTT{uuid.uuid4().hex[:20]}"
     buf = io.BytesIO()
     buf.write(f"--{boundary}\r\n".encode())
     buf.write(b'Content-Disposition: form-data; name="model"\r\n\r\n')
-    buf.write(b"whisper-1\r\n")
+    buf.write(model.encode("utf-8"))
+    buf.write(b"\r\n")
     buf.write(f"--{boundary}\r\n".encode())
     buf.write(f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode())
     buf.write(b"Content-Type: application/octet-stream\r\n\r\n")
@@ -455,14 +460,15 @@ def _build_openai_whisper_multipart(audio_bytes: bytes, filename: str) -> tuple[
     return boundary, buf.getvalue()
 
 
-def _openai_whisper_transcribe(audio_bytes: bytes, filename: str) -> str:
+def _openai_speech_to_text(audio_bytes: bytes, filename: str) -> str:
     import urllib.error
     import urllib.request
 
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
         raise ValueError("OPENAI_API_KEY is not configured")
-    boundary, body = _build_openai_whisper_multipart(audio_bytes, filename)
+    model = _openai_transcription_model()
+    boundary, body = _build_openai_transcription_multipart(audio_bytes, filename, model)
     req = urllib.request.Request(
         "https://api.openai.com/v1/audio/transcriptions",
         data=body,
@@ -483,14 +489,14 @@ def _openai_whisper_transcribe(audio_bytes: bytes, filename: str) -> str:
         except Exception:
             raw_text = ""
     except Exception as e:
-        raise ValueError(f"Whisper request failed: {e}") from e
+        raise ValueError(f"OpenAI transcription request failed: {e}") from e
     if status < 200 or status >= 300:
         try:
             err_j = json.loads(raw_text)
             detail = err_j.get("error", {}).get("message") if isinstance(err_j.get("error"), dict) else err_j.get("error")
         except Exception:
             detail = raw_text[:400] if raw_text else None
-        raise ValueError(detail or f"Whisper API error ({status})")
+        raise ValueError(detail or f"OpenAI transcription error ({status})")
     try:
         data = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -1725,7 +1731,7 @@ app.include_router(api_router, prefix="/api")
 @app.post("/api/transcribe", include_in_schema=False)
 async def api_transcribe(req: TranscribeRequest):
     """
-    Batch speech-to-text (ElevenLabs scribe_v2). Voice memo / iOS Safari posts here.
+    Batch speech-to-text: OpenAI (gpt-4o-mini-transcribe by default) when OPENAI_API_KEY is set, else ElevenLabs scribe_v2.
     Registered on the main app (not only APIRouter) so POST is never shadowed by the SPA
     catch-all GET /{full_path} (which would otherwise yield 405 Method Not Allowed).
     """
@@ -1734,9 +1740,13 @@ async def api_transcribe(req: TranscribeRequest):
     import urllib.request
     import uuid
 
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY is not configured")
+    if not openai_key and not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Configure OPENAI_API_KEY (recommended) or ELEVENLABS_API_KEY for transcription.",
+        )
     audio_b64 = (req.audio or "").strip()
     if not audio_b64:
         raise HTTPException(status_code=400, detail="audio (base64) is required")
@@ -1746,6 +1756,13 @@ async def api_transcribe(req: TranscribeRequest):
         raise HTTPException(status_code=400, detail="Invalid base64 audio")
     if len(raw) < 100:
         raise HTTPException(status_code=400, detail="Audio too short to transcribe")
+
+    if openai_key:
+        try:
+            transcript = await asyncio.to_thread(_openai_speech_to_text, raw, "audio.wav")
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        return {"text": transcript or ""}
 
     model_id = "scribe_v2"
     boundary = f"----SelfmeridianBoundary{uuid.uuid4().hex[:24]}"
@@ -1809,7 +1826,7 @@ async def api_transcribe(req: TranscribeRequest):
 @app.post("/api/voice-memo", include_in_schema=False)
 async def api_voice_memo(req: VoiceMemoRequest):
     """
-    Voice Memo tab: transcribe with OpenAI Whisper when OPENAI_API_KEY is set, else ElevenLabs STT.
+    Voice Memo tab: transcribe with OpenAI (gpt-4o-mini-transcribe by default) when OPENAI_API_KEY is set, else ElevenLabs STT.
     Optionally polish with Gemini (GEMINI_API_KEY). Returns raw + polished text for saving to The Brain.
     """
     import base64 as b64
@@ -1830,12 +1847,12 @@ async def api_voice_memo(req: VoiceMemoRequest):
     if not openai_key and not el_key:
         raise HTTPException(
             status_code=500,
-            detail="Configure OPENAI_API_KEY (Whisper) or ELEVENLABS_API_KEY for transcription.",
+            detail="Configure OPENAI_API_KEY (speech-to-text) or ELEVENLABS_API_KEY for transcription.",
         )
-    transcribe_engine = "whisper"
+    transcribe_engine = "openai"
     try:
         if openai_key:
-            raw_transcript = await asyncio.to_thread(_openai_whisper_transcribe, raw_audio, fname)
+            raw_transcript = await asyncio.to_thread(_openai_speech_to_text, raw_audio, fname)
         else:
             transcribe_engine = "elevenlabs"
             raw_transcript = await asyncio.to_thread(_elevenlabs_transcribe_bytes, raw_audio)

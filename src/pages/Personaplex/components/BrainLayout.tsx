@@ -1,5 +1,6 @@
 import { FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChatMessage, JournalEntry } from "../hooks/useJournalHistory";
+import { formatCalendarDayHeading, localCalendarDayKey } from "../knowledgeBaseMarkdownZip";
 
 export type BrainLibraryCategory = "book" | "podcast" | "article" | "research";
 
@@ -13,6 +14,7 @@ export type LibraryItemRow = {
 
 type Selection =
   | { kind: "journal"; id: string }
+  | { kind: "journal_day"; dayKey: string }
   | { kind: "conversation"; id: string }
   | { kind: "library"; category: BrainLibraryCategory; id: string };
 
@@ -77,6 +79,27 @@ type BrainLayoutProps = {
   onImportKnowledgeBaseFile?: (file: File) => void;
   onImportJournalDumpFolder?: (files: FileList) => void;
 };
+
+function groupJournalMonthByCalendarDay(monthEntries: JournalEntry[]): { dayKey: string; entries: JournalEntry[] }[] {
+  const m = new Map<string, JournalEntry[]>();
+  for (const e of monthEntries) {
+    const k = localCalendarDayKey(e.date);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k)!.push(e);
+  }
+  const keys = [...m.keys()].sort();
+  return keys.map((dayKey) => ({
+    dayKey,
+    entries: (m.get(dayKey) ?? []).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
+  }));
+}
+
+/** Local wall-clock time for an entry (Knowledge base header + sidebar). */
+function formatEntryTimeLabel(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+}
 
 function formatRelativeSaved(iso: string): string {
   const t = Date.parse(iso);
@@ -162,7 +185,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
     () => new Set(["books", "podcasts", "articles", "research"])
   );
-  const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
+  /** `${entryId}:${messageIndex}` so vector-log toggles are unique in day scroll. */
+  const [expandedLogKey, setExpandedLogKey] = useState<string | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
   const moreRef = useRef<HTMLDivElement>(null);
   const knowledgeBaseFileRef = useRef<HTMLInputElement>(null);
@@ -172,7 +196,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
 
   const journalSorted = useMemo(() => {
     const list = entries.filter((e) => !isConversationEntry(e));
-    return list.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    // Chronological (earlier in the day first — e.g. 1 PM above 11 PM on the same date).
+    return list.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
   }, [entries]);
 
   const conversationSorted = useMemo(() => {
@@ -202,7 +227,9 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const selectFirstForTab = useCallback(
     (tab: ExplorerTab): Selection | null => {
       if (tab === "journals") {
-        return journalSorted[0] ? { kind: "journal", id: journalSorted[0].id } : null;
+        if (journalSorted.length === 0) return null;
+        const newest = journalSorted[journalSorted.length - 1];
+        return { kind: "journal_day", dayKey: localCalendarDayKey(newest.date) };
       }
       if (tab === "conversations") {
         return conversationSorted[0] ? { kind: "conversation", id: conversationSorted[0].id } : null;
@@ -226,7 +253,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
       }
       setExplorerTab(next);
       setSelection(selectFirstForTab(next));
-      setExpandedLogIndex(null);
+      setExpandedLogKey(null);
     },
     [explorerTab, journalEditing, selectFirstForTab]
   );
@@ -234,6 +261,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   useEffect(() => {
     setSelection((prev) => {
       if (prev?.kind === "journal" && journalSorted.some((e) => e.id === prev.id)) return prev;
+      if (
+        prev?.kind === "journal_day" &&
+        journalSorted.some((e) => localCalendarDayKey(e.date) === prev.dayKey)
+      ) {
+        return prev;
+      }
       if (prev?.kind === "conversation" && conversationSorted.some((e) => e.id === prev.id)) return prev;
       if (prev?.kind === "library") {
         const list = libraryItems[CAT_KEY[prev.category]];
@@ -261,6 +294,11 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
     return null;
   }, [selection, journalSorted, conversationSorted]);
 
+  const selectedJournalDayEntries = useMemo(() => {
+    if (selection?.kind !== "journal_day") return null;
+    return journalSorted.filter((e) => localCalendarDayKey(e.date) === selection.dayKey);
+  }, [selection, journalSorted]);
+
   /** User-driven selection changes; prompts if leaving a transcript with unsaved edits. */
   const trySelect = useCallback(
     (next: Selection) => {
@@ -273,7 +311,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
         }
       }
       setSelection(next);
-      setExpandedLogIndex(null);
+      setExpandedLogKey(null);
     },
     [journalEditing, selection]
   );
@@ -389,7 +427,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
     [onToast]
   );
 
-  const journalActive = (id: string) => selection?.kind === "journal" && selection.id === id;
+  const journalDayActive = (dayKey: string) => selection?.kind === "journal_day" && selection.dayKey === dayKey;
   const conversationActive = (id: string) => selection?.kind === "conversation" && selection.id === id;
   const libraryActive = (cat: BrainLibraryCategory, id: string) =>
     selection?.kind === "library" && selection.category === cat && selection.id === id;
@@ -561,16 +599,14 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                   {monthLabel}
                                 </button>
                                 {journalExpandedMonths.has(mKey) && (
-                                  <ul className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-0.5 pb-1">
-                                    {monthEntries.map((entry) => (
-                                      <li key={entry.id}>
+                                  <div className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-2 pb-1">
+                                    {groupJournalMonthByCalendarDay(monthEntries).map((dayGroup) => (
+                                      <div key={dayGroup.dayKey}>
                                         <button
                                           type="button"
-                                          onClick={() => {
-                                            trySelect({ kind: "journal", id: entry.id });
-                                          }}
-                                          className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition-colors ${
-                                            journalActive(entry.id)
+                                          onClick={() => trySelect({ kind: "journal_day", dayKey: dayGroup.dayKey })}
+                                          className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition-colors ${
+                                            journalDayActive(dayGroup.dayKey)
                                               ? "bg-white text-gray-900 shadow-sm dark:bg-white dark:text-gray-900"
                                               : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#404040]"
                                           }`}
@@ -578,11 +614,11 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                           <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
                                           </svg>
-                                          <span className="truncate">{getFormattedDate(entry)}</span>
+                                          <span className="min-w-0 flex-1 truncate font-medium">{formatCalendarDayHeading(dayGroup.dayKey)}</span>
                                         </button>
-                                      </li>
+                                      </div>
                                     ))}
-                                  </ul>
+                                  </div>
                                 )}
                               </div>
                             );
@@ -642,26 +678,32 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                 </button>
                                 {convExpandedMonths.has(mKey) && (
                                   <ul className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-0.5 pb-1">
-                                    {monthEntries.map((entry) => (
-                                      <li key={entry.id}>
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            trySelect({ kind: "conversation", id: entry.id });
-                                          }}
-                                          className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition-colors ${
-                                            conversationActive(entry.id)
-                                              ? "bg-white text-gray-900 shadow-sm dark:bg-white dark:text-gray-900"
-                                              : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#404040]"
-                                          }`}
-                                        >
-                                          <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
-                                          </svg>
-                                          <span className="truncate">{getFormattedDate(entry)}</span>
-                                        </button>
-                                      </li>
-                                    ))}
+                                    {monthEntries.map((entry) => {
+                                      const timeLbl = formatEntryTimeLabel(entry.date);
+                                      return (
+                                        <li key={entry.id}>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              trySelect({ kind: "conversation", id: entry.id });
+                                            }}
+                                            className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition-colors ${
+                                              conversationActive(entry.id)
+                                                ? "bg-white text-gray-900 shadow-sm dark:bg-white dark:text-gray-900"
+                                                : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#404040]"
+                                            }`}
+                                          >
+                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                                            </svg>
+                                            <span className="truncate">
+                                              {getFormattedDate(entry)}
+                                              {timeLbl ? ` · ${timeLbl}` : ""}
+                                            </span>
+                                          </button>
+                                        </li>
+                                      );
+                                    })}
                                   </ul>
                                 )}
                               </div>
@@ -881,10 +923,17 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
             </div>
             <div className="flex-1 overflow-y-auto scrollbar px-6 py-8 md:px-10 md:py-10">
               <h3
-                className={`text-2xl md:text-3xl font-semibold text-gray-900 dark:text-gray-100 tracking-tight ${journalEditing ? "mb-2" : "mb-8"}`}
+                className={`text-2xl md:text-3xl font-semibold text-gray-900 dark:text-gray-100 tracking-tight ${journalEditing ? "mb-2" : "mb-2"}`}
               >
                 {getFormattedDate(selectedTranscript)}
               </h3>
+              {formatEntryTimeLabel(selectedTranscript.date) ? (
+                <p
+                  className={`text-lg font-medium text-gray-600 dark:text-white/80 tabular-nums ${journalEditing ? "mb-4" : "mb-6"}`}
+                >
+                  {formatEntryTimeLabel(selectedTranscript.date)}
+                </p>
+              ) : null}
               {journalEditing ? (
                 <p className="mb-6 text-sm text-gray-600 dark:text-white/70">
                   Editing — use <span className="font-medium">Save changes</span> to keep edits, or the pencil to discard.
@@ -913,12 +962,16 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                           <div className="pt-2">
                             <button
                               type="button"
-                              onClick={() => setExpandedLogIndex((prev) => (prev === i ? null : i))}
+                              onClick={() =>
+                                setExpandedLogKey((prev) =>
+                                  prev === `${selectedTranscript.id}:${i}` ? null : `${selectedTranscript.id}:${i}`
+                                )
+                              }
                               className="text-xs font-medium text-gray-700 hover:underline dark:text-white/80"
                             >
-                              {expandedLogIndex === i ? "Hide" : "Show"} memory context (vector DB)
+                              {expandedLogKey === `${selectedTranscript.id}:${i}` ? "Hide" : "Show"} memory context (vector DB)
                             </button>
-                            {expandedLogIndex === i && (
+                            {expandedLogKey === `${selectedTranscript.id}:${i}` && (
                               <pre className="mt-2 p-3 rounded-xl bg-gray-50 text-gray-600 text-xs whitespace-pre-wrap break-words border border-gray-100 max-h-48 overflow-y-auto dark:bg-[#343541] dark:text-gray-400 dark:border-gray-600">
                                 {msg.retrievalLog}
                               </pre>
@@ -935,12 +988,14 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                           <div className="pt-2">
                             <button
                               type="button"
-                              onClick={() => setExpandedLogIndex((prev) => (prev === i ? null : i))}
+                              onClick={() =>
+                                setExpandedLogKey((prev) => (prev === `${selectedTranscript.id}:${i}` ? null : `${selectedTranscript.id}:${i}`))
+                              }
                               className="text-xs font-medium text-gray-700 hover:underline dark:text-white/80"
                             >
-                              {expandedLogIndex === i ? "Hide" : "Show"} memory context (vector DB)
+                              {expandedLogKey === `${selectedTranscript.id}:${i}` ? "Hide" : "Show"} memory context (vector DB)
                             </button>
-                            {expandedLogIndex === i && (
+                            {expandedLogKey === `${selectedTranscript.id}:${i}` && (
                               <pre className="mt-2 p-3 rounded-xl bg-gray-50 text-gray-600 text-xs whitespace-pre-wrap break-words border border-gray-100 max-h-48 overflow-y-auto dark:bg-[#343541] dark:text-gray-400 dark:border-gray-600">
                                 {msg.retrievalLog}
                               </pre>
@@ -949,6 +1004,109 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                         )}
                       </div>
                     ))}
+              </div>
+            </div>
+          </div>
+        ) : selectedJournalDayEntries && selectedJournalDayEntries.length > 0 ? (
+          <div className="flex-1 flex flex-col min-h-0 m-3 md:m-4 rounded-2xl bg-white border border-gray-100 shadow-sm dark:bg-[#2f2f2f] dark:border-gray-700 overflow-hidden">
+            {onDownloadKnowledgeBase && onImportKnowledgeBaseFile && (
+              <>
+                <input
+                  ref={knowledgeBaseFileRef}
+                  type="file"
+                  accept=".zip,application/zip,application/x-zip-compressed,application/json,.json"
+                  className="hidden"
+                  aria-hidden
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) onImportKnowledgeBaseFile(f);
+                    e.target.value = "";
+                  }}
+                />
+                <div className="flex shrink-0 justify-end gap-2 border-b border-gray-100 px-4 pb-2.5 pt-3 dark:border-white/10 dark:bg-[#252525]">
+                  <button
+                    type="button"
+                    onClick={onDownloadKnowledgeBase}
+                    className={knowledgeBaseToolbarBtnClass}
+                    title="Download a .zip of Markdown files: journals/, conversations/, library/"
+                  >
+                    Download Markdown folder
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => knowledgeBaseFileRef.current?.click()}
+                    className={knowledgeBaseToolbarBtnClass}
+                    title="Upload a .zip export (or legacy .json). Layout matches The Brain explorer."
+                  >
+                    Upload Markdown folder
+                  </button>
+                </div>
+              </>
+            )}
+            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-[#343541]/40">
+              <span className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">The Brain</span>
+              <span className="text-xs text-gray-400 dark:text-gray-500">
+                {selectedJournalDayEntries.length} entr{selectedJournalDayEntries.length === 1 ? "y" : "ies"} · scroll to read oldest → newest
+              </span>
+            </div>
+            <div className="flex-1 overflow-y-auto scrollbar px-6 py-8 md:px-10 md:py-10">
+              <h3 className="text-2xl md:text-3xl font-semibold text-gray-900 dark:text-gray-100 tracking-tight mb-8">
+                {formatCalendarDayHeading(localCalendarDayKey(selectedJournalDayEntries[0].date))}
+              </h3>
+              <div className="max-w-3xl space-y-12 text-[15px] md:text-base leading-[1.75] text-gray-800 dark:text-gray-200 font-sans">
+                {selectedJournalDayEntries.map((entry, entryIdx) => {
+                  const timeLbl = formatEntryTimeLabel(entry.date);
+                  return (
+                    <article key={entry.id} className={entryIdx > 0 ? "pt-12 border-t border-gray-100 dark:border-white/10" : ""}>
+                      <div className="flex flex-wrap items-start justify-between gap-2 mb-6">
+                        <div>
+                          {timeLbl ? (
+                            <p className="text-lg font-medium text-gray-600 dark:text-white/80 tabular-nums">{timeLbl}</p>
+                          ) : (
+                            <p className="text-lg font-medium text-gray-600 dark:text-white/80">{getFormattedDate(entry)}</p>
+                          )}
+                          <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">Saved {formatRelativeSaved(entry.date)}</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => trySelect({ kind: "journal", id: entry.id })}
+                          className="shrink-0 rounded-full border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-800 shadow-sm hover:bg-gray-50 dark:border-white/15 dark:bg-white/10 dark:text-white dark:hover:bg-white/15"
+                        >
+                          Edit this entry
+                        </button>
+                      </div>
+                      <div className="space-y-8">
+                        {entry.fullTranscript.map((msg, i) => {
+                          const logKey = `${entry.id}:${i}`;
+                          return (
+                            <div key={i} className="space-y-2">
+                              <p className="text-xs font-semibold uppercase tracking-widest text-gray-400 dark:text-gray-500">
+                                {msg.role === "user" ? "You" : "AI"}
+                              </p>
+                              <p className="whitespace-pre-wrap">{msg.text}</p>
+                              {msg.role === "ai" && msg.retrievalLog && (
+                                <div className="pt-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedLogKey((prev) => (prev === logKey ? null : logKey))}
+                                    className="text-xs font-medium text-gray-700 hover:underline dark:text-white/80"
+                                  >
+                                    {expandedLogKey === logKey ? "Hide" : "Show"} memory context (vector DB)
+                                  </button>
+                                  {expandedLogKey === logKey && (
+                                    <pre className="mt-2 p-3 rounded-xl bg-gray-50 text-gray-600 text-xs whitespace-pre-wrap break-words border border-gray-100 max-h-48 overflow-y-auto dark:bg-[#343541] dark:text-gray-400 dark:border-gray-600">
+                                      {msg.retrievalLog}
+                                    </pre>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </article>
+                  );
+                })}
               </div>
             </div>
           </div>

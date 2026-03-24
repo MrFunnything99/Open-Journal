@@ -3,6 +3,9 @@ import type { ChatMessage, JournalEntry, KnowledgeBaseLibrarySnapshot } from "./
 
 const ROOT = "selfmeridian-knowledge-base";
 
+/** Split marker between multiple entries in one daily Markdown file (export/import round-trip). */
+export const KNOWLEDGE_BASE_ENTRY_BOUNDARY = "<!-- SelfMeridian:entry-boundary -->";
+
 function isConversationEntry(e: JournalEntry): boolean {
   return e.entrySource === "conversation";
 }
@@ -11,19 +14,60 @@ function slugFilePart(s: string): string {
   return s.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "entry";
 }
 
-function entryRelPath(e: JournalEntry, getFormattedDate: (e: JournalEntry) => string, section: "journals" | "conversations"): string {
-  const d = new Date(e.date);
+/** Local calendar date key `YYYY-MM-DD` for grouping exports and sidebar. */
+export function localCalendarDayKey(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "1970-01-01";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** Heading for a `YYYY-MM-DD` key (Brain sidebar day groups). */
+export function formatCalendarDayHeading(dayKey: string): string {
+  const parts = dayKey.split("-").map((x) => parseInt(x, 10));
+  if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) return dayKey;
+  const [y, mo, d] = parts;
+  return new Date(y!, mo! - 1, d!).toLocaleDateString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function dayBundleRelPath(iso: string, section: "journals" | "conversations"): string {
+  const d = new Date(iso);
   const year = d.getFullYear();
   const monthName = d.toLocaleString("en-US", { month: "long" });
-  const label = slugFilePart(getFormattedDate(e));
-  const idTail = slugFilePart(e.id).slice(-14);
-  return `${section}/${year}/${monthName}/${label}_${idTail}.md`;
+  const dk = localCalendarDayKey(iso);
+  return `${section}/${year}/${monthName}/${dk}.md`;
+}
+
+function bucketEntriesByLocalDay(entries: JournalEntry[], section: "journals" | "conversations"): Map<string, JournalEntry[]> {
+  const map = new Map<string, JournalEntry[]>();
+  for (const e of entries) {
+    const path = dayBundleRelPath(e.date, section);
+    if (!map.has(path)) map.set(path, []);
+    map.get(path)!.push(e);
+  }
+  for (const list of map.values()) {
+    list.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  }
+  return map;
 }
 
 function yamlScalar(s: string): string {
   if (s === "") return '""';
   if (/[\n":]/.test(s) || s.trim() !== s) return JSON.stringify(s);
   return s;
+}
+
+function formatRecordedForMarkdown(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" });
 }
 
 function humanReadableTranscript(e: JournalEntry): string {
@@ -48,6 +92,8 @@ function entryToMarkdown(e: JournalEntry): string {
     `entry_source: ${src}`,
     `synced_to_memory: ${e.syncedToMemory ? "true" : "false"}`,
     "---",
+    "",
+    `**Recorded:** ${formatRecordedForMarkdown(e.date)}`,
     "",
     "## Transcript",
     "",
@@ -94,19 +140,18 @@ function readme(): string {
     "",
     "This archive mirrors **The Brain → Knowledge base** layout:",
     "",
-    "- `journals/<year>/<Month>/` — journal sessions (not from live AI chat)",
-    "- `conversations/<year>/<Month>/` — conversation transcripts",
+    "- `journals/<year>/<Month>/YYYY-MM-DD.md` — one file per calendar day; multiple sessions appear in time order, separated by `<!-- SelfMeridian:entry-boundary -->`",
+    "- `conversations/<year>/<Month>/` — same one-file-per-day layout for live AI chats",
     "- `library/books|podcasts|articles|research/` — media library notes",
     "",
-    "Each entry is Markdown with YAML front matter. Transcript data for round-trip import is stored in the trailing `json` code block.",
+    "Each daily file contains one or more entries (YAML front matter + transcript each). Entries are separated by `<!-- SelfMeridian:entry-boundary -->`. Transcript JSON for re-import is at the end of each entry block.",
     "",
   ].join("\n");
 }
 
 export async function buildKnowledgeBaseMarkdownZip(
   entries: JournalEntry[],
-  library: KnowledgeBaseLibrarySnapshot,
-  getFormattedDate: (e: JournalEntry) => string
+  library: KnowledgeBaseLibrarySnapshot
 ): Promise<Blob> {
   const zip = new JSZip();
   const root = zip.folder(ROOT);
@@ -114,10 +159,17 @@ export async function buildKnowledgeBaseMarkdownZip(
 
   root.file("README.md", readme());
 
-  for (const e of entries) {
-    const section = isConversationEntry(e) ? "conversations" : "journals";
-    const path = entryRelPath(e, getFormattedDate, section);
-    root.file(path, entryToMarkdown(e));
+  const journals = entries.filter((e) => !isConversationEntry(e));
+  const conversations = entries.filter(isConversationEntry);
+
+  for (const [path, dayEntries] of bucketEntriesByLocalDay(journals, "journals")) {
+    const combined = dayEntries.map((e) => entryToMarkdown(e)).join(`\n\n${KNOWLEDGE_BASE_ENTRY_BOUNDARY}\n\n`);
+    root.file(path, combined);
+  }
+
+  for (const [path, dayEntries] of bucketEntriesByLocalDay(conversations, "conversations")) {
+    const combined = dayEntries.map((e) => entryToMarkdown(e)).join(`\n\n${KNOWLEDGE_BASE_ENTRY_BOUNDARY}\n\n`);
+    root.file(path, combined);
   }
 
   (["books", "podcasts", "articles", "research"] as const).forEach((cat) => {
@@ -269,8 +321,21 @@ export async function parseKnowledgeBaseMarkdownZip(file: File): Promise<{
           const { front, body } = parseSimpleFrontmatter(text);
 
           if (kind === "journal" || kind === "conversation") {
-            const je = journalEntryFromMarkdown(body, front, kind === "conversation" ? "conversation" : "journal");
-            if (je) entries.push(je);
+            const segments = text.includes(KNOWLEDGE_BASE_ENTRY_BOUNDARY)
+              ? text
+                  .split(KNOWLEDGE_BASE_ENTRY_BOUNDARY)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              : [text];
+            for (const seg of segments) {
+              const parsed = parseSimpleFrontmatter(seg);
+              const je = journalEntryFromMarkdown(
+                parsed.body,
+                parsed.front,
+                kind === "conversation" ? "conversation" : "journal"
+              );
+              if (je) entries.push(je);
+            }
             return;
           }
 
