@@ -45,6 +45,14 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
   const [sending, setSending] = useState(false);
   const [micPhase, setMicPhase] = useState<"idle" | "recording" | "processing">("idle");
   const [error, setError] = useState<string | null>(null);
+  const [rawTranscript, setRawTranscript] = useState("");
+  const [reviewText, setReviewText] = useState("");
+  const [validatedJournal, setValidatedJournal] = useState("");
+  const [validationFeedback, setValidationFeedback] = useState("");
+  const [validationNotes, setValidationNotes] = useState<string[]>([]);
+  const [validationModel, setValidationModel] = useState("openai/gpt-5.4");
+  const [modelUsed, setModelUsed] = useState("");
+  const [validating, setValidating] = useState(false);
   /** After first text send: hero fades, composer stays at bottom, sidebar + thread layout. */
   const [isChatActive, setIsChatActive] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
@@ -149,10 +157,15 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
     setError(null);
     try {
       const b64 = await blobToBase64(blob);
+      // Whisper uses the filename extension to detect format; MediaRecorder blobs have no name.
+      const filename =
+        blob instanceof File && blob.name?.trim()
+          ? blob.name.trim()
+          : "dictation.webm";
       const res = await backendFetch("/voice-memo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: b64, filename: "dictation.webm", mime_type: mimeType }),
+        body: JSON.stringify({ audio: b64, filename, mime_type: mimeType }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         detail?: string;
@@ -168,13 +181,65 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
       }
       const line = (data.polished_text ?? data.raw_transcript ?? "").trim();
       if (line) {
-        setDraft((prev) => (prev ? `${prev.trim()}\n${line}` : line));
+        setIsChatActive(true);
+        setRawTranscript((data.raw_transcript ?? line).trim());
+        setReviewText((data.raw_transcript ?? line).trim());
+        setValidatedJournal("");
+        setValidationFeedback("");
+        setValidationNotes([]);
+        setModelUsed("");
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Transcription failed");
     } finally {
       setMicPhase("idle");
     }
+  }, []);
+
+  const runJournalValidation = useCallback(async () => {
+    const text = reviewText.trim();
+    if (!text || validating) return;
+    setValidating(true);
+    setError(null);
+    try {
+      const res = await backendFetch("/journal-validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, model: validationModel.trim() || undefined }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        detail?: string;
+        reformatted_journal?: string;
+        feedback?: string;
+        validation_notes?: string[];
+        model_used?: string;
+      };
+      if (!res.ok) {
+        throw new Error(data.detail || `Validation failed (${res.status})`);
+      }
+      const reformatted = (data.reformatted_journal || text).trim();
+      setValidatedJournal(reformatted);
+      setValidationFeedback((data.feedback || "").trim());
+      setValidationNotes(Array.isArray(data.validation_notes) ? data.validation_notes.filter((x) => typeof x === "string") : []);
+      setModelUsed(typeof data.model_used === "string" && data.model_used.trim() ? data.model_used.trim() : "");
+      onToast("Validation complete.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Validation failed";
+      setError(msg);
+      onToast(msg);
+    } finally {
+      setValidating(false);
+    }
+  }, [reviewText, validating, onToast, validationModel]);
+
+  const startAnotherEntry = useCallback(() => {
+    setRawTranscript("");
+    setReviewText("");
+    setValidatedJournal("");
+    setValidationFeedback("");
+    setValidationNotes([]);
+    setModelUsed("");
+    setError(null);
   }, []);
 
   const startRecording = useCallback(async () => {
@@ -224,7 +289,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
     [processMicAudio]
   );
 
-  const composerDisabled = sending || micPhase !== "idle";
+  const composerDisabled = sending || micPhase !== "idle" || validating;
 
   const hasConversation = messages.length > 0 || sending;
 
@@ -346,11 +411,100 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, onOpenSessionPanel }) => {
               </div>
             </div>
 
-            {hasConversation && (
+            {(hasConversation || rawTranscript || reviewText) && (
               <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-8 md:px-6">
                 {error && (
                   <div className="glass-panel mb-6 rounded-2xl px-4 py-3 text-sm text-red-200">
                     {error}
+                  </div>
+                )}
+
+                {(rawTranscript || reviewText) && (
+                  <div className="glass-panel mb-8 rounded-2xl border border-white/10 px-4 py-4 md:px-5">
+                    <p className="text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/50">Journal audio pipeline</p>
+                    <p className="mt-2 text-sm text-white/70">
+                      {"Transcribe -> human review/edit -> AI reformat + validation. You can loop this as many times as you want."}
+                    </p>
+                    <textarea
+                      value={reviewText}
+                      onChange={(e) => setReviewText(e.target.value)}
+                      rows={8}
+                      placeholder="Transcript will appear here..."
+                      className="mt-3 w-full resize-y rounded-xl border border-white/15 bg-black/25 px-3 py-3 text-sm text-white placeholder:text-white/40 focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                    />
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <label className="text-xs text-white/60" htmlFor={`${idPrefix}-validation-model`}>
+                        Cleanup/feedback model
+                      </label>
+                      <select
+                        id={`${idPrefix}-validation-model`}
+                        value={validationModel}
+                        onChange={(e) => setValidationModel(e.target.value)}
+                        className="rounded-full border border-white/20 bg-black/30 px-3 py-1.5 text-xs text-white focus:border-white/30 focus:outline-none"
+                      >
+                        <option value="openai/gpt-5.4">openai/gpt-5.4</option>
+                        <option value="anthropic/claude-sonnet-4.6">anthropic/claude-sonnet-4.6</option>
+                        <option value="anthropic/claude-opus-4.6">anthropic/claude-opus-4.6</option>
+                      </select>
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void runJournalValidation()}
+                        disabled={!reviewText.trim() || validating}
+                        className="rounded-full bg-white px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-50"
+                      >
+                        {validating ? "Validating..." : "Run AI validation"}
+                      </button>
+                      {validatedJournal && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => setDraft(validatedJournal)}
+                            className="rounded-full border border-white/20 px-4 py-1.5 text-xs font-medium text-white/90 transition hover:bg-white/10"
+                          >
+                            Use as draft
+                          </button>
+                          <button
+                            type="button"
+                            onClick={startAnotherEntry}
+                            className="rounded-full border border-white/20 px-4 py-1.5 text-xs font-medium text-white/90 transition hover:bg-white/10"
+                          >
+                            Start another entry
+                          </button>
+                        </>
+                      )}
+                    </div>
+                    {validatedJournal && (
+                      <div className="mt-4 space-y-3 rounded-xl border border-white/10 bg-white/[0.04] p-3">
+                        <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">AI reformatted journal</p>
+                        <textarea
+                          value={validatedJournal}
+                          onChange={(e) => setValidatedJournal(e.target.value)}
+                          rows={8}
+                          className="w-full resize-y rounded-xl border border-white/15 bg-black/25 px-3 py-3 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                        />
+                        {validationFeedback && (
+                          <div>
+                            <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">Feedback</p>
+                            <p className="mt-1 whitespace-pre-wrap text-sm text-white/80">{validationFeedback}</p>
+                          </div>
+                        )}
+                        {modelUsed && (
+                          <p className="text-xs text-white/50">Model used: {modelUsed}</p>
+                        )}
+                        {validationNotes.length > 0 && (
+                          <div>
+                            <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">Validation notes</p>
+                            <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-white/75">
+                              {validationNotes.map((note, i) => (
+                                <li key={`${i}-${note.slice(0, 18)}`}>{note}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 

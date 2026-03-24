@@ -98,6 +98,11 @@ async def lifespan(app: FastAPI):
         print("[backend] XAI_API_KEY is set (Grok 4.20 reasoning for interviewer)")
     else:
         print("[backend] WARNING: XAI_API_KEY is missing. Set it in .env for /chat interviewer.")
+    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if or_key:
+        print("[backend] OPENROUTER_API_KEY is set (journal validation / OpenRouter)")
+    else:
+        print("[backend] WARNING: OPENROUTER_API_KEY is missing. Journal AI validation will be skipped until set in .env.")
     yield
     # Cleanup if needed
     pass
@@ -381,11 +386,39 @@ class VoiceMemoRequest(BaseModel):
     mime_type: Optional[str] = None
 
 
+class JournalValidateRequest(BaseModel):
+    text: str
+    model: Optional[str] = None
+
+
+class JournalValidateResponse(BaseModel):
+    reformatted_journal: str
+    feedback: str
+    validation_notes: list[str] = []
+    model_used: Optional[str] = None
+
+
 VOICE_MEMO_POLISH_INSTRUCTION = """You are editing a voice memo transcript. Clean it into clear, readable prose suitable for a personal journal.
 - Preserve meaning and factual content; do not invent events.
 - Remove filler words, false starts, and obvious speech-to-text errors.
 - Use first person when the speaker is reflecting on themselves.
 Output only the cleaned text with no title or preamble."""
+
+JOURNAL_VALIDATE_INSTRUCTION = """You are a supportive assistant helping someone turn a voice transcript into readable journal text.
+
+Your first job is reformatting only: make the passage coherent and pleasant to read. Smooth out filler and repeated words (e.g. "um", stutters, accidental duplicates), fix obvious transcription errors and misspellings, and resolve small incoherencies—without changing what the author meant. Preserve roughly 98% of their wording; only light edits. Do not invent facts or add new events.
+
+Your second job is short, friendly feedback or light reflection. Stay warm and uplifting toward the writer. Never attack or belittle them. You may name difficult realities in a protective, caring way (e.g. a situation sounds unsafe, or someone treated them poorly).
+
+Do not ask questions or prompt for replies; the writer will respond to feedback on their own.
+
+Respond in this exact format:
+===REFORMATTED===
+<journal text>
+===FEEDBACK===
+<feedback text>
+===VALIDATION===
+- <0–3 short optional lines: only gentle or protective observations; if none, write a single line: - (none)>"""
 
 
 def _guess_audio_filename(filename: Optional[str], mime_type: Optional[str]) -> str:
@@ -546,6 +579,105 @@ async def _polish_voice_memo_gemini(raw: str) -> str:
     except Exception as e:
         print("[backend] voice-memo polish error:", e)
         return (raw or "").strip()
+
+
+async def _validate_journal_openrouter(raw: str, model_override: Optional[str] = None) -> tuple[str, str, list[str], Optional[str]]:
+    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    text = (raw or "").strip()
+    if not text:
+        return "", "", [], None
+    if not key:
+        return (
+            text,
+            "Add OPENROUTER_API_KEY to the project root .env (uncomment and paste your key), save the file, and restart the Python API server (uvicorn / backend on port 8000) so it reloads environment variables.",
+            [],
+            None,
+        )
+    try:
+        import urllib.error
+        import urllib.request
+
+        model = (model_override or os.getenv("OPENROUTER_JOURNAL_VALIDATE_MODEL", "")).strip() or "openai/gpt-5.4"
+        prompt = JOURNAL_VALIDATE_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+        }
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://selfmeridian.local"),
+                "X-Title": os.getenv("OPENROUTER_TITLE", "SelfMeridian"),
+            },
+        )
+
+        def _call() -> str:
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    raw_text = resp.read().decode("utf-8")
+                    status = resp.status
+            except urllib.error.HTTPError as e:
+                status = e.code
+                try:
+                    raw_text = e.read().decode("utf-8")
+                except Exception:
+                    raw_text = ""
+            if status < 200 or status >= 300:
+                try:
+                    err_j = json.loads(raw_text)
+                    detail = err_j.get("error", {}).get("message") if isinstance(err_j.get("error"), dict) else err_j.get("error")
+                except Exception:
+                    detail = raw_text[:300] if raw_text else None
+                raise ValueError(detail or f"OpenRouter error ({status})")
+            data = json.loads(raw_text) if raw_text else {}
+            choices = data.get("choices") if isinstance(data, dict) else None
+            if isinstance(choices, list) and choices:
+                msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+                content = msg.get("content") if isinstance(msg, dict) else ""
+                return str(content or "").strip()
+            return ""
+
+        out = await asyncio.to_thread(_call)
+        if not out:
+            return text, "AI returned empty output.", [], model
+
+        def _between(src: str, start: str, end: Optional[str]) -> str:
+            i = src.find(start)
+            if i == -1:
+                return ""
+            i += len(start)
+            if end is None:
+                return src[i:].strip()
+            j = src.find(end, i)
+            return src[i:j].strip() if j != -1 else src[i:].strip()
+
+        reformatted = _between(out, "===REFORMATTED===", "===FEEDBACK===")
+        feedback = _between(out, "===FEEDBACK===", "===VALIDATION===")
+        validation_block = _between(out, "===VALIDATION===", None)
+
+        notes: list[str] = []
+        for line in validation_block.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("-"):
+                line = line[1:].strip()
+            if line:
+                notes.append(line)
+
+        if not reformatted:
+            reformatted = text
+        if not feedback:
+            feedback = "No major issues found."
+        return reformatted, feedback, notes[:8], model
+    except Exception as e:
+        print("[backend] journal validate openrouter error:", e)
+        return text, "Validation failed; using original transcript.", [str(e)[:180]], None
 
 
 @api_router.post("/voice")
@@ -1721,6 +1853,22 @@ async def api_voice_memo(req: VoiceMemoRequest):
         "transcribe_engine": transcribe_engine,
         "polished_by_gemini": has_gemini and bool((raw_transcript or "").strip()),
     }
+
+
+@app.post("/api/journal-validate", response_model=JournalValidateResponse, include_in_schema=False)
+async def api_journal_validate(req: JournalValidateRequest):
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) < 10:
+        raise HTTPException(status_code=400, detail="Please provide a longer transcript before validation")
+    reformatted, feedback, notes, model_used = await _validate_journal_openrouter(text, req.model)
+    return JournalValidateResponse(
+        reformatted_journal=reformatted,
+        feedback=feedback,
+        validation_notes=notes,
+        model_used=model_used,
+    )
 
 
 # Serve built frontend (monolith: only when static dir exists, e.g. Docker build)

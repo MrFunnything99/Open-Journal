@@ -78,6 +78,78 @@ function isExportPayload(obj: unknown): obj is ExportPayload {
   );
 }
 
+export const KNOWLEDGE_BASE_EXPORT_VERSION = 2 as const;
+
+export type KnowledgeBaseLibraryItem = {
+  id: string;
+  title: string;
+  author?: string;
+  date_completed?: string;
+  note?: string;
+};
+
+export type KnowledgeBaseLibrarySnapshot = {
+  books: KnowledgeBaseLibraryItem[];
+  podcasts: KnowledgeBaseLibraryItem[];
+  articles: KnowledgeBaseLibraryItem[];
+  research: KnowledgeBaseLibraryItem[];
+};
+
+export type KnowledgeBaseExport = {
+  version: typeof KNOWLEDGE_BASE_EXPORT_VERSION;
+  exportedAt: string;
+  entries: JournalEntry[];
+  library: KnowledgeBaseLibrarySnapshot;
+};
+
+function isKnowledgeBaseExport(obj: unknown): obj is KnowledgeBaseExport {
+  if (!isExportPayload(obj)) return false;
+  const o = obj as Record<string, unknown>;
+  if (o.version !== KNOWLEDGE_BASE_EXPORT_VERSION) return false;
+  const lib = o.library;
+  if (lib == null || typeof lib !== "object") return false;
+  const L = lib as Record<string, unknown>;
+  return (
+    Array.isArray(L.books) &&
+    Array.isArray(L.podcasts) &&
+    Array.isArray(L.articles) &&
+    Array.isArray(L.research)
+  );
+}
+
+export function buildKnowledgeBaseJson(
+  entries: JournalEntry[],
+  library: KnowledgeBaseLibrarySnapshot
+): string {
+  const payload: KnowledgeBaseExport = {
+    version: KNOWLEDGE_BASE_EXPORT_VERSION,
+    exportedAt: new Date().toISOString(),
+    entries,
+    library: {
+      books: [...library.books],
+      podcasts: [...library.podcasts],
+      articles: [...library.articles],
+      research: [...library.research],
+    },
+  };
+  return JSON.stringify(payload, null, 2);
+}
+
+export type ParsedKnowledgeBaseFile =
+  | { kind: "full"; data: KnowledgeBaseExport }
+  | { kind: "journalsOnly"; data: ExportPayload };
+
+export function parseKnowledgeBaseFile(text: string): ParsedKnowledgeBaseFile | null {
+  try {
+    const j = JSON.parse(text) as unknown;
+    if (isKnowledgeBaseExport(j)) return { kind: "full", data: j };
+    if (isExportPayload(j)) return { kind: "journalsOnly", data: j };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeMessage(m: unknown): ChatMessage | null {
   if (m == null || typeof m !== "object") return null;
   const o = m as Record<string, unknown>;

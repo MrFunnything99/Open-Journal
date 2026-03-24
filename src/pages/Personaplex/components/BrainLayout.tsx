@@ -73,6 +73,9 @@ type BrainLayoutProps = {
   onClickAddLibrary: (cat: BrainLibraryCategory) => void;
   onEditLibraryItem: (cat: BrainLibraryCategory, id: string) => void;
   onDeleteLibraryItem: (cat: BrainLibraryCategory, id: string) => void;
+  onDownloadKnowledgeBase?: () => void;
+  onImportKnowledgeBaseFile?: (file: File) => void;
+  onImportJournalDumpFolder?: (files: FileList) => void;
 };
 
 function formatRelativeSaved(iso: string): string {
@@ -123,6 +126,11 @@ const CAT_LABEL: Record<BrainLibraryCategory, string> = {
   research: "Research papers",
 };
 
+const knowledgeBaseToolbarBtnClass =
+  "rounded-full border border-gray-300 bg-transparent px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-100 dark:border-white/20 dark:text-white/85 dark:hover:bg-white/10";
+const journalDumpBtnClass =
+  "w-full rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-left text-xs font-medium text-white/80 transition-colors hover:bg-white/10 hover:text-white";
+
 export const BrainLayout: FC<BrainLayoutProps> = ({
   entries,
   getFormattedDate,
@@ -140,6 +148,9 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   onClickAddLibrary,
   onEditLibraryItem,
   onDeleteLibraryItem,
+  onDownloadKnowledgeBase,
+  onImportKnowledgeBaseFile,
+  onImportJournalDumpFolder,
 }) => {
   type ExplorerTab = "journals" | "conversations" | "library";
   const [explorerTab, setExplorerTab] = useState<ExplorerTab>("journals");
@@ -154,6 +165,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
   const moreRef = useRef<HTMLDivElement>(null);
+  const knowledgeBaseFileRef = useRef<HTMLInputElement>(null);
+  const journalDumpFolderRef = useRef<HTMLInputElement>(null);
   const [journalEditing, setJournalEditing] = useState(false);
   const [journalDraft, setJournalDraft] = useState<ChatMessage[]>([]);
 
@@ -703,11 +716,70 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
             </div>
           )}
         </nav>
+        {onImportJournalDumpFolder && (
+          <div className="border-t border-white/10 p-2">
+            <input
+              ref={journalDumpFolderRef}
+              type="file"
+              multiple
+              accept=".md,text/markdown,.txt,text/plain"
+              className="hidden"
+              aria-hidden
+              {...({ webkitdirectory: "" } as any)}
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) onImportJournalDumpFolder(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              className={journalDumpBtnClass}
+              onClick={() => journalDumpFolderRef.current?.click()}
+              title="Import a folder like Journal/YYYY-MM/YYYY-MM-DD.md"
+            >
+              Journal dump upload
+            </button>
+          </div>
+        )}
       </aside>
 
       <section className="flex-1 flex flex-col min-h-0 min-w-0 bg-[#F9FAFB] dark:bg-[#212121]">
         {selectedTranscript ? (
           <div className="flex-1 flex flex-col min-h-0 m-3 md:m-4 rounded-2xl bg-white border border-gray-100 shadow-sm dark:bg-[#2f2f2f] dark:border-gray-700 overflow-hidden">
+            {onDownloadKnowledgeBase && onImportKnowledgeBaseFile && (
+              <>
+                <input
+                  ref={knowledgeBaseFileRef}
+                  type="file"
+                  accept=".zip,application/zip,application/x-zip-compressed,application/json,.json"
+                  className="hidden"
+                  aria-hidden
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) onImportKnowledgeBaseFile(f);
+                    e.target.value = "";
+                  }}
+                />
+                <div className="flex shrink-0 justify-end gap-2 border-b border-gray-100 px-4 pb-2.5 pt-3 dark:border-white/10 dark:bg-[#252525]">
+                  <button
+                    type="button"
+                    onClick={onDownloadKnowledgeBase}
+                    className={knowledgeBaseToolbarBtnClass}
+                    title="Download a .zip of Markdown files: journals/, conversations/, library/"
+                  >
+                    Download Markdown folder
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => knowledgeBaseFileRef.current?.click()}
+                    className={knowledgeBaseToolbarBtnClass}
+                    title="Upload a .zip export (or legacy .json). Layout matches The Brain explorer."
+                  >
+                    Upload Markdown folder
+                  </button>
+                </div>
+              </>
+            )}
             <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-[#343541]/40">
               <span className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">The Brain</span>
               <div className="flex flex-wrap items-center gap-2">
@@ -882,6 +954,40 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
           </div>
         ) : selectedLibrary ? (
           <div className="flex-1 flex flex-col min-h-0 m-3 md:m-4 rounded-2xl bg-white border border-gray-100 shadow-sm dark:bg-[#2f2f2f] dark:border-gray-700 overflow-hidden">
+            {onDownloadKnowledgeBase && onImportKnowledgeBaseFile && (
+              <>
+                <input
+                  ref={knowledgeBaseFileRef}
+                  type="file"
+                  accept=".zip,application/zip,application/x-zip-compressed,application/json,.json"
+                  className="hidden"
+                  aria-hidden
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) onImportKnowledgeBaseFile(f);
+                    e.target.value = "";
+                  }}
+                />
+                <div className="flex shrink-0 justify-end gap-2 border-b border-gray-100 px-4 pb-2.5 pt-3 dark:border-white/10 dark:bg-[#252525]">
+                  <button
+                    type="button"
+                    onClick={onDownloadKnowledgeBase}
+                    className={knowledgeBaseToolbarBtnClass}
+                    title="Download a .zip of Markdown files: journals/, conversations/, library/"
+                  >
+                    Download Markdown folder
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => knowledgeBaseFileRef.current?.click()}
+                    className={knowledgeBaseToolbarBtnClass}
+                    title="Upload a .zip export (or legacy .json). Layout matches The Brain explorer."
+                  >
+                    Upload Markdown folder
+                  </button>
+                </div>
+              </>
+            )}
             <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-[#343541]/40">
               <span className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">The Brain</span>
               <div className="flex flex-wrap items-center gap-2">

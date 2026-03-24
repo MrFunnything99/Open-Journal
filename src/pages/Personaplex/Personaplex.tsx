@@ -5,7 +5,8 @@ import { usePersonaplexSession, type TranscriptEntry } from "./hooks/usePersonap
 import { SessionSidePanel } from "./components/SessionSidePanel";
 import { useTheme } from "../../hooks/useTheme";
 import { ThemeToggle } from "../../components/ThemeToggle";
-import { useJournalHistory } from "./hooks/useJournalHistory";
+import { parseKnowledgeBaseFile, useJournalHistory } from "./hooks/useJournalHistory";
+import { buildKnowledgeBaseMarkdownZip, parseKnowledgeBaseMarkdownZip } from "./knowledgeBaseMarkdownZip";
 import { type OrbState } from "./components/Orb";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { BrainLayout, type BrainLibraryCategory } from "./components/BrainLayout";
@@ -266,13 +267,190 @@ export const Personaplex = () => {
 
   const {
     entries,
+    saveEntry,
     saveOrUpdateEntry,
     markEntrySynced,
     syncUnsyncedEntries,
     deleteEntry,
     updateJournalEntry,
     getFormattedDate,
+    importEntriesFromExport,
   } = useJournalHistory();
+
+  const handleDownloadKnowledgeBase = useCallback(async () => {
+    try {
+      const blob = await buildKnowledgeBaseMarkdownZip(entries, libraryItems, getFormattedDate);
+      const a = document.createElement("a");
+      const url = URL.createObjectURL(blob);
+      a.href = url;
+      a.download = `selfmeridian-knowledge-base-${new Date().toISOString().slice(0, 10)}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setToastMessage("Downloaded Markdown folder (.zip). Unzip to browse journals, conversations, and library.");
+      setTimeout(() => setToastMessage(null), 4000);
+    } catch {
+      setToastMessage("Download failed.");
+      setTimeout(() => setToastMessage(null), 3000);
+    }
+  }, [entries, libraryItems, getFormattedDate]);
+
+  const mergeImportedLibrary = useCallback(
+    (lib: {
+      books: (typeof libraryItems.books)[number][];
+      podcasts: (typeof libraryItems.podcasts)[number][];
+      articles: (typeof libraryItems.articles)[number][];
+      research: (typeof libraryItems.research)[number][];
+    }) => {
+      const remap = (items: (typeof libraryItems.books)[number][]) =>
+        items.map((item, i) => ({
+          ...item,
+          id: `lib-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 9)}`,
+        }));
+      setLibraryItems((prev) => {
+        const next = {
+          books: [...prev.books, ...remap(lib.books)],
+          podcasts: [...prev.podcasts, ...remap(lib.podcasts)],
+          articles: [...prev.articles, ...remap(lib.articles)],
+          research: [...prev.research, ...remap(lib.research)],
+        };
+        try {
+          localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(next));
+        } catch {
+          /* ignore */
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  const handleImportKnowledgeBaseFile = useCallback(
+    async (file: File) => {
+      try {
+        const looksZip =
+          file.name.toLowerCase().endsWith(".zip") ||
+          file.type === "application/zip" ||
+          file.type === "application/x-zip-compressed";
+
+        if (looksZip) {
+          const parsed = await parseKnowledgeBaseMarkdownZip(file);
+          if (!parsed) {
+            setToastMessage("That ZIP isn’t a valid Markdown knowledge base (expected journals/, conversations/, library/).");
+            setTimeout(() => setToastMessage(null), 5000);
+            return;
+          }
+          const nEntries = importEntriesFromExport({
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            entries: parsed.entries,
+          });
+          mergeImportedLibrary(parsed.library);
+          const nLib =
+            parsed.library.books.length +
+            parsed.library.podcasts.length +
+            parsed.library.articles.length +
+            parsed.library.research.length;
+          setToastMessage(
+            `Imported ${nEntries} entr${nEntries === 1 ? "y" : "ies"} and ${nLib} library item${nLib === 1 ? "" : "s"} from Markdown.`
+          );
+          setTimeout(() => setToastMessage(null), 5000);
+          return;
+        }
+
+        const text = await file.text();
+        const parsed = parseKnowledgeBaseFile(text);
+        if (!parsed) {
+          setToastMessage("Use a .zip of Markdown folders, or a legacy .json backup.");
+          setTimeout(() => setToastMessage(null), 4000);
+          return;
+        }
+        if (parsed.kind === "journalsOnly") {
+          const n = importEntriesFromExport(parsed.data);
+          setToastMessage(
+            n > 0 ? `Imported ${n} journal entr${n === 1 ? "y" : "ies"} from JSON.` : "No entries found in that file."
+          );
+          setTimeout(() => setToastMessage(null), 4000);
+          return;
+        }
+        const nEntries = importEntriesFromExport({
+          version: parsed.data.version,
+          exportedAt: parsed.data.exportedAt,
+          entries: parsed.data.entries,
+        });
+        mergeImportedLibrary(parsed.data.library);
+        const nLib =
+          parsed.data.library.books.length +
+          parsed.data.library.podcasts.length +
+          parsed.data.library.articles.length +
+          parsed.data.library.research.length;
+        setToastMessage(
+          `Imported ${nEntries} journal entr${nEntries === 1 ? "y" : "ies"} and ${nLib} library item${nLib === 1 ? "" : "s"} from JSON.`
+        );
+        setTimeout(() => setToastMessage(null), 5000);
+      } catch {
+        setToastMessage("Could not read that file.");
+        setTimeout(() => setToastMessage(null), 4000);
+      }
+    },
+    [importEntriesFromExport, mergeImportedLibrary]
+  );
+
+  const handleImportJournalDumpFolder = useCallback(
+    async (files: FileList) => {
+      const list = Array.from(files).filter((f) => /\.(md|txt)$/i.test(f.name));
+      if (list.length === 0) {
+        setToastMessage("No .md or .txt files found in that folder.");
+        setTimeout(() => setToastMessage(null), 3500);
+        return;
+      }
+
+      const parseDateFromFile = (f: File): string | null => {
+        const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath ?? f.name;
+        const m = rel.match(/(20\d{2})-(\d{2})-(\d{2})/);
+        if (m) {
+          const iso = `${m[1]}-${m[2]}-${m[3]}T12:00:00.000Z`;
+          if (!Number.isNaN(Date.parse(iso))) return iso;
+        }
+        const m2 = rel.match(/(20\d{2})-(\d{2})/);
+        if (m2) {
+          const iso = `${m2[1]}-${m2[2]}-01T12:00:00.000Z`;
+          if (!Number.isNaN(Date.parse(iso))) return iso;
+        }
+        return null;
+      };
+
+      const dated = await Promise.all(
+        list.map(async (f) => ({
+          file: f,
+          date: parseDateFromFile(f),
+          text: (await f.text()).trim(),
+        }))
+      );
+
+      const valid = dated
+        .filter((x) => x.text.length > 0)
+        .sort((a, b) => {
+          const ta = a.date ? Date.parse(a.date) : 0;
+          const tb = b.date ? Date.parse(b.date) : 0;
+          return ta - tb;
+        });
+
+      let imported = 0;
+      for (const row of valid) {
+        const transcript = [{ role: "user" as const, text: row.text }];
+        const id = saveEntry(transcript, row.date ?? undefined);
+        if (id) imported += 1;
+      }
+
+      if (imported === 0) {
+        setToastMessage("No valid journal content found.");
+      } else {
+        setToastMessage(`Imported ${imported} journal entr${imported === 1 ? "y" : "ies"} from folder.`);
+      }
+      setTimeout(() => setToastMessage(null), 4500);
+    },
+    [saveEntry]
+  );
 
   useEffect(() => {
     fetch("/api/voices")
@@ -864,6 +1042,9 @@ export const Personaplex = () => {
                         setTimeout(() => setToastMessage(null), 3000);
                       });
                   }}
+                  onDownloadKnowledgeBase={handleDownloadKnowledgeBase}
+                  onImportKnowledgeBaseFile={handleImportKnowledgeBaseFile}
+                  onImportJournalDumpFolder={handleImportJournalDumpFolder}
                 />
               </div>
               ) : (
