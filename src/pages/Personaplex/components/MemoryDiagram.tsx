@@ -64,7 +64,7 @@ export function MemoryDiagram({ onRefreshStats }: MemoryDiagramProps) {
       if (!code || !code.trim()) {
         setStatus("success");
         if (containerRef.current) {
-          containerRef.current.innerHTML = '<p class="text-slate-500 text-sm text-center py-8">No diagram generated.</p>';
+          containerRef.current.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-sm text-center py-8">No diagram generated.</p>';
         }
         return;
       }
@@ -102,9 +102,9 @@ export function MemoryDiagram({ onRefreshStats }: MemoryDiagramProps) {
   }, [fetchAndRender]);
 
   return (
-    <div className="rounded-xl bg-slate-900/50 border border-slate-700/50 overflow-hidden flex flex-col min-h-0">
-      <div className="flex items-center justify-between gap-2 p-3 border-b border-slate-700/50 flex-shrink-0">
-        <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider">
+    <div className="rounded-xl bg-white border border-gray-200 shadow-sm dark:bg-[#2f2f2f] dark:border-gray-700 overflow-hidden flex flex-col min-h-0">
+      <div className="flex items-center justify-between gap-2 p-3 border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
+        <h3 className="text-sm font-medium text-gray-600 dark:text-gray-400 uppercase tracking-wider">
           Your memory map
         </h3>
         <button
@@ -118,7 +118,7 @@ export function MemoryDiagram({ onRefreshStats }: MemoryDiagramProps) {
       </div>
       <div className="flex-1 min-h-[280px] overflow-auto p-4 flex items-center justify-center">
         {status === "loading" && (
-          <p className="text-sm text-slate-500">Building your memory map…</p>
+          <p className="text-sm text-gray-500 dark:text-gray-400">Building your memory map…</p>
         )}
         {status === "error" && errorMessage && (
           <p className="text-sm text-red-400/90 text-center px-4">{errorMessage}</p>

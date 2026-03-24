@@ -4,38 +4,23 @@ FastAPI backend for Selfmeridian: /chat and /end-session.
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import io
 import json
 import os
 import re
-import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, Depends, Response
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
-
-from auth import (
-    COOKIE_NAME,
-    CurrentUser,
-    create_access_token,
-    create_refresh_token,
-    verify_refresh_token,
-    set_refresh_cookie,
-    clear_refresh_cookie,
-    get_current_user,
-    get_current_user_optional,
-    hash_password,
-    verify_password,
-)
 
 # Load .env from project root first (parent of backend/), then cwd
 _root = Path(__file__).resolve().parent.parent
@@ -44,7 +29,6 @@ for name in (".env", ".env.local"):
     load_dotenv(Path.cwd() / name)
     load_dotenv(Path.cwd().parent / name)
 
-import jwt
 import vec_store
 from graph import build_graph, build_librarian_graph, JournalState
 from langchain_core.messages import HumanMessage
@@ -76,30 +60,8 @@ from library import (
 )
 from google import genai
 
-# Auth: simple login (no email). JWT_SECRET required for register/login.
-JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
-JWT_ALGORITHM = "HS256"
-JWT_EXP_DAYS = 30
-PBKDF2_ITERATIONS = 120_000
-
-
-def _hash_password(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ITERATIONS).hex()
-
-
 def _instance_id(request: Request) -> str:
-    """Instance ID = logged-in user id (from JWT) or X-Instance-ID header (anonymous)."""
-    auth = request.headers.get("Authorization") or ""
-    if auth.startswith("Bearer "):
-        token = auth[7:].strip()
-        if token and JWT_SECRET:
-            try:
-                payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-                sub = payload.get("sub")
-                if sub is not None:
-                    return str(sub)
-            except jwt.InvalidTokenError:
-                pass
+    """Per-browser instance id for scoping memory (sent as X-Instance-ID)."""
     return (request.headers.get("X-Instance-ID") or "").strip()
 
 
@@ -179,39 +141,6 @@ class ChatResponse(BaseModel):
     session_id: str
     retrieval_log: Optional[str] = None
     notes_saved: Optional[List[Dict[str, str]]] = None  # [{"item_id": "...", "note": "..."}]
-
-
-class AuthRegisterRequest(BaseModel):
-    username: str
-    password: str
-
-
-class AuthLoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class AuthResponse(BaseModel):
-    token: str
-    user_id: int
-    username: str
-
-
-# Two-token auth: email or username + passlib. Username-only accounts stored as username@anonymous.local
-class ApiRegisterRequest(BaseModel):
-    email: str  # can be email or username (no @)
-    password: str
-
-
-class ApiLoginRequest(BaseModel):
-    email: str  # can be email or username
-    password: str
-
-
-class ApiAuthResponse(BaseModel):
-    access_token: str
-    user_id: int
-    email: str
 
 
 class EndSessionRequest(BaseModel):
@@ -414,177 +343,6 @@ class MemoryDiagramResponse(BaseModel):
     mermaid: str
 
 
-# --- Simple auth (no email): persistent data when logged in; anonymous data forgotten after 1h on client ---
-@api_router.post("/auth/register", response_model=AuthResponse)
-async def auth_register(req: AuthRegisterRequest):
-    """Register with username + password. No email. Returns JWT for persistent data."""
-    if not JWT_SECRET:
-        raise HTTPException(status_code=503, detail="Auth not configured (set JWT_SECRET in .env)")
-    username = (req.username or "").strip().lower()
-    password = req.password or ""
-    if len(username) < 2:
-        raise HTTPException(status_code=400, detail="Username must be at least 2 characters")
-    if len(password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    salt = secrets.token_hex(16)
-    password_hash = _hash_password(password, salt)
-    vec_store.ensure_db()
-    user_id = vec_store.auth_user_create(username, password_hash, salt)
-    if user_id is None:
-        raise HTTPException(status_code=409, detail="Username already taken")
-    exp = datetime.now(timezone.utc) + timedelta(days=JWT_EXP_DAYS)
-    token = jwt.encode(
-        {"sub": user_id, "username": username, "exp": exp},
-        JWT_SECRET,
-        algorithm=JWT_ALGORITHM,
-    )
-    return AuthResponse(token=token, user_id=user_id, username=username)
-
-
-@api_router.post("/auth/login", response_model=AuthResponse)
-async def auth_login(req: AuthLoginRequest):
-    """Login with username + password. Returns JWT for persistent data."""
-    if not JWT_SECRET:
-        raise HTTPException(status_code=503, detail="Auth not configured (set JWT_SECRET in .env)")
-    username = (req.username or "").strip().lower()
-    password = req.password or ""
-    vec_store.ensure_db()
-    user = vec_store.auth_user_get_by_username(username)
-    if not user or _hash_password(password, user["salt"]) != user["password_hash"]:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-    exp = datetime.now(timezone.utc) + timedelta(days=JWT_EXP_DAYS)
-    token = jwt.encode(
-        {"sub": user["id"], "username": user["username"], "exp": exp},
-        JWT_SECRET,
-        algorithm=JWT_ALGORITHM,
-    )
-    return AuthResponse(token=token, user_id=user["id"], username=user["username"])
-
-
-@api_router.get("/auth/me")
-async def auth_me(current_user: CurrentUser = Depends(get_current_user)):
-    """Return current user (two-token access or legacy Bearer)."""
-    return {"user_id": current_user.id, "username": current_user.email, "email": current_user.email}
-
-
-class AnonymousMemoryCountResponse(BaseModel):
-    gist_count: int
-    episodic_count: int
-
-
-@api_router.get("/auth/anonymous-memory-count", response_model=AnonymousMemoryCountResponse)
-async def anonymous_memory_count(request: Request):
-    """Return memory counts for the current X-Instance-ID (no Bearer). Used when anonymous user is about to log in, to ask if they want to sync."""
-    instance_id = (request.headers.get("X-Instance-ID") or "").strip()
-    if not instance_id:
-        return AnonymousMemoryCountResponse(gist_count=0, episodic_count=0)
-    try:
-        g, e = await asyncio.to_thread(vec_store.memory_count_for_instance, instance_id)
-        return AnonymousMemoryCountResponse(gist_count=g, episodic_count=e)
-    except Exception:
-        return AnonymousMemoryCountResponse(gist_count=0, episodic_count=0)
-
-
-class MergeInstanceRequest(BaseModel):
-    from_instance_id: str
-
-
-@api_router.post("/auth/merge-instance")
-async def merge_instance(req: MergeInstanceRequest, current_user: CurrentUser = Depends(get_current_user)):
-    """Copy memory from anonymous instance (from_instance_id) into the logged-in user's instance."""
-    to_id = str(current_user.id)
-    from_id = (req.from_instance_id or "").strip()
-    if not from_id or from_id == to_id:
-        return {"ok": True}
-    try:
-        await asyncio.to_thread(vec_store.merge_instance_memory, from_id, to_id)
-        return {"ok": True}
-    except Exception as e:
-        print("[backend] merge_instance error:", e)
-        raise HTTPException(status_code=500, detail="Merge failed")
-
-
-def _display_name(stored_email: str) -> str:
-    """Return display name: real email or username part for username@anonymous.local accounts."""
-    if (stored_email or "").endswith(vec_store.ANONYMOUS_EMAIL_SUFFIX):
-        return (stored_email or "")[: -len(vec_store.ANONYMOUS_EMAIL_SUFFIX)] or stored_email
-    return stored_email or ""
-
-
-# --- Two-token auth: /api/register, /api/login, /api/refresh, /api/logout ---
-@api_router.post("/register", response_model=ApiAuthResponse)
-async def api_register(req: ApiRegisterRequest, response: Response):
-    """Register with email or username + password. Username = no @ in the value. Returns access token and sets refresh cookie."""
-    if not JWT_SECRET:
-        raise HTTPException(status_code=503, detail="Auth not configured (set JWT_SECRET)")
-    raw = (req.email or "").strip().lower()
-    password = req.password or ""
-    if not raw:
-        raise HTTPException(status_code=400, detail="Email or username required")
-    if len(password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    vec_store.ensure_db()
-    hashed = hash_password(password)
-    if "@" in raw:
-        email = raw
-    else:
-        email = raw + vec_store.ANONYMOUS_EMAIL_SUFFIX
-    user_id = vec_store.user_create(email, hashed)
-    if user_id is None:
-        raise HTTPException(status_code=409, detail="Email or username already registered")
-    display = _display_name(email)
-    access = create_access_token(user_id, display)
-    refresh = create_refresh_token(user_id, display)
-    set_refresh_cookie(response, refresh)
-    return ApiAuthResponse(access_token=access, user_id=user_id, email=display)
-
-
-@api_router.post("/login", response_model=ApiAuthResponse)
-async def api_login(req: ApiLoginRequest, response: Response):
-    """Login with email or username + password. Returns access token and sets refresh cookie."""
-    if not JWT_SECRET:
-        raise HTTPException(status_code=503, detail="Auth not configured (set JWT_SECRET)")
-    identifier = (req.email or "").strip().lower()
-    password = req.password or ""
-    if not identifier:
-        raise HTTPException(status_code=400, detail="Email or username required")
-    vec_store.ensure_db()
-    user = vec_store.user_get_by_email_or_username(identifier)
-    if not user or not verify_password(password, user["hashed_password"]):
-        raise HTTPException(status_code=401, detail="Invalid email/username or password")
-    display = _display_name(user["email"])
-    access = create_access_token(user["id"], display)
-    refresh = create_refresh_token(user["id"], display)
-    set_refresh_cookie(response, refresh)
-    return ApiAuthResponse(access_token=access, user_id=user["id"], email=display)
-
-
-@api_router.post("/refresh", response_model=ApiAuthResponse)
-async def api_refresh(request: Request):
-    """Exchange refresh token (from cookie) for a new access token."""
-    refresh_val = request.cookies.get(COOKIE_NAME) or ""
-    payload = verify_refresh_token(refresh_val)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
-    user_id = int(payload["sub"])
-    display = payload.get("email") or ""  # JWT stores display name (email or username)
-    access = create_access_token(user_id, display)
-    return ApiAuthResponse(access_token=access, user_id=user_id, email=display)
-
-
-@api_router.post("/logout")
-async def api_logout(response: Response):
-    """Clear refresh token cookie."""
-    clear_refresh_cookie(response)
-    return {"ok": True}
-
-
-@api_router.get("/me")
-async def api_me(current_user: CurrentUser = Depends(get_current_user)):
-    """Return current user from access token (email/username is display name)."""
-    return {"user_id": current_user.id, "email": current_user.email, "username": current_user.email}
-
-
 # --- ElevenLabs proxy: TTS and voices (no auth required; used by session UI) ---
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
@@ -614,6 +372,180 @@ class TranscribeRequest(BaseModel):
     """Batch STT for voice-memo flow (iOS Safari, etc.). Same contract as api/transcribe.ts."""
     audio: str
     format: Optional[str] = None
+
+
+class VoiceMemoRequest(BaseModel):
+    """Voice Memo tab: base64 audio → Whisper (or ElevenLabs) → Gemini polish."""
+    audio: str
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+
+
+VOICE_MEMO_POLISH_INSTRUCTION = """You are editing a voice memo transcript. Clean it into clear, readable prose suitable for a personal journal.
+- Preserve meaning and factual content; do not invent events.
+- Remove filler words, false starts, and obvious speech-to-text errors.
+- Use first person when the speaker is reflecting on themselves.
+Output only the cleaned text with no title or preamble."""
+
+
+def _guess_audio_filename(filename: Optional[str], mime_type: Optional[str]) -> str:
+    fn = (filename or "").strip()
+    if fn and "." in fn:
+        base = fn.replace("\\", "/").split("/")[-1]
+        if len(base) <= 120:
+            return base
+    mt = (mime_type or "").lower()
+    if "mp3" in mt or mt == "audio/mpeg":
+        return "audio.mp3"
+    if "mp4" in mt or "m4a" in mt or "aac" in mt:
+        return "audio.m4a"
+    if "wav" in mt:
+        return "audio.wav"
+    if "ogg" in mt or "opus" in mt:
+        return "audio.ogg"
+    if "flac" in mt:
+        return "audio.flac"
+    return "recording.webm"
+
+
+def _build_openai_whisper_multipart(audio_bytes: bytes, filename: str) -> tuple[str, bytes]:
+    boundary = f"----SelfMeridianWhisper{uuid.uuid4().hex[:20]}"
+    buf = io.BytesIO()
+    buf.write(f"--{boundary}\r\n".encode())
+    buf.write(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+    buf.write(b"whisper-1\r\n")
+    buf.write(f"--{boundary}\r\n".encode())
+    buf.write(f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode())
+    buf.write(b"Content-Type: application/octet-stream\r\n\r\n")
+    buf.write(audio_bytes)
+    buf.write(f"\r\n--{boundary}--\r\n".encode())
+    return boundary, buf.getvalue()
+
+
+def _openai_whisper_transcribe(audio_bytes: bytes, filename: str) -> str:
+    import urllib.error
+    import urllib.request
+
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise ValueError("OPENAI_API_KEY is not configured")
+    boundary, body = _build_openai_whisper_multipart(audio_bytes, filename)
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw_text = resp.read().decode("utf-8")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            raw_text = e.read().decode("utf-8")
+        except Exception:
+            raw_text = ""
+    except Exception as e:
+        raise ValueError(f"Whisper request failed: {e}") from e
+    if status < 200 or status >= 300:
+        try:
+            err_j = json.loads(raw_text)
+            detail = err_j.get("error", {}).get("message") if isinstance(err_j.get("error"), dict) else err_j.get("error")
+        except Exception:
+            detail = raw_text[:400] if raw_text else None
+        raise ValueError(detail or f"Whisper API error ({status})")
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return raw_text.strip()
+    text = data.get("text")
+    return str(text).strip() if text is not None else ""
+
+
+def _elevenlabs_transcribe_bytes(audio_bytes: bytes) -> str:
+    """Same wire format as /api/transcribe (ElevenLabs scribe_v2)."""
+    import urllib.error
+    import urllib.request
+
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ELEVENLABS_API_KEY is not configured")
+    model_id = "scribe_v2"
+    boundary = f"----SelfmeridianBoundary{uuid.uuid4().hex[:24]}"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="model_id"\r\n\r\n'
+        f"{model_id}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode("utf-8") + audio_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    content_type = f"multipart/form-data; boundary={boundary}"
+    request = urllib.request.Request(
+        ELEVENLABS_STT_URL,
+        data=body,
+        method="POST",
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": content_type,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as resp:
+            raw_text = resp.read().decode("utf-8")
+            status_code = resp.status
+    except urllib.error.HTTPError as e:
+        status_code = e.code
+        try:
+            raw_text = e.read().decode("utf-8")
+        except Exception:
+            raw_text = ""
+    except Exception as e:
+        raise ValueError(f"ElevenLabs STT failed: {e}") from e
+    data: dict = {}
+    if raw_text.strip():
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            pass
+    if status_code < 200 or status_code >= 300:
+        err_detail = data.get("detail")
+        if isinstance(err_detail, dict):
+            msg = err_detail.get("message") or str(err_detail)
+        elif isinstance(err_detail, str):
+            msg = err_detail
+        else:
+            msg = data.get("message") or (raw_text.strip()[:300] if raw_text.strip() else None) or f"ElevenLabs STT failed ({status_code})"
+        raise ValueError(str(msg))
+    text = data.get("text")
+    return str(text).strip() if text is not None else ""
+
+
+async def _polish_voice_memo_gemini(raw: str) -> str:
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key or not (raw or "").strip():
+        return (raw or "").strip()
+    try:
+        client = genai.Client(api_key=key)
+        model = os.getenv("GEMINI_VOICE_MEMO_MODEL", "gemini-2.0-flash")
+        prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + (raw or "").strip()[:48000]
+
+        def _call():
+            return client.models.generate_content(model=model, contents=prompt)
+
+        result = await asyncio.to_thread(_call)
+        out = getattr(result, "text", "")
+        if isinstance(out, list):
+            out = " ".join(str(c) for c in out)
+        out = (out or "").strip()
+        return out if out else (raw or "").strip()
+    except Exception as e:
+        print("[backend] voice-memo polish error:", e)
+        return (raw or "").strip()
 
 
 @api_router.post("/voice")
@@ -730,20 +662,20 @@ async def api_scribe_token():
 
 
 @api_router.get("/memory-diagram", response_model=MemoryDiagramResponse)
-async def memory_diagram(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def memory_diagram(request: Request):
     """
     Legacy endpoint for memory diagram; retained for compatibility but not used by Brain UI.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     gist_facts, episodic_summaries = get_memory_for_visualization(instance_id=instance_id)
     mermaid_code = generate_memory_mermaid(gist_facts, episodic_summaries)
     return MemoryDiagramResponse(mermaid=mermaid_code)
 
 
 @api_router.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def chat(req: ChatRequest, request: Request):
     """User sends text; Interviewer responds. State updated in memory. mode=recommendations uses library interview (books, notes)."""
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     mode = (req.mode or "journal").strip().lower()
     if mode not in ("journal", "recommendations"):
@@ -847,12 +779,12 @@ def _get_or_create_library_interview_session(session_id: Optional[str]) -> str:
 
 
 @api_router.post("/library-interview", response_model=LibraryInterviewResponse)
-async def library_interview(req: LibraryInterviewRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def library_interview(req: LibraryInterviewRequest, request: Request):
     """
     One turn of the library interview: user message + optional library snapshot.
     Agent asks about books and may save short notes; notes_saved lists any updates.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     session_id = _get_or_create_library_interview_session(req.session_id)
     messages = library_interview_sessions[session_id]
 
@@ -909,9 +841,9 @@ async def library_interview(req: LibraryInterviewRequest, request: Request, curr
 
 
 @api_router.post("/end-session", response_model=EndSessionResponse)
-async def end_session(req: EndSessionRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def end_session(req: EndSessionRequest, request: Request):
     """Trigger Librarian: extract, embed, save to SQLite+sqlite-vec (and LightRAG when enabled)."""
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     messages = sessions.get(session_id, [])
 
@@ -950,13 +882,13 @@ async def end_session(req: EndSessionRequest, request: Request, current_user: Op
 INGEST_HISTORY_TIMEOUT_SEC = 55
 
 @api_router.post("/ingest-history", response_model=IngestHistoryResponse)
-async def ingest_history(req: IngestHistoryRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def ingest_history(req: IngestHistoryRequest, request: Request):
     """
     Ingest a prior journal text into SQLite+sqlite-vec and LightRAG.
     Treats `text` as a single-session transcript. LightRAG gets same summary+facts as vec_store.
     Returns 200 always (so CORS headers are sent); ok=False on failure or timeout.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     session_id = req.session_id or f"import-{uuid.uuid4()}"
     try:
         text = (req.text or "").strip()
@@ -1136,14 +1068,14 @@ async def infer_entry_date(req: InferEntryDateRequest):
 
 
 @api_router.get("/memory-stats", response_model=MemoryStats)
-async def memory_stats(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def memory_stats(request: Request):
     """
     Lightweight stats endpoint; scoped to current user or anonymous instance.
     """
     import vec_store
 
     vec_store.ensure_db()
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     return MemoryStats(
         gist_facts_count=vec_store.gist_count(instance_id),
         episodic_log_count=vec_store.episodic_count(instance_id),
@@ -1152,9 +1084,9 @@ async def memory_stats(request: Request, current_user: Optional[CurrentUser] = D
 
 
 @api_router.get("/memory/facts")
-async def get_memory_facts(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def get_memory_facts(request: Request):
     """List all gist facts with ids for Memory UI (view/edit/delete)."""
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         items = await asyncio.to_thread(list_memory_facts, instance_id)
         return {"facts": [MemoryItem(**x) for x in items]}
@@ -1164,9 +1096,9 @@ async def get_memory_facts(request: Request, current_user: Optional[CurrentUser]
 
 
 @api_router.get("/memory/summaries")
-async def get_memory_summaries(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def get_memory_summaries(request: Request):
     """List all episodic summaries with ids for Memory UI."""
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         items = await asyncio.to_thread(list_memory_summaries, instance_id)
         return {"summaries": [MemoryItem(**x) for x in items]}
@@ -1222,9 +1154,9 @@ async def delete_memory_summary_route(summary_id: int):
 
 
 @api_router.post("/memory/facts")
-async def create_memory_fact(req: MemoryFactCreate, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def create_memory_fact(req: MemoryFactCreate, request: Request):
     """Add a user-created fact; returns new id."""
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         fid = await asyncio.to_thread(add_memory_fact, req.document, None, instance_id)
         return {"ok": fid is not None, "id": fid}
@@ -1234,9 +1166,9 @@ async def create_memory_fact(req: MemoryFactCreate, request: Request, current_us
 
 
 @api_router.post("/memory/summaries")
-async def create_memory_summary(req: MemorySummaryCreate, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def create_memory_summary(req: MemorySummaryCreate, request: Request):
     """Add a user-created summary; returns new id."""
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         sid = await asyncio.to_thread(add_memory_summary, req.document, None, instance_id)
         return {"ok": sid is not None, "id": sid}
@@ -1461,12 +1393,12 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
 RECOMMENDATIONS_TIMEOUT_SEC = 90
 
 @api_router.get("/recommendations", response_model=RecommendationsResponse)
-async def get_recommendations(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def get_recommendations(request: Request):
     """
     Generate personalized book, podcast, and article recommendations from journal memory
     and what the user has already consumed/liked. May take 30–90s; timeout keeps response before proxy limit.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         data = await asyncio.wait_for(
             asyncio.to_thread(generate_recommendations, instance_id),
@@ -1497,12 +1429,12 @@ class CalendarDayResponse(BaseModel):
 
 
 @api_router.post("/calendar-day-summary", response_model=CalendarDayResponse)
-async def calendar_day_summary(req: CalendarDayRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def calendar_day_summary(req: CalendarDayRequest, request: Request):
     """
     For a given date, combine raw journal transcript (if any) with DB memory for that day
     and return an AI-generated day summary/highlights.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     date_iso = (req.date or "").strip()[:10]
     if not date_iso or len(date_iso) < 10:
         return CalendarDayResponse(summary="Please provide a valid date (YYYY-MM-DD).", has_journal=False)
@@ -1528,12 +1460,12 @@ async def calendar_day_summary(req: CalendarDayRequest, request: Request, curren
 
 
 @api_router.post("/recommendations/consumed", response_model=ConsumedResponse)
-async def mark_consumed(req: ConsumedRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def mark_consumed(req: ConsumedRequest, request: Request):
     """
     Record that the user has read/listened to a recommendation. Stored in the vector store
     so future recommendations avoid repeats and better match their tastes.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     content_type = (req.type or "article").lower()
     if content_type not in ("book", "podcast", "article", "research"):
         content_type = "article"
@@ -1553,11 +1485,11 @@ async def mark_consumed(req: ConsumedRequest, request: Request, current_user: Op
 
 
 @api_router.get("/library")
-async def get_library(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def get_library(request: Request):
     """
     Return consumed items grouped by type for the Library UI.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         data = await asyncio.to_thread(list_consumed, 200, instance_id)
         return data
@@ -1567,11 +1499,11 @@ async def get_library(request: Request, current_user: Optional[CurrentUser] = De
 
 
 @api_router.patch("/library/{item_id}")
-async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Request):
     """
     Update date_completed and/or note for a library item by id.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         def _wrap():
             return update_consumed(
@@ -1588,11 +1520,11 @@ async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Req
 
 
 @api_router.delete("/library/{item_id}")
-async def delete_library_item(item_id: str, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def delete_library_item(item_id: str, request: Request):
     """
     Remove a library item from the consumed collection.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         ok = await asyncio.to_thread(delete_consumed, item_id, instance_id)
         return {"ok": ok}
@@ -1602,13 +1534,13 @@ async def delete_library_item(item_id: str, request: Request, current_user: Opti
 
 
 @api_router.post("/library-notes", response_model=LibraryNoteResponse)
-async def library_notes(req: LibraryNoteRequest, request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def library_notes(req: LibraryNoteRequest, request: Request):
     """
     Library helper endpoint: user can paste titles or notes about books, podcasts,
     articles, or research they've read. An agent organizes this into structured
     consumed items to improve future recommendations.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     try:
         from library import process_library_note
 
@@ -1637,11 +1569,11 @@ async def lightrag_context(q: str = "", mode: str = "hybrid"):
 
 
 @api_router.post("/memory-wipe")
-async def memory_wipe(request: Request, current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+async def memory_wipe(request: Request):
     """
     Wipe gist and episodic memory for the current user/instance. Consumed library is kept.
     """
-    instance_id = str(current_user.id) if current_user else _instance_id(request)
+    instance_id = _instance_id(request)
     if instance_id:
         vec_store.wipe_memory_for_instance(instance_id)
     else:
@@ -1740,6 +1672,55 @@ async def api_transcribe(req: TranscribeRequest):
     text = data.get("text")
     transcript = str(text).strip() if text is not None else ""
     return {"text": transcript}
+
+
+@app.post("/api/voice-memo", include_in_schema=False)
+async def api_voice_memo(req: VoiceMemoRequest):
+    """
+    Voice Memo tab: transcribe with OpenAI Whisper when OPENAI_API_KEY is set, else ElevenLabs STT.
+    Optionally polish with Gemini (GEMINI_API_KEY). Returns raw + polished text for saving to The Brain.
+    """
+    import base64 as b64
+
+    audio_b64 = (req.audio or "").strip()
+    if not audio_b64:
+        raise HTTPException(status_code=400, detail="audio (base64) is required")
+    try:
+        raw_audio = b64.b64decode(audio_b64, validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 audio")
+    if len(raw_audio) < 100:
+        raise HTTPException(status_code=400, detail="Audio too short to transcribe")
+
+    fname = _guess_audio_filename(req.filename, req.mime_type)
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    el_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not openai_key and not el_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Configure OPENAI_API_KEY (Whisper) or ELEVENLABS_API_KEY for transcription.",
+        )
+    transcribe_engine = "whisper"
+    try:
+        if openai_key:
+            raw_transcript = await asyncio.to_thread(_openai_whisper_transcribe, raw_audio, fname)
+        else:
+            transcribe_engine = "elevenlabs"
+            raw_transcript = await asyncio.to_thread(_elevenlabs_transcribe_bytes, raw_audio)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print("[backend] /api/voice-memo transcribe error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    polished = await _polish_voice_memo_gemini(raw_transcript)
+    has_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
+    return {
+        "raw_transcript": raw_transcript or "",
+        "polished_text": polished or raw_transcript or "",
+        "transcribe_engine": transcribe_engine,
+        "polished_by_gemini": has_gemini and bool((raw_transcript or "").strip()),
+    }
 
 
 # Serve built frontend (monolith: only when static dir exists, e.g. Docker build)

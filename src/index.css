@@ -31,6 +31,74 @@
   animation: orb-ai 2s ease-in-out infinite;
 }
 
+/* Ambient background orbs — slow drift + breathing (meditative) */
+@keyframes ambient-float-1 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    transform: translate3d(4%, -5%, 0) scale(1.06);
+  }
+}
+
+@keyframes ambient-float-2 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1.02);
+  }
+  100% {
+    transform: translate3d(-5%, 4%, 0) scale(0.97);
+  }
+}
+
+@keyframes ambient-float-3 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(0.98);
+  }
+  100% {
+    transform: translate3d(3%, 6%, 0) scale(1.05);
+  }
+}
+
+@keyframes ambient-float-4 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    transform: translate3d(-4%, -3%, 0) scale(1.04);
+  }
+}
+
+.ambient-orb {
+  pointer-events: none;
+  will-change: transform;
+}
+
+.ambient-orb-1 {
+  animation: ambient-float-1 28s ease-in-out infinite alternate;
+}
+
+.ambient-orb-2 {
+  animation: ambient-float-2 24s ease-in-out infinite alternate;
+}
+
+.ambient-orb-3 {
+  animation: ambient-float-3 30s ease-in-out infinite alternate;
+}
+
+.ambient-orb-4 {
+  animation: ambient-float-4 22s ease-in-out infinite alternate;
+}
+
+@layer components {
+  /** Ethereal glass — dark translucent surfaces with blur */
+  .glass-panel {
+    @apply border border-white/10 bg-white/[0.06] backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.2)];
+  }
+  .glass-panel-subtle {
+    @apply border border-white/[0.08] bg-black/20 backdrop-blur-md;
+  }
+}
+
 @layer utilities {
   /* Hide scrollbar for Chrome, Safari and Opera */
   .no-scrollbar::-webkit-scrollbar {
@@ -50,8 +118,14 @@
   }
 
   .scrollbar::-webkit-scrollbar-thumb {
-    background: white;
-    border: 3px solid #f6f7ed;
+    background: #c4c4c4;
+    border: 3px solid transparent;
+    background-clip: padding-box;
+    border-radius: 9999px;
+  }
+
+  .dark .scrollbar::-webkit-scrollbar-thumb {
+    background: #565656;
   }
 }
 

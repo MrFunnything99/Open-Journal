@@ -10,6 +10,11 @@ export type JournalEntry = {
   fullTranscript: ChatMessage[];
   /** True after this entry has been sent to /ingest-history so recommendations use it */
   syncedToMemory?: boolean;
+  /**
+   * `conversation` = live Personaplex AI session (saveOrUpdateEntry).
+   * Omitted or `journal` = imported / pasted / one-off saves (saveEntry).
+   */
+  entrySource?: "journal" | "conversation";
 };
 
 const STORAGE_KEY = "openjournal-history";
@@ -93,7 +98,10 @@ function normalizeEntry(raw: unknown): JournalEntry | null {
   const date = typeof o.date === "string" ? o.date : new Date().toISOString();
   const preview = typeof o.preview === "string" ? o.preview : transcriptToPreview(fullTranscript);
   const syncedToMemory = o.syncedToMemory === true;
-  return { id, date, preview, fullTranscript, syncedToMemory };
+  let entrySource: "journal" | "conversation" | undefined;
+  if (o.entrySource === "conversation") entrySource = "conversation";
+  else if (o.entrySource === "journal") entrySource = "journal";
+  return { id, date, preview, fullTranscript, syncedToMemory, entrySource };
 }
 
 export const useJournalHistory = () => {
@@ -123,6 +131,7 @@ export const useJournalHistory = () => {
       preview,
       fullTranscript: transcript,
       syncedToMemory: false,
+      entrySource: "journal",
     };
     setEntries((prev) => [entry, ...prev]);
     return id;
@@ -150,6 +159,7 @@ export const useJournalHistory = () => {
           fullTranscript: transcript,
           // Any update means this entry should be re-synced.
           syncedToMemory: false,
+          entrySource: "conversation",
         };
         if (idx === -1) return [nextEntry, ...prev];
         const copy = [...prev];
@@ -206,6 +216,26 @@ export const useJournalHistory = () => {
     setEntries((prev) => prev.filter((e) => e.id !== id));
   }, []);
 
+  /** Replace transcript for an existing entry (e.g. edits on The Brain). Marks unsynced for re-ingest. */
+  const updateJournalEntry = useCallback((id: string, fullTranscript: ChatMessage[]) => {
+    if (fullTranscript.length === 0) return;
+    const hasText = fullTranscript.some((m) => m.text.trim().length > 0);
+    if (!hasText) return;
+    setEntries((prev) => {
+      const idx = prev.findIndex((e) => e.id === id);
+      if (idx === -1) return prev;
+      const preview = transcriptToPreview(fullTranscript);
+      const copy = [...prev];
+      copy[idx] = {
+        ...copy[idx],
+        fullTranscript,
+        preview,
+        syncedToMemory: false,
+      };
+      return copy;
+    });
+  }, []);
+
   const getFormattedDate = useCallback((entry: JournalEntry) => {
     return formatDate(entry.date);
   }, []);
@@ -240,6 +270,7 @@ export const useJournalHistory = () => {
     syncUnsyncedEntries,
     clearHistory,
     deleteEntry,
+    updateJournalEntry,
     getFormattedDate,
     exportAllJournals,
     importEntriesFromExport,

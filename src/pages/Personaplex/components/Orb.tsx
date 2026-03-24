@@ -32,11 +32,12 @@ export const Orb: FC<OrbProps> = ({ state, thinkingProgress = 0, className = "" 
       case "userSpeaking":
         return "shadow-[0_0_60px_rgba(34,197,94,0.4)]";
       case "aiSpeaking":
-        return "shadow-[0_0_60px_rgba(168,85,247,0.4)]";
+        return "shadow-[0_0_60px_rgba(16,163,127,0.38)]";
       case "aiThinking":
-        return "shadow-[0_0_40px_rgba(148,163,184,0.2)]";
+        return "shadow-[0_0_44px_rgba(16,185,129,0.22)] dark:shadow-[0_0_40px_rgba(107,114,128,0.2)]";
       default:
-        return "shadow-[0_0_40px_rgba(148,163,184,0.15)]";
+        /** Light mode: soft mint halo (variant 1); dark: neutral */
+        return "shadow-[0_0_50px_rgba(16,185,129,0.3)] dark:shadow-[0_0_40px_rgba(107,114,128,0.12)]";
     }
   };
 
@@ -45,11 +46,11 @@ export const Orb: FC<OrbProps> = ({ state, thinkingProgress = 0, className = "" 
       case "userSpeaking":
         return "from-emerald-500/30 to-cyan-500/20";
       case "aiSpeaking":
-        return "from-violet-500/30 to-fuchsia-500/20";
+        return "from-[#10a37f]/30 to-emerald-600/20";
       case "aiThinking":
-        return "from-slate-400/15 to-slate-600/10";
+        return "from-gray-400/20 to-gray-500/10 dark:from-slate-400/15 dark:to-slate-600/10";
       default:
-        return "from-slate-400/10 to-slate-600/5";
+        return "from-emerald-100/40 to-gray-200/20 dark:from-slate-400/10 dark:to-slate-600/5";
     }
   };
 
@@ -82,8 +83,8 @@ export const Orb: FC<OrbProps> = ({ state, thinkingProgress = 0, className = "" 
         className={`
           relative rounded-full
           w-20 h-20 sm:w-28 sm:h-28 md:w-64 md:h-64
-          bg-gradient-to-br from-slate-800/90 to-slate-900/95
-          border border-slate-700/50
+          bg-white shadow-inner dark:bg-gradient-to-br dark:from-slate-800/90 dark:to-slate-900/95
+          border border-gray-100 dark:border-slate-700/50
           backdrop-blur-sm
           ${getPulseClass()}
         `}
@@ -99,11 +100,11 @@ export const Orb: FC<OrbProps> = ({ state, thinkingProgress = 0, className = "" 
               cy="50"
               r={ORB_R}
               fill="none"
-              stroke="rgba(255,255,255,0.9)"
+              stroke="currentColor"
               strokeWidth="4"
               strokeDasharray={thinkingStrokeDash}
               strokeLinecap="butt"
-              className="transition-all duration-300 ease-out"
+              className="text-gray-800 dark:text-white/90 transition-all duration-300 ease-out"
             />
           </svg>
         </div>
