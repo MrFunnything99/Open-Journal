@@ -1089,8 +1089,17 @@ def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict
     ]
 
 
-def update_consumed(item_id: str, *, date_completed: str | None = None, note: str | None = None, instance_id: str = "") -> bool:
-    """Update date_completed and/or note by id_original in consumed_meta. When instance_id is set, only update rows for that instance."""
+def update_consumed(
+    item_id: str,
+    *,
+    date_completed: str | None = None,
+    note: str | None = None,
+    title: str | None = None,
+    author: str | None = None,
+    url: str | None = None,
+    instance_id: str = "",
+) -> bool:
+    """Update consumed metadata by id_original. When instance_id is set, only update consumed_meta rows for that instance."""
     conn = _get_conn()
     if instance_id:
         cur = conn.execute("SELECT 1 FROM consumed_meta WHERE id_original = ? AND instance_id = ?", (item_id, instance_id))
@@ -1112,6 +1121,15 @@ def update_consumed(item_id: str, *, date_completed: str | None = None, note: st
     if note is not None:
         updates.append("note = ?")
         params.append((note or "")[:2000])
+    if title is not None:
+        updates.append("title = ?")
+        params.append((title or "")[:500])
+    if author is not None:
+        updates.append("author = ?")
+        params.append((author or "")[:300])
+    if url is not None:
+        updates.append("url = ?")
+        params.append((url or "")[:500])
     if not updates:
         return True
     params.append(item_id)
@@ -1131,6 +1149,30 @@ def update_consumed(item_id: str, *, date_completed: str | None = None, note: st
                 f"UPDATE consumed_meta SET {', '.join(updates)} WHERE id_original = ?",
                 params,
             )
+    # Keep vec_consumed metadata in sync (vec table has no instance_id column).
+    # This does not re-embed; it only updates displayed metadata/document fields for consistency.
+    vec_updates = []
+    vec_params: list[Any] = []
+    if title is not None:
+        vec_updates.append("title = ?")
+        vec_params.append((title or "")[:500])
+    if author is not None:
+        vec_updates.append("author = ?")
+        vec_params.append((author or "")[:300])
+    if url is not None:
+        vec_updates.append("url = ?")
+        vec_params.append((url or "")[:500])
+    if note is not None:
+        vec_updates.append("note = ?")
+        vec_params.append((note or "")[:2000])
+    if date_completed is not None:
+        vec_updates.append("date_completed = ?")
+        vec_params.append((date_completed or "")[:50])
+    if vec_updates:
+        conn.execute(
+            f"UPDATE vec_consumed SET {', '.join(vec_updates)} WHERE id_original = ?",
+            vec_params + [item_id],
+        )
     conn.commit()
     return True
 

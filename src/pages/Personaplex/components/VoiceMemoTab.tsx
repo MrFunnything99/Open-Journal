@@ -581,6 +581,69 @@ export const VoiceMemoTab: FC<Props> = ({
                         <div className="text-[0.95rem] leading-7 text-white/95">
                           <p className="whitespace-pre-wrap break-words">{m.content}</p>
                         </div>
+                        {(m.agentSteps && m.agentSteps.length > 0) || (m.actions && m.actions.length > 0) || m.retrievalLog ? (
+                          <details className="mt-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-white/80">
+                            <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-[0.15em] text-white/60">
+                              Agent activity
+                            </summary>
+                            <div className="mt-2 space-y-3 text-xs">
+                              {m.actions && m.actions.length > 0 ? (
+                                <div>
+                                  <p className="font-semibold text-white/70">Actions</p>
+                                  <ul className="mt-1 list-disc space-y-1 pl-5 text-white/75">
+                                    {m.actions.map((a, idx) => (
+                                      <li key={`${m.id}-act-${idx}`}>
+                                        Opened <span className="font-medium text-white/85">{a.view}</span>
+                                        {a.brainSection ? (
+                                          <>
+                                            {" "}
+                                            · <span className="font-medium text-white/85">{a.brainSection}</span>
+                                          </>
+                                        ) : null}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              ) : null}
+
+                              {m.agentSteps && m.agentSteps.length > 0 ? (
+                                <div>
+                                  <p className="font-semibold text-white/70">Steps</p>
+                                  <ul className="mt-1 list-disc space-y-1 pl-5 text-white/75">
+                                    {m.agentSteps
+                                      .filter((s) => typeof s?.summary === "string" && (s.summary ?? "").trim())
+                                      .slice(0, 12)
+                                      .map((s, idx) => {
+                                        const kind = typeof s.kind === "string" ? s.kind : "";
+                                        const name = typeof s.name === "string" ? s.name : "";
+                                        const summary = (s.summary ?? "").trim();
+                                        return (
+                                          <li key={`${m.id}-step-${idx}`}>
+                                            {kind ? <span className="font-medium text-white/85">{kind}</span> : "step"}
+                                            {name ? <span className="text-white/55"> · {name}</span> : null}
+                                            {": "}
+                                            {summary}
+                                          </li>
+                                        );
+                                      })}
+                                  </ul>
+                                  {m.agentSteps.length > 12 ? (
+                                    <p className="mt-1 text-[11px] text-white/50">Showing first 12 steps.</p>
+                                  ) : null}
+                                </div>
+                              ) : null}
+
+                              {m.retrievalLog ? (
+                                <div>
+                                  <p className="font-semibold text-white/70">Memory context (vector DB)</p>
+                                  <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-white/10 bg-black/30 p-2 text-[11px] text-white/70">
+                                    {m.retrievalLog}
+                                  </pre>
+                                </div>
+                              ) : null}
+                            </div>
+                          </details>
+                        ) : null}
                         <div className="mt-2 flex items-center gap-0.5 text-white/50 opacity-90 transition-opacity group-hover:opacity-100">
                           <button
                             type="button"

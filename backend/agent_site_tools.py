@@ -74,7 +74,7 @@ def find_consumed_item_by_title_query(title_query: str, instance_id: str) -> dic
 
 def tool_update_library_item(raw_args: object, instance_id: str) -> tuple[dict[str, Any], str]:
     """
-    Apply library note/date update. Returns (result_json_for_llm, agent_step_summary).
+    Apply library metadata update (note/date/title/author/url). Returns (result_json_for_llm, agent_step_summary).
     """
     if not isinstance(raw_args, dict):
         return {"ok": False, "error": "invalid_args"}, "Library update failed: invalid arguments"
@@ -82,13 +82,21 @@ def tool_update_library_item(raw_args: object, instance_id: str) -> tuple[dict[s
     title_query = (raw_args.get("title_query") or "").strip()[: _MAX_TITLE_QUERY]
     has_note = "note" in raw_args
     has_date = "date_completed" in raw_args
+    has_title = "new_title" in raw_args
+    has_author = "new_author" in raw_args
+    has_url = "new_url" in raw_args
     note_s = None if not has_note else str(raw_args.get("note") or "").strip()[:_MAX_NOTE_LEN]
     date_s = None if not has_date else str(raw_args.get("date_completed") or "").strip()[:50]
+    new_title = None if not has_title else str(raw_args.get("new_title") or "").strip()[:500]
+    new_author = None if not has_author else str(raw_args.get("new_author") or "").strip()[:300]
+    new_url = None if not has_url else str(raw_args.get("new_url") or "").strip()[:500]
 
     if not item_id and not title_query:
         return {"ok": False, "error": "need_item_id_or_title_query"}, "Library update skipped: need item id or title to search"
-    if not has_note and not has_date:
-        return {"ok": False, "error": "no_fields_to_update"}, "Library update skipped: provide note and/or date_completed"
+    if not (has_note or has_date or has_title or has_author or has_url):
+        return {"ok": False, "error": "no_fields_to_update"}, (
+            "Library update skipped: provide note, date_completed, new_title, new_author, and/or new_url"
+        )
 
     resolved_id = item_id
     resolved_title = ""
@@ -103,6 +111,9 @@ def tool_update_library_item(raw_args: object, instance_id: str) -> tuple[dict[s
         resolved_id,
         date_completed=date_s,
         note=note_s,
+        title=new_title,
+        author=new_author,
+        url=new_url,
         instance_id=instance_id,
     )
     if not ok:
@@ -114,6 +125,12 @@ def tool_update_library_item(raw_args: object, instance_id: str) -> tuple[dict[s
         parts.append("note set")
     if date_s is not None:
         parts.append(f"date {date_s}")
+    if new_title is not None and new_title.strip():
+        parts.append("title updated")
+    if new_author is not None:
+        parts.append("author updated")
+    if new_url is not None:
+        parts.append("url updated")
     summ = " — ".join(parts[:3])
     return {"ok": True, "item_id": resolved_id, "title": resolved_title or None}, summ
 

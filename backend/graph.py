@@ -128,8 +128,8 @@ UPDATE_LIBRARY_ITEM_TOOL = {
     "function": {
         "name": "update_library_item",
         "description": (
-            "Update an existing Library item's note and/or completion date. Use when the user asks to change a note, "
-            "rename wording stored as a note, or set completion date for something already in their library "
+            "Update an existing Library item's metadata (note, completion date, title, author, url). Use when the user asks to change a note, "
+            "fix a mistaken title/author, rename an item, or set completion date for something already in their library "
             "(books, podcasts, articles, research already consumed). Provide item_id if known; otherwise use "
             "title_query to find the best match by title."
         ),
@@ -151,6 +151,18 @@ UPDATE_LIBRARY_ITEM_TOOL = {
                 "date_completed": {
                     "type": "string",
                     "description": "YYYY-MM-DD; include only if updating completion date",
+                },
+                "new_title": {
+                    "type": "string",
+                    "description": "Corrected title to store for this item; include only if changing the title",
+                },
+                "new_author": {
+                    "type": "string",
+                    "description": "Corrected author/creator; include only if changing the author",
+                },
+                "new_url": {
+                    "type": "string",
+                    "description": "Corrected canonical URL; include only if changing the URL",
                 },
             },
         },

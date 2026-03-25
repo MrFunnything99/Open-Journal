@@ -374,6 +374,9 @@ class LibraryBulkImportResponse(BaseModel):
 class LibraryItemUpdate(BaseModel):
     date_completed: Optional[str] = None
     note: Optional[str] = None
+    title: Optional[str] = None
+    author: Optional[str] = None
+    url: Optional[str] = None
 
 
 class MemoryDiagramResponse(BaseModel):
@@ -1678,7 +1681,7 @@ async def get_library(request: Request):
 @api_router.patch("/library/{item_id}")
 async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Request):
     """
-    Update date_completed and/or note for a library item by id.
+    Update library item metadata by id.
     """
     instance_id = _instance_id(request)
     try:
@@ -1687,6 +1690,9 @@ async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Req
                 item_id,
                 date_completed=req.date_completed,
                 note=req.note,
+                title=req.title,
+                author=req.author,
+                url=req.url,
                 instance_id=instance_id,
             )
         ok = await asyncio.to_thread(_wrap)

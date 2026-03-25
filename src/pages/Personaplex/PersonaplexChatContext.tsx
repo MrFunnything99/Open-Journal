@@ -47,6 +47,8 @@ export type PersonaplexChatMessage = {
   role: "user" | "assistant";
   content: string;
   retrievalLog?: string;
+  agentSteps?: Array<{ kind?: string; name?: string; summary?: string }>;
+  actions?: PersonaplexNavigateAction[];
 };
 
 export type AgentActivityEntry = {
@@ -424,6 +426,8 @@ export function PersonaplexChatProvider({
 
       const retrievalLog =
         typeof data.retrieval_log === "string" && data.retrieval_log.trim() ? data.retrieval_log.trim() : undefined;
+
+      const navActions = parseNavigateActions(data.actions);
       setMessages((m) => [
         ...m,
         {
@@ -431,6 +435,8 @@ export function PersonaplexChatProvider({
           role: "assistant",
           content: data.response!,
           retrievalLog,
+          agentSteps: steps.length > 0 ? steps : undefined,
+          actions: navActions.length > 0 ? navActions : undefined,
         },
       ]);
 
@@ -446,7 +452,6 @@ export function PersonaplexChatProvider({
         onToast(libN === 1 ? "Added 1 item to your Library." : `Added ${libN} items to your Library.`);
       }
 
-      const navActions = parseNavigateActions(data.actions);
       if (navActions.length > 0) {
         onAgentActionRef.current?.(navActions);
         for (const na of navActions) {

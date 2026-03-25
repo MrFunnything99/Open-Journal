@@ -712,13 +712,30 @@ def list_consumed(max_items: int = 200, instance_id: str = "") -> dict[str, list
         return out
 
 
-def update_consumed(item_id: str, *, date_completed: str | None = None, note: str | None = None, instance_id: str = "") -> bool:
-    """Update date_completed and/or note for a consumed item. Returns True if updated."""
+def update_consumed(
+    item_id: str,
+    *,
+    date_completed: str | None = None,
+    note: str | None = None,
+    title: str | None = None,
+    author: str | None = None,
+    url: str | None = None,
+    instance_id: str = "",
+) -> bool:
+    """Update metadata for a consumed item. Returns True if updated."""
     import vec_store
 
     _ensure_storage()
     try:
-        return vec_store.update_consumed(item_id, date_completed=date_completed, note=note, instance_id=instance_id)
+        return vec_store.update_consumed(
+            item_id,
+            date_completed=date_completed,
+            note=note,
+            title=title,
+            author=author,
+            url=url,
+            instance_id=instance_id,
+        )
     except Exception as e:
         print("[backend] update_consumed error:", e)
         return False
