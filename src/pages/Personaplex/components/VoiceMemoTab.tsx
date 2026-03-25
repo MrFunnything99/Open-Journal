@@ -1,11 +1,10 @@
 import { FC, useCallback, useEffect, useId, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
 import type { ChatMessage } from "../hooks/useJournalHistory";
+import { usePersonaplexChat } from "../PersonaplexChatContext";
 
 type Props = {
   onToast: (msg: string) => void;
-  /** Opens the full voice session panel (ChatGPT-style “voice mode” control). */
-  onOpenSessionPanel?: () => void;
   /** Persist to The Brain → Knowledge base → Journals (uses date for folder layout + memory ingest). */
   saveEntry?: (transcript: ChatMessage[], dateIso: string) => string;
   syncUnsyncedEntries?: () => Promise<number>;
@@ -13,12 +12,8 @@ type Props = {
    * Chat tab: keep the composer higher (not flush to the bottom) and reserve space beneath it for extra UI.
    */
   elevateComposerLayout?: boolean;
-};
-
-type UiMessage = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
+  /** Home: jump to the dedicated Chat screen for a wider conversation layout. */
+  onOpenFullChat?: () => void;
 };
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -56,8 +51,6 @@ function effectiveRecorderMime(recorder: MediaRecorder): string {
   }
   return "audio/webm";
 }
-
-const CHAT_TIMEOUT_MS = 90_000;
 
 type HomeInteractionMode = "conversation" | "journal" | "autobiography";
 
@@ -112,29 +105,22 @@ function dateAndTimeToIso(dateStr: string, timeStr: string): string {
   return new Date(y, mo - 1, day, h, mi, 0, 0).toISOString();
 }
 
-function WaveformIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden>
-      <rect x="5" y="10" width="3" height="8" rx="1" />
-      <rect x="10.5" y="6" width="3" height="16" rx="1" />
-      <rect x="16" y="8" width="3" height="12" rx="1" />
-    </svg>
-  );
-}
-
 export const VoiceMemoTab: FC<Props> = ({
   onToast,
-  onOpenSessionPanel,
   saveEntry,
   syncUnsyncedEntries,
   elevateComposerLayout = false,
+  onOpenFullChat,
 }) => {
+  const {
+    messages,
+    sending,
+    isChatActive,
+    chatError,
+    setDraft: setGlobalDraft,
+  } = usePersonaplexChat();
   const idPrefix = useId();
-  const [messages, setMessages] = useState<UiMessage[]>([]);
-  const [draft, setDraft] = useState("");
-  const [chatSessionId, setChatSessionId] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
-  const [micPhase, setMicPhase] = useState<"idle" | "recording" | "processing">("idle");
+  const [journalMicPhase, setJournalMicPhase] = useState<"idle" | "recording" | "processing">("idle");
   const [error, setError] = useState<string | null>(null);
   const [rawTranscript, setRawTranscript] = useState("");
   const [reviewText, setReviewText] = useState("");
@@ -148,8 +134,6 @@ export const VoiceMemoTab: FC<Props> = ({
   const [journalEntryDate, setJournalEntryDate] = useState("");
   const [journalEntryTime, setJournalEntryTime] = useState("");
   const [savingJournal, setSavingJournal] = useState(false);
-  /** After first text send: hero fades, composer stays at bottom, sidebar + thread layout. */
-  const [isChatActive, setIsChatActive] = useState(false);
   const [homeInteractionMode, setHomeInteractionMode] = useState<HomeInteractionMode>("conversation");
   const listRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -185,71 +169,8 @@ export const VoiceMemoTab: FC<Props> = ({
     [onToast]
   );
 
-  const sendChat = useCallback(async () => {
-    const text = draft.trim();
-    if (!text || sending) return;
-    setIsChatActive(true);
-    setError(null);
-    setDraft("");
-    const userMsg: UiMessage = { id: `u_${Date.now()}`, role: "user", content: text };
-    setMessages((m) => [...m, userMsg]);
-    setSending(true);
-
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), CHAT_TIMEOUT_MS);
-
-    try {
-      const res = await backendFetch("/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          session_id: chatSessionId,
-          personalization: 1,
-          intrusiveness: 0.5,
-          mode: "journal",
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-      const raw = await res.text();
-      let data: {
-        error?: string;
-        detail?: string;
-        response?: string;
-        session_id?: string;
-      } = {};
-      if (raw.trim()) {
-        try {
-          data = JSON.parse(raw) as typeof data;
-        } catch {
-          throw new Error(res.ok ? "Invalid response from server" : `Server error (${res.status})`);
-        }
-      }
-      if (!res.ok) {
-        throw new Error(data.detail || data.error || `Chat failed (${res.status})`);
-      }
-      if (!data.response || typeof data.response !== "string" || !data.session_id) {
-        throw new Error(data.error || "Invalid chat response");
-      }
-      setChatSessionId(data.session_id);
-      setMessages((m) => [...m, { id: `a_${Date.now()}`, role: "assistant", content: data.response! }]);
-    } catch (e) {
-      const msg =
-        e instanceof Error && e.name === "AbortError"
-          ? "Request timed out. Try again."
-          : e instanceof Error
-            ? e.message
-            : "Something went wrong";
-      setError(msg);
-      onToast(msg);
-    } finally {
-      setSending(false);
-    }
-  }, [draft, sending, chatSessionId, onToast]);
-
   const processMicAudio = useCallback(async (blob: Blob, mimeType: string) => {
-    setMicPhase("processing");
+    setJournalMicPhase("processing");
     setError(null);
     try {
       const b64 = await blobToBase64(blob);
@@ -277,7 +198,6 @@ export const VoiceMemoTab: FC<Props> = ({
       }
       const line = (data.polished_text ?? data.raw_transcript ?? "").trim();
       if (line) {
-        setIsChatActive(true);
         const capturedAt = new Date();
         const rawBody = ((data.raw_transcript ?? "").trim() || line).trim();
         const reviewBody = (data.raw_transcript ?? line).trim();
@@ -293,7 +213,7 @@ export const VoiceMemoTab: FC<Props> = ({
     } catch (e) {
       setError(e instanceof Error ? e.message : "Transcription failed");
     } finally {
-      setMicPhase("idle");
+      setJournalMicPhase("idle");
     }
   }, []);
 
@@ -382,7 +302,7 @@ export const VoiceMemoTab: FC<Props> = ({
   ]);
 
   const startRecording = useCallback(async () => {
-    if (micPhase !== "idle" || sending) return;
+    if (journalMicPhase !== "idle" || sending) return;
     setError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -405,17 +325,17 @@ export const VoiceMemoTab: FC<Props> = ({
       };
       mr.start();
       mediaRecorderRef.current = mr;
-      setMicPhase("recording");
+      setJournalMicPhase("recording");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Microphone unavailable");
-      setMicPhase("idle");
+      setJournalMicPhase("idle");
     }
-  }, [micPhase, sending, processMicAudio]);
+  }, [journalMicPhase, sending, processMicAudio]);
 
   const stopRecording = useCallback(() => {
     const mr = mediaRecorderRef.current;
     if (mr && mr.state !== "inactive") mr.stop();
-    else setMicPhase("idle");
+    else setJournalMicPhase("idle");
   }, []);
 
   const onPickFile = useCallback(
@@ -429,105 +349,14 @@ export const VoiceMemoTab: FC<Props> = ({
     [processMicAudio]
   );
 
-  const composerDisabled = sending || micPhase !== "idle" || validating;
+  const journalRecorderBusy = journalMicPhase !== "idle" || validating;
 
   const hasConversation = messages.length > 0 || sending;
-
-  const composerInner = (
-    <>
-      <input ref={fileInputRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.webm,.ogg,.flac" className="hidden" onChange={onPickFile} />
-      <button
-        type="button"
-        onClick={() => fileInputRef.current?.click()}
-        disabled={composerDisabled}
-        className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-white/90 hover:bg-white/10 disabled:opacity-40"
-        aria-label="Attach audio"
-        title="Attach audio"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-        </svg>
-      </button>
-
-      <textarea
-        id={`${idPrefix}-composer`}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            void sendChat();
-          }
-        }}
-        disabled={composerDisabled}
-        rows={1}
-        placeholder="Ask anything"
-        className="max-h-40 min-h-[48px] min-w-0 flex-1 resize-none border-0 bg-transparent py-3 text-[0.95rem] text-white placeholder:text-white/45 focus:outline-none focus:ring-0 disabled:opacity-50"
-      />
-
-      {micPhase === "recording" ? (
-        <button
-          type="button"
-          onClick={stopRecording}
-          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-red-500 text-white"
-          aria-label="Stop recording"
-        >
-          <span className="h-2.5 w-2.5 rounded-full bg-white animate-pulse" />
-        </button>
-      ) : (
-        <button
-          type="button"
-          onClick={startRecording}
-          disabled={composerDisabled}
-          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-white/90 hover:bg-white/10 disabled:opacity-40"
-          aria-label="Dictate"
-          title="Dictate"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-          </svg>
-        </button>
-      )}
-
-      <button
-        type="button"
-        onClick={() => {
-          if (onOpenSessionPanel) {
-            onOpenSessionPanel();
-            return;
-          }
-          void startRecording();
-        }}
-        disabled={sending || micPhase !== "idle"}
-        className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-white text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-40"
-        aria-label={onOpenSessionPanel ? "Open voice session" : "Voice input"}
-        title={onOpenSessionPanel ? "Voice session" : "Voice input"}
-      >
-        <WaveformIcon className="h-5 w-5" />
-      </button>
-    </>
-  );
+  const showFullChatCta = Boolean(onOpenFullChat && !elevateComposerLayout && hasConversation);
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col bg-transparent">
       <div className="flex min-h-0 flex-1 flex-row">
-        {isChatActive && (
-          <aside
-            className="glass-panel mb-3 ml-2 mt-2 hidden w-60 shrink-0 flex-col rounded-2xl border border-white/10 md:mb-4 md:ml-3 md:mt-3 md:flex"
-            aria-label="Conversation"
-          >
-            <div className="border-b border-white/10 px-4 py-3">
-              <p className="text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/50">Chats</p>
-              <p className="mt-1 truncate text-sm font-medium text-white">This conversation</p>
-            </div>
-            <div className="flex-1 overflow-y-auto px-3 py-3">
-              <div className="glass-panel-subtle rounded-xl border border-white/10 px-3 py-2.5 text-xs text-white/80">
-                Replies stay in this thread.
-              </div>
-            </div>
-          </aside>
-        )}
-
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div
             ref={listRef}
@@ -558,9 +387,20 @@ export const VoiceMemoTab: FC<Props> = ({
 
             {(hasConversation || rawTranscript || reviewText) && (
               <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-8 md:px-6">
-                {error && (
+                {showFullChatCta && (
+                  <div className="mb-6 flex justify-end">
+                    <button
+                      type="button"
+                      onClick={onOpenFullChat}
+                      className="rounded-full border border-white/20 bg-white/[0.08] px-4 py-2 text-xs font-medium text-white/90 shadow-sm backdrop-blur-md transition hover:bg-white/[0.12] hover:text-white"
+                    >
+                      Open Chat for full view
+                    </button>
+                  </div>
+                )}
+                {(error || chatError) && (
                   <div className="glass-panel mb-6 rounded-2xl px-4 py-3 text-sm text-red-200">
-                    {error}
+                    {error || chatError}
                   </div>
                 )}
 
@@ -570,6 +410,41 @@ export const VoiceMemoTab: FC<Props> = ({
                     <p className="mt-2 text-sm text-white/70">
                       {"Transcribe -> human review/edit -> AI reformat + validation. You can loop this as many times as you want."}
                     </p>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept="audio/*,.mp3,.m4a,.wav,.webm,.ogg,.flac"
+                        className="hidden"
+                        onChange={onPickFile}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={journalRecorderBusy || sending}
+                        className="rounded-full border border-white/25 bg-white/10 px-3 py-1.5 text-xs font-medium text-white/90 transition hover:bg-white/15 disabled:opacity-50"
+                      >
+                        Attach audio
+                      </button>
+                      {journalMicPhase === "recording" ? (
+                        <button
+                          type="button"
+                          onClick={stopRecording}
+                          className="rounded-full bg-red-500/80 px-3 py-1.5 text-xs font-medium text-white"
+                        >
+                          Stop recording
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => void startRecording()}
+                          disabled={journalRecorderBusy || sending}
+                          className="rounded-full bg-emerald-500/80 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+                        >
+                          {journalMicPhase === "processing" ? "Transcribing…" : "Record"}
+                        </button>
+                      )}
+                    </div>
                     {saveEntry && (
                       <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
                         <div className="flex flex-col gap-1">
@@ -648,7 +523,7 @@ export const VoiceMemoTab: FC<Props> = ({
                         <>
                           <button
                             type="button"
-                            onClick={() => setDraft(validatedJournal)}
+                            onClick={() => setGlobalDraft(validatedJournal)}
                             className="rounded-full border border-white/20 px-4 py-1.5 text-xs font-medium text-white/90 transition hover:bg-white/10"
                           >
                             Use as draft
@@ -756,27 +631,13 @@ export const VoiceMemoTab: FC<Props> = ({
           </div>
 
           <div
-            className={`flex flex-none flex-col bg-transparent px-3 pt-2 transition-[padding] duration-500 ease-out md:px-4 ${
-              elevateComposerLayout ? "pb-2" : "pb-5"
-            } ${isChatActive ? "border-t border-white/[0.07]" : ""}`}
+            className={`flex flex-none flex-col bg-transparent px-3 pt-2 pb-[calc(5.5rem+env(safe-area-inset-bottom))] transition-[padding] duration-500 ease-out md:px-4 md:pb-8 ${
+              isChatActive ? "border-t border-white/[0.07]" : ""
+            }`}
           >
             <div className="mx-auto w-full max-w-[48rem]">
-              {!isChatActive && error && (
-                <div className="glass-panel mb-4 rounded-2xl px-4 py-3 text-sm text-red-200">
-                  {error}
-                </div>
-              )}
-
               <div
-                className={`glass-panel flex items-center gap-1 rounded-full pl-3 pr-2 transition-shadow duration-500 md:gap-2 md:pl-4 ${
-                  micPhase === "recording" ? "ring-2 ring-red-400/40" : ""
-                } ${isChatActive ? "shadow-[0_-4px_24px_rgba(0,0,0,0.15)]" : ""}`}
-              >
-                {composerInner}
-              </div>
-
-              <div
-                className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3"
+                className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-3"
                 role="radiogroup"
                 aria-label="How you want to use the assistant"
               >
@@ -811,12 +672,6 @@ export const VoiceMemoTab: FC<Props> = ({
                 })}
               </div>
             </div>
-            {elevateComposerLayout && !isChatActive ? (
-              <div
-                className="mx-auto mt-4 w-full max-w-[48rem] flex-none min-h-[6.5rem] sm:min-h-[7.5rem]"
-                aria-hidden
-              />
-            ) : null}
           </div>
         </div>
       </div>

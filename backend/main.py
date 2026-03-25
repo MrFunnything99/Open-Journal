@@ -12,7 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Response
@@ -55,6 +55,7 @@ from library import (
     run_relationship_summary_agent,
     run_people_grouping_agent,
     save_session_data,
+    gemini_extraction_backend,
     update_consumed,
     update_memory_fact,
     update_memory_summary,
@@ -71,7 +72,8 @@ def _instance_id(request: Request) -> str:
 sessions: dict[str, list] = {}
 library_interview_sessions: dict[str, list] = {}  # session_id -> list of {role, content}
 
-CHAT_INVOKE_TIMEOUT_SEC = 60
+# Journal chat may run OpenRouter + tool round-trips (e.g. add_library_items); keep headroom.
+CHAT_INVOKE_TIMEOUT_SEC = 90
 LIBRARY_INTERVIEW_TIMEOUT_SEC = 45
 
 
@@ -96,21 +98,18 @@ async def lifespan(app: FastAPI):
     if not pplx_key:
         print("[backend] WARNING: PERPLEXITY_API_KEY missing — vector ingest and retrieval will fail until set.")
 
-    xai_key = os.getenv("XAI_API_KEY")
-    print("[backend] Generation: Grok")
-    if not (xai_key and xai_key.strip()):
-        print("[backend] WARNING: XAI_API_KEY missing — /chat interviewer will not work until set.")
-
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if gemini_key and gemini_key.strip():
-        print("[backend] Extraction: Gemini (if still enabled — librarian / extraction / helpers; not embeddings)")
-    else:
-        print("[backend] Extraction: Gemini not enabled — GEMINI_API_KEY missing (ingest extraction will fail)")
+    print(f"[backend] Extraction / library LLM: {gemini_extraction_backend()}")
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    chat_model = (os.getenv("OPENROUTER_CHAT_MODEL") or "openai/gpt-5.4").strip()
     if or_key:
-        print("[backend] OPENROUTER_API_KEY is set (journal validation / OpenRouter)")
+        print(
+            f"[backend] OPENROUTER_API_KEY is set — /chat ({chat_model}), journal validation, "
+            "and extraction when GEMINI_VIA_OPENROUTER is not off"
+        )
     else:
-        print("[backend] WARNING: OPENROUTER_API_KEY is missing. Journal AI validation will be skipped until set in .env.")
+        print(
+            "[backend] WARNING: OPENROUTER_API_KEY missing — /chat interviewer and journal validation will not work until set."
+        )
     yield
     # Cleanup if needed
     pass
@@ -154,6 +153,10 @@ class ChatResponse(BaseModel):
     session_id: str
     retrieval_log: Optional[str] = None
     notes_saved: Optional[List[Dict[str, str]]] = None  # [{"item_id": "...", "note": "..."}]
+    library_items_added: Optional[int] = None  # journal mode: agent saved N items to Library
+    agent_steps: Optional[List[Dict[str, Any]]] = None  # retrieval + tool summaries for UI
+    # Allowlisted UI actions from journal chat agent (e.g. navigate). Frontend must ignore unknown types.
+    actions: Optional[List[Dict[str, Any]]] = None
 
 
 class EndSessionRequest(BaseModel):
@@ -323,6 +326,7 @@ class RecommendationsResponse(BaseModel):
     podcasts: list[RecommendationItem]
     articles: list[RecommendationItem]
     research: list[RecommendationItem]
+    news: list[RecommendationItem] = []
 
 
 class ConsumedRequest(BaseModel):
@@ -345,6 +349,26 @@ class LibraryNoteRequest(BaseModel):
 class LibraryNoteResponse(BaseModel):
     ok: bool
     items_added: int
+
+
+class LibraryBulkImportItem(BaseModel):
+    id: str
+    type: str  # book | podcast | article | research
+    title: str
+    author: Optional[str] = None
+    note: Optional[str] = None
+    date_completed: Optional[str] = None
+    url: Optional[str] = None
+    liked: bool = True
+
+
+class LibraryBulkImportRequest(BaseModel):
+    items: List[LibraryBulkImportItem]
+
+
+class LibraryBulkImportResponse(BaseModel):
+    ok: bool
+    count: int = 0
 
 
 class LibraryItemUpdate(BaseModel):
@@ -913,7 +937,28 @@ async def chat(req: ChatRequest, request: Request):
             c.get("text", str(c)) for c in response_text if isinstance(c, dict)
         )
     retrieval_log = result.get("retrieval_log")
-    return ChatResponse(response=response_text, session_id=session_id, retrieval_log=retrieval_log)
+    lib_n = result.get("library_items_added")
+    lib_opt = int(lib_n) if isinstance(lib_n, int) and lib_n > 0 else None
+    raw_steps = result.get("agent_steps")
+    agent_steps: Optional[List[Dict[str, Any]]] = None
+    if isinstance(raw_steps, list) and raw_steps:
+        agent_steps = [s for s in raw_steps if isinstance(s, dict)]
+        if not agent_steps:
+            agent_steps = None
+    raw_actions = result.get("client_actions")
+    actions: Optional[List[Dict[str, Any]]] = None
+    if isinstance(raw_actions, list) and raw_actions:
+        actions = [a for a in raw_actions if isinstance(a, dict) and a.get("type") == "navigate"]
+        if not actions:
+            actions = None
+    return ChatResponse(
+        response=response_text,
+        session_id=session_id,
+        retrieval_log=retrieval_log,
+        library_items_added=lib_opt,
+        agent_steps=agent_steps,
+        actions=actions,
+    )
 
 
 def _get_or_create_library_interview_session(session_id: Optional[str]) -> str:
@@ -1517,14 +1562,15 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
     return {"ok": ok}
 
 
-# Keep under typical proxy origin timeout (e.g. Cloudflare 100s) to avoid 524
-RECOMMENDATIONS_TIMEOUT_SEC = 90
+# Keep under typical proxy origin timeout (e.g. Cloudflare 100s) to avoid 524.
+# Slightly above RECOMMENDATIONS_AGENT_TIMEOUT_SEC so parallel agents can finish first.
+RECOMMENDATIONS_TIMEOUT_SEC = float(os.getenv("RECOMMENDATIONS_HTTP_TIMEOUT_SEC", "78"))
 
 @api_router.get("/recommendations", response_model=RecommendationsResponse)
 async def get_recommendations(request: Request):
     """
-    Generate personalized book, podcast, and article recommendations from journal memory
-    and what the user has already consumed/liked. May take 30–90s; timeout keeps response before proxy limit.
+    Personalized books, podcasts, articles, research, and news from journal memory and consumed library.
+    May take ~35–80s depending on Perplexity + LLM latency; override RECOMMENDATIONS_HTTP_TIMEOUT_SEC if needed.
     """
     instance_id = _instance_id(request)
     try:
@@ -1532,17 +1578,20 @@ async def get_recommendations(request: Request):
             asyncio.to_thread(generate_recommendations, instance_id),
             timeout=RECOMMENDATIONS_TIMEOUT_SEC,
         )
+    except asyncio.CancelledError:
+        raise
     except asyncio.TimeoutError:
         print("[backend] /recommendations timed out after", RECOMMENDATIONS_TIMEOUT_SEC, "s")
-        return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[])
+        return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[], news=[])
     except Exception as e:
         print("[backend] /recommendations error:", e)
-        return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[])
+        return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[], news=[])
     return RecommendationsResponse(
         books=[RecommendationItem(**x) for x in data.get("books", [])],
         podcasts=[RecommendationItem(**x) for x in data.get("podcasts", [])],
         articles=[RecommendationItem(**x) for x in data.get("articles", [])],
         research=[RecommendationItem(**x) for x in data.get("research", [])],
+        news=[RecommendationItem(**x) for x in data.get("news", [])],
     )
 
 
@@ -1706,6 +1755,54 @@ async def memory_wipe(request: Request):
     else:
         wipe_memory()
     return {"ok": True, "message": "Memory wiped."}
+
+
+@api_router.post("/memory-reset-knowledge-base-import")
+async def memory_reset_knowledge_base_import(request: Request):
+    """
+    Wipe all vector-backed memory for this instance: journal gist/episodic embeddings and the
+    consumed library index. Used before a full knowledge-base folder re-import so embeddings
+    match the uploaded export only.
+    """
+    instance_id = _instance_id(request)
+    try:
+        await asyncio.to_thread(vec_store.wipe_all_vector_memory_for_instance, instance_id)
+        return {"ok": True}
+    except Exception as e:
+        print("[backend] /memory-reset-knowledge-base-import error:", e)
+        return {"ok": False, "detail": str(e)}
+
+
+@api_router.post("/library/bulk-import", response_model=LibraryBulkImportResponse)
+async def library_bulk_import(req: LibraryBulkImportRequest, request: Request):
+    """
+    Rebuild consumed library rows with embeddings (after KB import). Items use client ids as stable keys.
+    """
+    instance_id = _instance_id(request)
+    n = 0
+    for it in req.items:
+        ct = (it.type or "article").lower()
+        if ct not in ("book", "podcast", "article", "research"):
+            ct = "article"
+        if not (it.id or "").strip() or not (it.title or "").strip():
+            continue
+        try:
+            await asyncio.to_thread(
+                add_consumed,
+                ct,
+                it.title.strip(),
+                author=it.author,
+                url=it.url,
+                liked=it.liked,
+                note=it.note,
+                date_completed=it.date_completed,
+                instance_id=instance_id,
+                id_override=it.id.strip(),
+            )
+            n += 1
+        except Exception as e:
+            print("[backend] /library/bulk-import item error:", e)
+    return LibraryBulkImportResponse(ok=True, count=n)
 
 
 @api_router.get("/health")

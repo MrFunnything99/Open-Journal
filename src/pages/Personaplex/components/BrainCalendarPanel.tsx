@@ -27,9 +27,6 @@ export const BrainCalendarPanel: FC<BrainCalendarPanelProps> = ({
 }) => {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-4 md:p-6">
-      <p className="mb-4 text-sm text-gray-500 dark:text-gray-400">
-        Click a date for an AI summary of that day (journal entries + memory).
-      </p>
       <div className="flex min-h-0 flex-1 flex-col gap-6 sm:flex-row">
         <div className="shrink-0">
           <div className="mb-3 flex items-center justify-between gap-4">

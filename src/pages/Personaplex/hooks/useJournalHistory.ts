@@ -334,6 +334,26 @@ export const useJournalHistory = () => {
     return withNewIds.length;
   }, []);
 
+  /** Replace local journal history entirely (used after server vector wipe + knowledge base re-import). */
+  const importEntriesReplaceAll = useCallback((payload: ExportPayload): number => {
+    const normalized = payload.entries
+      .map((raw) => normalizeEntry(raw))
+      .filter((e): e is JournalEntry => e != null);
+    if (normalized.length === 0) {
+      setEntries([]);
+      saveToStorage([]);
+      return 0;
+    }
+    const withNewIds = normalized.map((e) => ({
+      ...e,
+      id: generateId(),
+      syncedToMemory: false as const,
+    }));
+    setEntries(withNewIds);
+    saveToStorage(withNewIds);
+    return withNewIds.length;
+  }, []);
+
   return {
     entries,
     saveEntry,
@@ -346,6 +366,7 @@ export const useJournalHistory = () => {
     getFormattedDate,
     exportAllJournals,
     importEntriesFromExport,
+    importEntriesReplaceAll,
     isExportPayload,
   };
 };

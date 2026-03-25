@@ -1218,6 +1218,41 @@ def wipe_memory_for_instance(instance_id: str) -> None:
     conn.commit()
 
 
+def wipe_consumed_for_instance(instance_id: str) -> None:
+    """Remove consumed library rows and embeddings for this instance (or legacy unscoped rows if instance_id is '')."""
+    conn = _get_conn()
+    where, params = _instance_where(instance_id, "consumed_meta")
+    try:
+        rows = conn.execute(
+            f"SELECT id_original FROM consumed_meta WHERE {where}",
+            params,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    for (oid,) in rows:
+        if not oid:
+            continue
+        conn.execute("DELETE FROM vec_consumed WHERE id_original = ?", (oid,))
+    try:
+        conn.execute(f"DELETE FROM consumed_meta WHERE {where}", params)
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+
+
+def wipe_all_vector_memory_for_instance(instance_id: str) -> None:
+    """
+    Clear gist, episodic, and consumed vectors for one instance (full knowledge-base reset before re-import).
+    When instance_id is empty, clears global gist/episodic (legacy) and legacy consumed rows.
+    """
+    if instance_id:
+        wipe_memory_for_instance(instance_id)
+        wipe_consumed_for_instance(instance_id)
+    else:
+        wipe_memory()
+        wipe_consumed_for_instance("")
+
+
 def memory_count_for_instance(instance_id: str) -> tuple[int, int]:
     """Return (gist_count, episodic_count) for the given instance_id. Used to ask anonymous user if they want to sync."""
     if not instance_id or not instance_id.strip():

@@ -1,6 +1,6 @@
 # Selfmeridian Python Backend
 
-Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** as the primary vector memory. **LightRAG** is optional and **off by default** (see `lightrag_bridge.py`). The main app uses **Perplexity** (vector embeddings), **Gemini** (memory extraction and helpers), and **Grok/XAI** (chat); OpenRouter is optional and used only in some Node-side routes if you enable it.
+Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** as the primary vector memory. **LightRAG** is optional and **off by default** (see `lightrag_bridge.py`). The main app uses **Perplexity** (vector embeddings), **Gemini or OpenRouter** (memory extraction and helpers), and **OpenRouter** (journal `/chat` interviewer, default `openai/gpt-5.4`).
 
 ## Setup (1-time)
 
@@ -24,8 +24,8 @@ Copy `.env.example` to `.env` in the project root and set:
 
 - `PERPLEXITY_API_KEY` – for vector embeddings (gist / episodic / library search); required for memory retrieval indexing
 - `GEMINI_API_KEY` – for Gemini `generate_content` only: extraction, recommendations helpers, date inference (not embeddings)
-- `XAI_API_KEY` – for interviewer chat (Grok 4.20 reasoning, required for /chat)
-- `GEMINI_CHAT_MODEL` – e.g. `gemini-3-flash-preview` (optional, for date inference etc.; interviewer uses Grok)
+- `OPENROUTER_API_KEY` – required for `/chat` (journal interviewer) and journal validation; optional model via `OPENROUTER_CHAT_MODEL` (default `openai/gpt-5.4`)
+- `GEMINI_CHAT_MODEL` – e.g. `gemini-3-flash-preview` when using direct Google SDK for extraction (not used by `/chat`)
 - `PERPLEXITY_EMBEDDING_MODEL` – default `pplx-embed-context-v1-4b` (contextualized API; use `pplx-embed-v1-4b` for standard `/v1/embeddings` if you switch)
 - `EMBEDDING_DIM` – must match model output (default `2560` for full-size 4B Perplexity embeddings; use Matryoshka `dimensions` in API only if you align this env)
 - `LIGHTRAG_ENABLED` – default `false`; set to `true` to enable optional LightRAG indexing (`lightrag_bridge.py`)

@@ -1,157 +1,122 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Dispatch, SetStateAction } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { backendFetch } from "../../backendApi";
-import { usePersonaplexSession, type TranscriptEntry } from "./hooks/usePersonaplexSession";
-import { SessionSidePanel } from "./components/SessionSidePanel";
-import { useTheme } from "../../hooks/useTheme";
-import { ThemeToggle } from "../../components/ThemeToggle";
 import { parseKnowledgeBaseFile, useJournalHistory } from "./hooks/useJournalHistory";
 import { buildKnowledgeBaseMarkdownZip, parseKnowledgeBaseMarkdownZip } from "./knowledgeBaseMarkdownZip";
-import { type OrbState } from "./components/Orb";
-import { ConnectionStatus } from "./components/ConnectionStatus";
 import { BrainLayout, type BrainLibraryCategory } from "./components/BrainLayout";
 import { VoiceMemoTab } from "./components/VoiceMemoTab";
 import { BrainCalendarPanel } from "./components/BrainCalendarPanel";
+import { PersonaplexChatProvider, type PersonaplexNavigateAction } from "./PersonaplexChatContext";
+import { MobileAskComposerDock } from "./components/GlobalAskAnythingBar";
+import { PersonaplexLeftRail } from "./components/PersonaplexLeftRail";
 
-type VoiceOption = { voice_id: string; name: string };
-
-/** Default journaling assistant prompt (base; personalization is always \"high\" / memory-connected) */
-const DEFAULT_PERSONAPLEX_PROMPT = `You are an empathetic and insightful conversational journaling assistant. Your goal is to provide a supportive space for the user to reflect on their thoughts, experiences, and emotions. Read the user's entries and respond naturally. Ask open-ended questions to encourage further exploration, but always let the user guide the direction and depth of the conversation. Avoid being overly prescriptive, giving unsolicited advice, or summarizing their thoughts unnecessarily. Just be a curious, active listener. Always facilitate conversation that gets the user exploring their thoughts and emotions. Try to keep responses brief and concise when possible to conserve tokens.`;
-
-const INTRUSIVENESS_LABELS: Record<number, string> = {
-  0: "Context building only; follow the user's lead; gather and reflect back; avoid probing or emotional questions.",
-  0.25: "Mostly context building; ask sparingly and only to clarify or expand.",
-  0.5: "Balanced; mix context-building with occasional reflective questions.",
-  0.75: "More dynamic questions; ask how things made them feel, what they noticed, etc., when it fits.",
-  1: "Dynamic questions; actively ask \"how did this make you feel?\", \"what was that like?\", and other reflective, feeling-focused questions to deepen exploration.",
-};
-
-const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Rachel
 const RECOMMENDATIONS_CACHE_KEY = "openjournal-recommendations-cache";
 const LIBRARY_CACHE_KEY = "openjournal-library-cache";
 
-/** Fallback when /api/voices is unavailable (e.g. API server not running) */
-const FALLBACK_VOICES: VoiceOption[] = [
-  { voice_id: "21m00Tcm4TlvDq8ikWAM", name: "Rachel" },
-  { voice_id: "pNInz6obpgDQGcFmaJgB", name: "Adam" },
-  { voice_id: "EXAVITQu4vr4xnSDxMaL", name: "Bella" },
-  { voice_id: "ErXwobaYiN019PkySvjV", name: "Antoni" },
-  { voice_id: "MF3mGyEYCl7XYWbV9V6O", name: "Elli" },
-  { voice_id: "TxGEqnHWrfWFTfGW9XjX", name: "Josh" },
-  { voice_id: "VR6AewLTigWG4xSOukaG", name: "Arnold" },
-  { voice_id: "onwK4e9ZLuTAKqWW03F9", name: "Domi" },
-  { voice_id: "N2lVS1w4EtoT3dr4eOWO", name: "Sam" },
-];
+type RecItem = { title: string; author?: string; reason?: string; url?: string };
+type RecommendationsBundle = {
+  books: RecItem[];
+  podcasts: RecItem[];
+  articles: RecItem[];
+  research: RecItem[];
+  news: RecItem[];
+};
+const EMPTY_RECOMMENDATIONS: RecommendationsBundle = {
+  books: [],
+  podcasts: [],
+  articles: [],
+  research: [],
+  news: [],
+};
+
+function readRecommendationsCache(): RecommendationsBundle {
+  try {
+    const raw = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
+    if (!raw) return { ...EMPTY_RECOMMENDATIONS };
+    const parsed = JSON.parse(raw) as Partial<RecommendationsBundle>;
+    return {
+      books: Array.isArray(parsed.books) ? parsed.books : [],
+      podcasts: Array.isArray(parsed.podcasts) ? parsed.podcasts : [],
+      articles: Array.isArray(parsed.articles) ? parsed.articles : [],
+      research: Array.isArray(parsed.research) ? parsed.research : [],
+      news: Array.isArray(parsed.news) ? parsed.news : [],
+    };
+  } catch {
+    return { ...EMPTY_RECOMMENDATIONS };
+  }
+}
+
+const KB_UPLOAD_CONFIRM_MESSAGE =
+  "Uploading a knowledge base replaces everything for this session.\n\n" +
+  "• Server: all journal embeddings and your library vector index are deleted, then rebuilt from this file.\n" +
+  "• This device: journals and library are replaced by the import (not merged).\n" +
+  "• Cached recommendations are cleared.\n\n" +
+  "Stay online until syncing finishes. This cannot be undone.\n\n" +
+  "Continue?";
+
+const JOURNAL_FOLDER_UPLOAD_CONFIRM_MESSAGE =
+  "Import all journal files from the selected folder? New entries will be added to your knowledge base.";
+
+type LibraryBulkImportPayloadItem = {
+  id: string;
+  type: "book" | "podcast" | "article" | "research";
+  title: string;
+  author?: string;
+  note?: string;
+  date_completed?: string;
+  url?: string;
+  liked: boolean;
+};
+
+function librarySnapshotToBulkPayload(next: {
+  books: Array<{ id: string; title: string; author?: string; note?: string; date_completed?: string }>;
+  podcasts: Array<{ id: string; title: string; author?: string; note?: string; date_completed?: string }>;
+  articles: Array<{ id: string; title: string; author?: string; note?: string; date_completed?: string }>;
+  research: Array<{ id: string; title: string; author?: string; note?: string; date_completed?: string }>;
+}): LibraryBulkImportPayloadItem[] {
+  const items: LibraryBulkImportPayloadItem[] = [];
+  const push = (row: (typeof next.books)[number], type: LibraryBulkImportPayloadItem["type"]) => {
+    items.push({
+      id: row.id,
+      type,
+      title: row.title,
+      author: row.author,
+      note: row.note,
+      date_completed: row.date_completed,
+      liked: true,
+    });
+  };
+  next.books.forEach((r) => push(r, "book"));
+  next.podcasts.forEach((r) => push(r, "podcast"));
+  next.articles.forEach((r) => push(r, "article"));
+  next.research.forEach((r) => push(r, "research"));
+  return items;
+}
 
 type PersonaplexView = "voice_memo" | "brain" | "recommendations" | "journal";
 
-/** Glass nav — active item solid white pill; inactive muted on glass */
-function PersonaplexNavButtons({
-  view,
-  setView,
-}: {
-  view: PersonaplexView;
-  setView: Dispatch<SetStateAction<PersonaplexView>>;
-}) {
-  const base =
-    "inline-flex items-center justify-center rounded-full text-sm font-medium transition-colors gap-1.5 " +
-    "min-h-[44px] min-w-[44px] px-2 sm:px-2.5 md:min-h-0 md:min-w-0 md:px-3.5 md:py-2";
-  const active = "bg-white text-gray-900 shadow-sm";
-  const inactive = "text-white/60 hover:bg-white/10 hover:text-white";
-  return (
-    <>
-      <button
-        type="button"
-        onClick={() => setView("voice_memo")}
-        className={`${base} ${view === "voice_memo" ? active : inactive}`}
-        title="Home — chat, dictate, annotate or hear replies"
-        aria-label="Home"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 md:h-4 md:w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-        </svg>
-        <span className="hidden sm:inline">Home</span>
-      </button>
-      <button
-        type="button"
-        onClick={() => setView("brain")}
-        className={`${base} ${view === "brain" ? active : inactive}`}
-        title="The Brain — journals and library"
-        aria-label="The Brain"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 md:h-4 md:w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
-        </svg>
-        <span className="hidden sm:inline">The Brain</span>
-      </button>
-      <button
-        type="button"
-        onClick={() => setView("recommendations")}
-        className={`${base} ${view === "recommendations" ? active : inactive}`}
-        title="Personalized recommendations"
-        aria-label="Personalized recommendations"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 md:h-4 md:w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
-        </svg>
-        <span className="hidden sm:inline">Recommendations</span>
-      </button>
-      <button
-        type="button"
-        onClick={() => setView("journal")}
-        className={`${base} ${view === "journal" ? active : inactive}`}
-        title="Chat — reflect with the assistant"
-        aria-label="Chat"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 md:h-4 md:w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-        </svg>
-        <span className="hidden sm:inline">Chat</span>
-      </button>
-    </>
-  );
-}
-
 export const Personaplex = () => {
-  const { mode, toggle } = useTheme();
-  // Personalization is always \"high\": the agent should actively connect past memories and journals to the current conversation when relevant.
-  const personalization = 1;
-  const intrusiveness = 0.5;
-  const [sessionMode, setSessionMode] = useState<"journal" | "recommendations">("journal");
-  const [voices, setVoices] = useState<VoiceOption[]>(FALLBACK_VOICES);
-  const [selectedVoiceId, setSelectedVoiceId] = useState(DEFAULT_VOICE_ID);
-  // Fixed voice settings: speed 1.0, moderate stability to reduce ElevenLabs variability/errors.
-  const voiceSettings = useMemo(
-    () => ({
-      stability: 0.4,
-      similarity_boost: 0.75,
-      style: 0.4,
-      speed: 1.0,
-    }),
-    []
-  );
-  const textPrompt = useMemo(
-    () =>
-      DEFAULT_PERSONAPLEX_PROMPT +
-      "\n\nPersonalization: Always look for relevant connections between today's journaling and the user's past entries and memories. When appropriate, bring prior sessions or stories back into the conversation to deepen reflection (for example, if the user asks what to journal about today, suggest follow-ups based on past sessions)." +
-      "\n\nQuestioning style (intrusiveness): " +
-      Math.round(intrusiveness * 100) +
-      "%. " +
-      (INTRUSIVENESS_LABELS[intrusiveness as keyof typeof INTRUSIVENESS_LABELS] ?? INTRUSIVENESS_LABELS[0.5]),
-    [intrusiveness]
-  );
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
-  const [interimTranscript, setInterimTranscript] = useState("");
   const [view, setView] = useState<PersonaplexView>("voice_memo");
-  const [sessionPanelOpen, setSessionPanelOpen] = useState(false);
-  const [sessionSettingsExpanded, setSessionSettingsExpanded] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [showLiveTranscription, setShowLiveTranscription] = useState(true);
-  const [inputMode, setInputMode] = useState<"voice" | "text">("voice");
-  const [typedInput, setTypedInput] = useState("");
-  type RecItem = { title: string; author?: string; reason?: string; url?: string };
-  const [recommendations, setRecommendations] = useState<{ books: RecItem[]; podcasts: RecItem[]; articles: RecItem[]; research: RecItem[] }>({ books: [], podcasts: [], articles: [], research: [] });
+  const [railExpanded, setRailExpanded] = useState(true);
+  const [mobileRailOpen, setMobileRailOpen] = useState(false);
+  const chatToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 4000);
+  }, []);
+  const handleChatAgentAction = useCallback(
+    (actions: PersonaplexNavigateAction[]) => {
+      let navigated = false;
+      for (const a of actions) {
+        if (a.type !== "navigate") continue;
+        setView(a.view);
+        if (a.view === "brain" && a.brainSection) setBrainSection(a.brainSection);
+        navigated = true;
+      }
+      if (navigated) chatToast("Opened the screen you asked for.");
+    },
+    [chatToast]
+  );
+  const [recommendations, setRecommendations] = useState<RecommendationsBundle>(() => readRecommendationsCache());
   const [recommendationsLoading, setRecommendationsLoading] = useState(false);
   const recommendationsInFlightRef = useRef(false);
   const [consumedIds, setConsumedIds] = useState<Set<string>>(new Set());
@@ -268,14 +233,41 @@ export const Personaplex = () => {
   const {
     entries,
     saveEntry,
-    saveOrUpdateEntry,
-    markEntrySynced,
     syncUnsyncedEntries,
     deleteEntry,
     updateJournalEntry,
     getFormattedDate,
-    importEntriesFromExport,
+    importEntriesReplaceAll,
   } = useJournalHistory();
+
+  const prepareKnowledgeBaseUpload = useCallback(() => window.confirm(KB_UPLOAD_CONFIRM_MESSAGE), []);
+
+  const prepareJournalDumpUpload = useCallback(() => window.confirm(JOURNAL_FOLDER_UPLOAD_CONFIRM_MESSAGE), []);
+
+  const resetServerKnowledgeBaseMemory = useCallback(async (): Promise<boolean> => {
+    try {
+      const r = await backendFetch("/memory-reset-knowledge-base-import", { method: "POST" });
+      const data = (await r.json().catch(() => ({}))) as { ok?: boolean };
+      return r.ok && data.ok !== false;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const pushLibraryBulkToServer = useCallback(async (items: LibraryBulkImportPayloadItem[]) => {
+    if (items.length === 0) return true;
+    try {
+      const r = await backendFetch("/library/bulk-import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items }),
+      });
+      const data = (await r.json().catch(() => ({}))) as { ok?: boolean };
+      return r.ok && data.ok !== false;
+    } catch {
+      return false;
+    }
+  }, []);
 
   const handleDownloadKnowledgeBase = useCallback(async () => {
     try {
@@ -294,38 +286,80 @@ export const Personaplex = () => {
     }
   }, [entries, libraryItems]);
 
-  const mergeImportedLibrary = useCallback(
+  const replaceImportedLibrary = useCallback(
     (lib: {
       books: (typeof libraryItems.books)[number][];
       podcasts: (typeof libraryItems.podcasts)[number][];
       articles: (typeof libraryItems.articles)[number][];
       research: (typeof libraryItems.research)[number][];
     }) => {
-      const remap = (items: (typeof libraryItems.books)[number][]) =>
+      const base = Date.now();
+      const remap = (items: (typeof libraryItems.books)[number][], tag: string) =>
         items.map((item, i) => ({
           ...item,
-          id: `lib-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 9)}`,
+          id: `lib-${base}-${tag}-${i}-${Math.random().toString(36).slice(2, 8)}`,
         }));
-      setLibraryItems((prev) => {
-        const next = {
-          books: [...prev.books, ...remap(lib.books)],
-          podcasts: [...prev.podcasts, ...remap(lib.podcasts)],
-          articles: [...prev.articles, ...remap(lib.articles)],
-          research: [...prev.research, ...remap(lib.research)],
-        };
-        try {
-          localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(next));
-        } catch {
-          /* ignore */
-        }
-        return next;
-      });
+      const next = {
+        books: remap(lib.books, "book"),
+        podcasts: remap(lib.podcasts, "podcast"),
+        articles: remap(lib.articles, "article"),
+        research: remap(lib.research, "research"),
+      };
+      setLibraryItems(next);
+      try {
+        localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
     },
     []
   );
 
   const handleImportKnowledgeBaseFile = useCallback(
     async (file: File) => {
+      const applyKnowledgeBaseImport = async (
+        exportPayload: { version: number; exportedAt: string; entries: (typeof entries)[number][] },
+        lib: {
+          books: (typeof libraryItems.books)[number][];
+          podcasts: (typeof libraryItems.podcasts)[number][];
+          articles: (typeof libraryItems.articles)[number][];
+          research: (typeof libraryItems.research)[number][];
+        }
+      ) => {
+        if (!(await resetServerKnowledgeBaseMemory())) {
+          setToastMessage("Could not reset server memory. Check your connection and try again.");
+          setTimeout(() => setToastMessage(null), 6000);
+          return;
+        }
+        try {
+          localStorage.removeItem(RECOMMENDATIONS_CACHE_KEY);
+        } catch {
+          /* ignore */
+        }
+        setRecommendations({ ...EMPTY_RECOMMENDATIONS });
+        const nEntries = importEntriesReplaceAll({
+          version: exportPayload.version,
+          exportedAt: exportPayload.exportedAt,
+          entries: exportPayload.entries,
+        });
+        const nextLib = replaceImportedLibrary(lib);
+        const bulk = librarySnapshotToBulkPayload(nextLib);
+        const libOk = await pushLibraryBulkToServer(bulk);
+        if (!libOk) {
+          setToastMessage("Journals updated locally; library sync failed. Check the API and try uploading again.");
+          setTimeout(() => setToastMessage(null), 6000);
+        }
+        const synced = await syncUnsyncedEntries();
+        void fetchLibrary();
+        const nLib = bulk.length;
+        setToastMessage(
+          `Knowledge base replaced: ${nEntries} journal entr${nEntries === 1 ? "y" : "ies"}, ${nLib} library item${nLib === 1 ? "" : "s"}. ` +
+            `${synced} synced to server memory.`
+        );
+        setTimeout(() => setToastMessage(null), 6500);
+      };
+
       try {
         const looksZip =
           file.name.toLowerCase().endsWith(".zip") ||
@@ -339,21 +373,10 @@ export const Personaplex = () => {
             setTimeout(() => setToastMessage(null), 5000);
             return;
           }
-          const nEntries = importEntriesFromExport({
-            version: 1,
-            exportedAt: new Date().toISOString(),
-            entries: parsed.entries,
-          });
-          mergeImportedLibrary(parsed.library);
-          const nLib =
-            parsed.library.books.length +
-            parsed.library.podcasts.length +
-            parsed.library.articles.length +
-            parsed.library.research.length;
-          setToastMessage(
-            `Imported ${nEntries} entr${nEntries === 1 ? "y" : "ies"} and ${nLib} library item${nLib === 1 ? "" : "s"} from Markdown.`
+          await applyKnowledgeBaseImport(
+            { version: 1, exportedAt: new Date().toISOString(), entries: parsed.entries },
+            parsed.library
           );
-          setTimeout(() => setToastMessage(null), 5000);
           return;
         }
 
@@ -365,34 +388,28 @@ export const Personaplex = () => {
           return;
         }
         if (parsed.kind === "journalsOnly") {
-          const n = importEntriesFromExport(parsed.data);
-          setToastMessage(
-            n > 0 ? `Imported ${n} journal entr${n === 1 ? "y" : "ies"} from JSON.` : "No entries found in that file."
-          );
-          setTimeout(() => setToastMessage(null), 4000);
+          await applyKnowledgeBaseImport(parsed.data, {
+            books: [],
+            podcasts: [],
+            articles: [],
+            research: [],
+          });
           return;
         }
-        const nEntries = importEntriesFromExport({
-          version: parsed.data.version,
-          exportedAt: parsed.data.exportedAt,
-          entries: parsed.data.entries,
-        });
-        mergeImportedLibrary(parsed.data.library);
-        const nLib =
-          parsed.data.library.books.length +
-          parsed.data.library.podcasts.length +
-          parsed.data.library.articles.length +
-          parsed.data.library.research.length;
-        setToastMessage(
-          `Imported ${nEntries} journal entr${nEntries === 1 ? "y" : "ies"} and ${nLib} library item${nLib === 1 ? "" : "s"} from JSON.`
+        await applyKnowledgeBaseImport(
+          {
+            version: parsed.data.version,
+            exportedAt: parsed.data.exportedAt,
+            entries: parsed.data.entries,
+          },
+          parsed.data.library
         );
-        setTimeout(() => setToastMessage(null), 5000);
       } catch {
         setToastMessage("Could not read that file.");
         setTimeout(() => setToastMessage(null), 4000);
       }
     },
-    [importEntriesFromExport, mergeImportedLibrary]
+    [fetchLibrary, importEntriesReplaceAll, pushLibraryBulkToServer, replaceImportedLibrary, resetServerKnowledgeBaseMemory, syncUnsyncedEntries]
   );
 
   const handleImportJournalDumpFolder = useCallback(
@@ -452,29 +469,6 @@ export const Personaplex = () => {
     [saveEntry]
   );
 
-  useEffect(() => {
-    fetch("/api/voices")
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Not found"))))
-      .then((data: { voices?: VoiceOption[] }) => {
-        const list = data.voices ?? [];
-        if (list.length > 0) {
-          const hasRachel = list.some((v) => v.voice_id === DEFAULT_VOICE_ID);
-          const listWithDefault = hasRachel
-            ? list
-            : [{ voice_id: DEFAULT_VOICE_ID, name: "Rachel" }, ...list];
-          const sorted = [...listWithDefault].sort((a, b) => {
-            if (a.voice_id === DEFAULT_VOICE_ID) return -1;
-            if (b.voice_id === DEFAULT_VOICE_ID) return 1;
-            return 0;
-          });
-          setVoices(sorted);
-        }
-      })
-      .catch(() => {
-        /* Keep FALLBACK_VOICES from initial state */
-      });
-  }, []);
-
   const hasRunInitialSyncRef = useRef(false);
   useEffect(() => {
     if (entries.length === 0 || hasRunInitialSyncRef.current) return;
@@ -482,7 +476,8 @@ export const Personaplex = () => {
     syncUnsyncedEntries();
   }, [entries.length, syncUnsyncedEntries]);
 
-  const fetchRecommendations = useCallback((showLoadingUnlessCached = false, retryCount = 0) => {
+  /** Network fetch only — user clicks "Refresh recommendations". Cached lists stay until then. */
+  const refreshRecommendationsFromApi = useCallback((retryCount = 0) => {
     if (recommendationsInFlightRef.current) return;
     const doFetch = (isRetry: boolean) => {
       const ac = new AbortController();
@@ -490,12 +485,13 @@ export const Personaplex = () => {
       recommendationsInFlightRef.current = true;
       backendFetch("/recommendations", { signal: ac.signal })
         .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
-        .then((data: { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] }) => {
-          const next = {
+        .then((data: Partial<RecommendationsBundle>) => {
+          const next: RecommendationsBundle = {
             books: data.books ?? [],
             podcasts: data.podcasts ?? [],
             articles: data.articles ?? [],
             research: data.research ?? [],
+            news: data.news ?? [],
           };
           setRecommendations(next);
           try {
@@ -506,10 +502,10 @@ export const Personaplex = () => {
         })
         .catch(() => {
           if (!isRetry && retryCount < 1) {
-            setTimeout(() => fetchRecommendations(showLoadingUnlessCached, 1), 2500);
+            setTimeout(() => refreshRecommendationsFromApi(1), 2500);
             return;
           }
-          setRecommendations({ books: [], podcasts: [], articles: [], research: [] });
+          setRecommendations(readRecommendationsCache());
         })
         .finally(() => {
           clearTimeout(timeoutId);
@@ -517,66 +513,34 @@ export const Personaplex = () => {
           setRecommendationsLoading(false);
         });
     };
-
-    try {
-      const cached = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
-      if (cached && showLoadingUnlessCached) {
-        const parsed = JSON.parse(cached) as { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] };
-        if (parsed && (parsed.books?.length || parsed.podcasts?.length || parsed.articles?.length || parsed.research?.length)) {
-          setRecommendations({
-            books: parsed.books ?? [],
-            podcasts: parsed.podcasts ?? [],
-            articles: parsed.articles ?? [],
-            research: parsed.research ?? [],
-          });
-          setRecommendationsLoading(true);
-          doFetch(retryCount >= 1);
-          return;
-        }
-      }
-    } catch {
-      /* ignore cache parse errors */
-    }
     setRecommendationsLoading(true);
     doFetch(retryCount >= 1);
   }, []);
 
   useEffect(() => {
     if (view !== "recommendations") return;
-    syncUnsyncedEntries()
-      .then((n) => {
-        if (n > 0) {
-          try {
-            localStorage.removeItem(RECOMMENDATIONS_CACHE_KEY);
-          } catch {
-            /* ignore */
-          }
-        }
-      })
-      .then(() => {
-        try {
-          const cached = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
-          if (cached) {
-            const parsed = JSON.parse(cached) as { books?: RecItem[]; podcasts?: RecItem[]; articles?: RecItem[]; research?: RecItem[] };
-            if (parsed && Array.isArray(parsed.books) && Array.isArray(parsed.podcasts) && Array.isArray(parsed.articles)) {
-              setRecommendations({
-                books: parsed.books ?? [],
-                podcasts: parsed.podcasts ?? [],
-                articles: parsed.articles ?? [],
-                research: Array.isArray(parsed.research) ? parsed.research : [],
-              });
-            }
-          }
-        } catch {
-          /* ignore */
-        }
-        fetchRecommendations(true);
-      })
-      .catch(() => fetchRecommendations(true));
-  }, [view, syncUnsyncedEntries, fetchRecommendations]);
+    void syncUnsyncedEntries();
+    setRecommendations((prev) => {
+      const hasAny =
+        prev.books.length > 0 ||
+        prev.podcasts.length > 0 ||
+        prev.articles.length > 0 ||
+        prev.research.length > 0 ||
+        prev.news.length > 0;
+      if (hasAny) return prev;
+      return readRecommendationsCache();
+    });
+  }, [view, syncUnsyncedEntries]);
 
   useEffect(() => {
-    if (view === "recommendations" && (recommendations.books.length > 0 || recommendations.podcasts.length > 0 || recommendations.articles.length > 0 || recommendations.research.length > 0)) {
+    if (
+      view === "recommendations" &&
+      (recommendations.books.length > 0 ||
+        recommendations.podcasts.length > 0 ||
+        recommendations.articles.length > 0 ||
+        recommendations.research.length > 0 ||
+        recommendations.news.length > 0)
+    ) {
       try {
         localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(recommendations));
       } catch {
@@ -635,196 +599,9 @@ export const Personaplex = () => {
     [consumedIds]
   );
 
-  const {
-    status,
-    errorMessage,
-    isProcessing,
-    connect,
-    disconnect,
-    commitManual,
-    submitTextTurn,
-    cancelUserCapture,
-    resumeVoiceCapture,
-    isConnected,
-    isUserSpeaking,
-    isAiSpeaking,
-    isVoiceMemoMode,
-    isVoiceMemoRecording,
-    startVoiceMemoRecording,
-    stopVoiceMemoRecording,
-    lastPlaybackFailed,
-    playLastFailedPlayback,
-  } = usePersonaplexSession({
-    systemPrompt: textPrompt,
-    selectedVoiceId,
-    manualMode: true,
-    personalization,
-    intrusiveness,
-    sessionMode,
-    voiceSettings,
-    onTranscriptUpdate: useCallback((updater) => {
-      setTranscript((prev) => {
-        const next = typeof updater === "function" ? updater(prev) : updater;
-        return next;
-      });
-    }, []),
-    onInterimTranscript: setInterimTranscript,
-    onNotesSaved: useCallback(
-      (notes: { item_id: string; note: string }[]) => {
-        fetchLibrary();
-        if (notes.length) {
-          setToastMessage(notes.length === 1 ? "Note saved." : `Saved ${notes.length} notes.`);
-          setTimeout(() => setToastMessage(null), 3000);
-        }
-      },
-      [fetchLibrary]
-    ),
-    showLiveTranscription,
-    allowVoiceCapture: inputMode === "voice",
-  });
-
-  const transcriptScrollRef = useRef<HTMLDivElement>(null);
-  const autoScrollEnabledRef = useRef(true);
-
-  const orbState: OrbState = useMemo(() => {
-    if (isUserSpeaking) return "userSpeaking";
-    if (isAiSpeaking) return "aiSpeaking";
-    if (isProcessing) return "aiThinking";
-    return "idle";
-  }, [isUserSpeaking, isAiSpeaking, isProcessing]);
-
-  const [thinkingProgress, setThinkingProgress] = useState(0);
-  const thinkingStartRef = useRef<number | null>(null);
-  const thinkingRafRef = useRef<number | null>(null);
-  const activeSessionEntryIdRef = useRef<string | null>(null);
-  const lastAutoSavedSignatureRef = useRef("");
-
-  useEffect(() => {
-    if (!isProcessing) {
-      setThinkingProgress(0);
-      thinkingStartRef.current = null;
-      if (thinkingRafRef.current != null) {
-        cancelAnimationFrame(thinkingRafRef.current);
-        thinkingRafRef.current = null;
-      }
-      return;
-    }
-    thinkingStartRef.current = Date.now();
-    const durationMs = 12000;
-
-    const tick = () => {
-      const start = thinkingStartRef.current;
-      if (start == null) return;
-      const elapsed = Date.now() - start;
-      const progress = Math.min(1, elapsed / durationMs);
-      setThinkingProgress(progress);
-      if (progress < 1) thinkingRafRef.current = requestAnimationFrame(tick);
-    };
-    thinkingRafRef.current = requestAnimationFrame(tick);
-    return () => {
-      if (thinkingRafRef.current != null) cancelAnimationFrame(thinkingRafRef.current);
-    };
-  }, [isProcessing]);
-
-  const handleConnect = useCallback(() => {
-    activeSessionEntryIdRef.current = null;
-    lastAutoSavedSignatureRef.current = "";
-    connect();
-  }, [connect]);
-
-  // Autosave after every completed AI turn so abrupt disconnects still preserve history.
-  useEffect(() => {
-    if (transcript.length === 0) return;
-    const last = transcript[transcript.length - 1];
-    if (!last || last.role !== "ai") return;
-    const signature = `${transcript.length}|${last.text}`;
-    if (signature === lastAutoSavedSignatureRef.current) return;
-    lastAutoSavedSignatureRef.current = signature;
-    const id = saveOrUpdateEntry(activeSessionEntryIdRef.current, transcript);
-    if (id) activeSessionEntryIdRef.current = id;
-  }, [transcript, saveOrUpdateEntry]);
-
-  const handleDisconnect = useCallback(() => {
-    if (transcript.length > 0) {
-      const id = saveOrUpdateEntry(activeSessionEntryIdRef.current, transcript);
-      if (id) activeSessionEntryIdRef.current = id;
-      const transcriptText = transcript
-        .map((e) => (e.role === "user" ? "User: " + e.text : "Assistant: " + e.text))
-        .join("\n\n");
-      backendFetch("/ingest-history", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: transcriptText }),
-      })
-        .then(async (r) => {
-          const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };
-          if (data?.ok !== false && id) markEntrySynced(id);
-        })
-        .catch(() => {});
-      setToastMessage("Journal entry saved and synced to memory.");
-      setTimeout(() => setToastMessage(null), 3000);
-    }
-    activeSessionEntryIdRef.current = null;
-    lastAutoSavedSignatureRef.current = "";
-    setTranscript([]);
-    setInterimTranscript("");
-    disconnect();
-  }, [disconnect, transcript, saveOrUpdateEntry, markEntrySynced]);
-
-  const handleSendTypedInput = useCallback(() => {
-    const sent = submitTextTurn(typedInput);
-    if (sent) setTypedInput("");
-  }, [submitTextTurn, typedInput]);
-
-  const handleInputModeChange = useCallback((mode: "voice" | "text") => {
-    setInputMode(mode);
-  }, []);
-  const isModeToggleLocked = isAiSpeaking || isProcessing;
-
-  const previousInputModeRef = useRef<"voice" | "text">(inputMode);
-  useEffect(() => {
-    if (!isConnected) {
-      previousInputModeRef.current = inputMode;
-      return;
-    }
-    if (previousInputModeRef.current === inputMode) return;
-    if (inputMode === "text") cancelUserCapture();
-    else resumeVoiceCapture();
-    previousInputModeRef.current = inputMode;
-  }, [inputMode, isConnected, cancelUserCapture, resumeVoiceCapture]);
-
-  useEffect(() => {
-    if (!isConnected) return;
-    if (inputMode !== "voice") return;
-    if (isAiSpeaking || isProcessing) return;
-    // If user switched to voice while AI was still talking, start listening as soon as it's safe.
-    resumeVoiceCapture();
-  }, [inputMode, isConnected, isAiSpeaking, isProcessing, resumeVoiceCapture]);
-
-  useEffect(() => {
-    if (!isConnected) {
-      setTranscript([]);
-      setExpandedLogIndex(null);
-      setInterimTranscript("");
-    }
-  }, [isConnected]);
-
-  const handleTranscriptScroll = useCallback(() => {
-    const el = transcriptScrollRef.current;
-    if (!el) return;
-    const isNearBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < 50;
-    autoScrollEnabledRef.current = isNearBottom;
-  }, []);
-
-  useEffect(() => {
-    const scrollEl = transcriptScrollRef.current;
-    if (!scrollEl || !autoScrollEnabledRef.current) return;
-    scrollEl.scrollTop = scrollEl.scrollHeight - scrollEl.clientHeight;
-  }, [transcript, interimTranscript]);
-
   return (
-    <div className="relative flex h-screen w-full flex-col overflow-hidden bg-[#0a0a12] font-sans text-white antialiased">
+    <PersonaplexChatProvider onToast={chatToast} onAgentAction={handleChatAgentAction}>
+    <div className="relative flex h-screen w-full flex-row overflow-hidden bg-[#0a0a12] font-sans text-white antialiased">
       {/* Ethereal mesh + animated ambient orbs (pointer-events none on layer) */}
       <div className="pointer-events-none fixed inset-0 z-0" aria-hidden>
         <div className="absolute inset-0 bg-gradient-to-br from-[#0c1228] via-[#0d1f2d] to-[#1a0f2e]" />
@@ -865,41 +642,33 @@ export const Personaplex = () => {
         />
       </div>
 
-      {/* Header — glass pills */}
-      <header className="relative z-20 flex-none px-4 py-3 sm:px-6 sm:py-4">
-        {/* Mobile */}
-        <div className="flex flex-col gap-3 md:hidden">
-          <div className="flex items-center justify-between gap-3 min-w-0">
-            <div className="glass-panel flex min-w-0 max-w-[55%] items-center gap-2 rounded-full px-3 py-2 text-white">
-              <h1 className="truncate text-xs font-medium uppercase tracking-[0.2em] text-white sm:text-sm">Selfmeridian</h1>
-            </div>
-            <div className="flex items-center justify-end gap-2 shrink-0">
-              <ThemeToggle mode={mode} onToggle={toggle} className="border-white/15 bg-white/10 text-white backdrop-blur-md hover:bg-white/15" />
-              <div className="glass-panel inline-flex max-w-[min(100%,12rem)] flex-wrap justify-end gap-0.5 rounded-full p-1">
-              <PersonaplexNavButtons view={view} setView={setView} />
-            </div>
-          </div>
-          </div>
-          <div className="glass-panel-subtle flex flex-wrap items-center gap-x-3 gap-y-2 rounded-full px-3 py-2">
-            <ConnectionStatus status={status} className="shrink-0 text-sm text-white/70" />
-            {errorMessage && (
-              <span className="w-full basis-full text-sm text-red-300">{errorMessage}</span>
-            )}
-          </div>
-        </div>
+      <PersonaplexLeftRail
+        expanded={railExpanded}
+        setExpanded={setRailExpanded}
+        mobileOpen={mobileRailOpen}
+        setMobileOpen={setMobileRailOpen}
+        view={view}
+        setView={setView}
+      />
 
-        {/* Desktop */}
-        <div className="hidden md:flex md:items-center md:justify-between md:gap-4 md:w-full">
-          <div className="glass-panel flex min-w-0 max-w-[55%] items-center gap-3 rounded-full px-4 py-2.5 sm:max-w-none">
-            <h1 className="shrink-0 text-sm font-medium uppercase tracking-[0.25em] text-white sm:text-base">Selfmeridian</h1>
-            <ConnectionStatus status={status} className="text-sm text-white/70" />
-            {errorMessage && <span className="truncate text-sm text-red-300">{errorMessage}</span>}
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <ThemeToggle mode={mode} onToggle={toggle} className="border-white/15 bg-white/10 text-white backdrop-blur-md hover:bg-white/15" />
-            <div className="glass-panel inline-flex rounded-full p-1">
-            <PersonaplexNavButtons view={view} setView={setView} />
-            </div>
+      <div className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      {/* Header — centered brand; nav lives in left rail (Open WebUI–style shell) */}
+      <header className="relative z-20 flex-none px-4 py-3 sm:px-6 sm:py-4">
+        <div className="flex items-center justify-center gap-3">
+          <button
+            type="button"
+            className="rounded-full border border-white/15 bg-white/10 p-2.5 text-white shadow-sm backdrop-blur-md md:hidden"
+            onClick={() => setMobileRailOpen(true)}
+            aria-label="Open menu"
+          >
+            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+          <div className="glass-panel flex min-w-0 max-w-full flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-full px-4 py-2.5 text-center">
+            <h1 className="shrink-0 text-xs font-medium uppercase tracking-[0.2em] text-white sm:text-sm md:text-base">
+              Selfmeridian
+            </h1>
           </div>
         </div>
       </header>
@@ -914,7 +683,7 @@ export const Personaplex = () => {
       )}
 
       {/* Main content */}
-      <main className="relative z-10 flex min-h-0 flex-1 flex-col">
+      <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
         <div
           className={`flex-1 flex flex-col min-h-0 transition-opacity duration-300 ${
             view === "brain" || view === "voice_memo" || view === "journal" ? "overflow-hidden" : "overflow-y-auto"
@@ -922,61 +691,69 @@ export const Personaplex = () => {
         >
           {(view === "voice_memo" || view === "journal") && (
             <VoiceMemoTab
-              onOpenSessionPanel={() => setSessionPanelOpen(true)}
-              onToast={(msg) => {
-                setToastMessage(msg);
-                setTimeout(() => setToastMessage(null), 4000);
-              }}
+              onToast={chatToast}
               saveEntry={saveEntry}
               syncUnsyncedEntries={syncUnsyncedEntries}
               elevateComposerLayout={view === "journal"}
+              onOpenFullChat={view === "voice_memo" ? () => setView("journal") : undefined}
             />
           )}
           {view === "brain" && (
-            <div className="flex min-h-0 flex-1 flex-row overflow-hidden">
-              <aside
-                className="flex w-[11.5rem] shrink-0 flex-col border-r border-white/10 bg-black/25 px-2 py-2 sm:w-52 sm:py-3"
-                aria-label="Brain sections"
-              >
-                <p className="px-2 pb-2 text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/45">
-                  The Brain
-                </p>
-                <nav className="flex flex-col gap-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setBrainSection("knowledgeBase")}
-                    className={`rounded-2xl px-3 py-2.5 text-left text-sm font-medium transition-colors ${
-                      brainSection === "knowledgeBase"
-                        ? "bg-white/15 text-white shadow-sm"
-                        : "text-white/65 hover:bg-white/10 hover:text-white"
-                    }`}
-                    title="Journal entries, conversation transcripts, and your media library"
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <div className="flex-none border-b border-white/10 px-4 py-3 md:px-5">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between lg:gap-4">
+                  <div className="min-w-0 flex-1">
+                    <h2 className="text-sm font-medium text-white/90 md:text-base">
+                      {brainSection === "knowledgeBase" ? "Knowledge base" : "Calendar"}
+                    </h2>
+                    <p className="mt-1 text-xs text-white/50 md:text-sm">
+                      {brainSection === "knowledgeBase"
+                        ? "Journal entries, conversation transcripts, and your books & media library."
+                        : "Click a date for an AI summary of that day (journal entries + memory)."}
+                    </p>
+                  </div>
+                  <div
+                    className="flex shrink-0 gap-1 rounded-xl border border-white/10 bg-white/[0.06] p-1"
+                    role="tablist"
+                    aria-label="Brain section"
                   >
-                    Knowledge base
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBrainSection("calendar")}
-                    className={`rounded-2xl px-3 py-2.5 text-left text-sm font-medium transition-colors ${
-                      brainSection === "calendar"
-                        ? "bg-white/15 text-white shadow-sm"
-                        : "text-white/65 hover:bg-white/10 hover:text-white"
-                    }`}
-                    title="Month view and day summaries"
-                  >
-                    Calendar
-                  </button>
-                </nav>
-              </aside>
-              <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={brainSection === "knowledgeBase"}
+                      onClick={() => setBrainSection("knowledgeBase")}
+                      className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors md:text-sm ${
+                        brainSection === "knowledgeBase"
+                          ? "bg-white/[0.14] text-white shadow-sm ring-1 ring-white/10"
+                          : "text-white/60 hover:bg-white/10 hover:text-white"
+                      }`}
+                    >
+                      <svg className="h-4 w-4 shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                      </svg>
+                      <span className="whitespace-nowrap">Knowledge base</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={brainSection === "calendar"}
+                      onClick={() => setBrainSection("calendar")}
+                      className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors md:text-sm ${
+                        brainSection === "calendar"
+                          ? "bg-white/[0.14] text-white shadow-sm ring-1 ring-white/10"
+                          : "text-white/60 hover:bg-white/10 hover:text-white"
+                      }`}
+                    >
+                      <svg className="h-4 w-4 shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                      </svg>
+                      <span className="whitespace-nowrap">Calendar</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
               {brainSection === "knowledgeBase" ? (
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-                <div className="flex-none border-b border-white/10 px-4 py-2.5">
-                  <h2 className="text-sm font-medium text-white/90">Knowledge base</h2>
-                  <p className="mt-0.5 text-xs text-white/50">
-                    Journal entries, conversation transcripts, and your books &amp; media library.
-                  </p>
-                </div>
                 <BrainLayout
                   entries={entries}
                   onDeleteEntry={deleteEntry}
@@ -1047,7 +824,9 @@ export const Personaplex = () => {
                   }}
                   onDownloadKnowledgeBase={handleDownloadKnowledgeBase}
                   onImportKnowledgeBaseFile={handleImportKnowledgeBaseFile}
+                  onPrepareKnowledgeBaseUpload={prepareKnowledgeBaseUpload}
                   onImportJournalDumpFolder={handleImportJournalDumpFolder}
+                  onPrepareJournalDumpUpload={prepareJournalDumpUpload}
                 />
               </div>
               ) : (
@@ -1063,24 +842,24 @@ export const Personaplex = () => {
                   setCalendarDaySummaryLoading={setCalendarDaySummaryLoading}
                 />
               )}
-              </div>
             </div>
           )}
           {view === "recommendations" && (
-            <div className="flex-1 flex flex-col min-h-0 px-4 pt-4 pb-0 md:px-6 md:pt-6 md:pb-1 overflow-hidden">
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-24 pt-4 md:px-6 md:pt-6 md:pb-28">
               <div className="flex-shrink-0 flex flex-wrap items-center justify-between gap-3 mb-4">
                 <div>
                   <h2 className="text-lg font-medium text-gray-800 dark:text-gray-200 uppercase tracking-wider">
                     Recommendations
                   </h2>
                   <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">
-                Based on your journal memory and what you’ve already read or listened to. Mark items as read/listened so future suggestions get better.
+                    Based on your journal memory and what you’ve already read or listened to. Suggestions are kept on this
+                    device until you refresh. Mark items as read/listened so future runs get better.
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => fetchRecommendations(false)}
+                    onClick={() => refreshRecommendationsFromApi()}
                     disabled={recommendationsLoading}
                     className="px-3 py-2 rounded-lg bg-gray-100 text-gray-600 text-sm font-medium hover:bg-gray-200 dark:bg-[#404040] dark:text-gray-400 dark:hover:bg-[#505050] disabled:opacity-50 transition-colors"
                   >
@@ -1089,9 +868,61 @@ export const Personaplex = () => {
                 </div>
               </div>
               <div className="flex-1 min-h-0 overflow-auto">
-              {recommendationsLoading && !recommendations.books.length && !recommendations.podcasts.length && !recommendations.articles.length && !recommendations.research.length ? (
-                <p className="text-gray-500 dark:text-gray-400 text-sm">Loading recommendations… This can take up to a minute.</p>
+              {recommendationsLoading &&
+              !recommendations.books.length &&
+              !recommendations.podcasts.length &&
+              !recommendations.articles.length &&
+              !recommendations.research.length &&
+              !recommendations.news.length ? (
+                <p className="text-gray-500 dark:text-gray-400 text-sm">
+                  Loading recommendations… This can take up to ~90 seconds.
+                </p>
+              ) : !recommendationsLoading &&
+                !recommendations.books.length &&
+                !recommendations.podcasts.length &&
+                !recommendations.articles.length &&
+                !recommendations.research.length &&
+                !recommendations.news.length ? (
+                <p className="text-gray-500 dark:text-gray-400 text-sm">
+                  No cached suggestions yet. Click <strong className="font-medium text-gray-700 dark:text-gray-300">Refresh recommendations</strong> to
+                  generate a new set (heavy; runs only when you ask).
+                </p>
               ) : (
+                <div className="space-y-6 pb-0">
+                  {recommendations.news.length > 0 && (
+                    <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4">
+                      <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+                        <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">
+                          News — mostly uplifting
+                        </h3>
+                        <span className="text-[10px] text-gray-400 dark:text-gray-500">Open web via Perplexity Search</span>
+                      </div>
+                      <ul className="space-y-2.5">
+                        {recommendations.news.map((item, i) => (
+                          <li key={`news-${i}-${item.title}`} className="text-sm">
+                            <a
+                              href={
+                                item.url && item.url.startsWith("http")
+                                  ? item.url
+                                  : `https://www.google.com/search?q=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`
+                              }
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="font-medium text-gray-900 dark:text-gray-100 hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline"
+                            >
+                              {item.title}
+                            </a>
+                            {item.author ? (
+                              <span className="text-gray-500 dark:text-gray-400 text-xs ml-1.5">· {item.author}</span>
+                            ) : null}
+                            {item.reason ? (
+                              <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5 leading-snug">{item.reason}</p>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  )}
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 pb-0">
                   {/* Books */}
                   <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
@@ -1111,7 +942,11 @@ export const Personaplex = () => {
                               }`}
                             >
                               <a
-                                href={`https://www.amazon.com/s?k=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`}
+                                href={
+                                  item.url && item.url.startsWith("http")
+                                    ? item.url
+                                    : `https://www.amazon.com/s?k=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`
+                                }
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="text-gray-900 dark:text-gray-100 text-sm font-medium hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline cursor-pointer"
@@ -1215,7 +1050,7 @@ export const Personaplex = () => {
                   </section>
                   {/* Articles */}
                   <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
-                    <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3">News & articles</h3>
+                    <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3">Articles</h3>
                     <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
                       {recommendations.articles.length === 0 ? (
                         <p className="text-gray-500 dark:text-gray-400 text-xs">No article suggestions right now.</p>
@@ -1295,6 +1130,7 @@ export const Personaplex = () => {
                       )}
                     </div>
                   </section>
+                </div>
                 </div>
               )}
               </div>
@@ -1391,49 +1227,34 @@ export const Personaplex = () => {
         </div>
       </main>
 
-      <SessionSidePanel
-        open={sessionPanelOpen}
-        onOpen={() => setSessionPanelOpen(true)}
-        onClose={() => setSessionPanelOpen(false)}
-        settingsExpanded={sessionSettingsExpanded}
-        onToggleSettings={() => setSessionSettingsExpanded((v) => !v)}
-        status={status}
-        onConnect={handleConnect}
-        onDisconnect={handleDisconnect}
-        errorMessage={errorMessage}
-        sessionMode={sessionMode}
-        setSessionMode={setSessionMode}
-        voices={voices}
-        selectedVoiceId={selectedVoiceId}
-        setSelectedVoiceId={setSelectedVoiceId}
-        showLiveTranscription={showLiveTranscription}
-        setShowLiveTranscription={setShowLiveTranscription}
-        isVoiceMemoMode={isVoiceMemoMode}
-        inputMode={inputMode}
-        handleInputModeChange={handleInputModeChange}
-        isModeToggleLocked={isModeToggleLocked}
-        isConnected={isConnected}
-        orbState={orbState}
-        thinkingProgress={thinkingProgress}
-        isAiSpeaking={isAiSpeaking}
-        isUserSpeaking={isUserSpeaking}
-        isProcessing={isProcessing}
-        isVoiceMemoRecording={isVoiceMemoRecording}
-        startVoiceMemoRecording={startVoiceMemoRecording}
-        stopVoiceMemoRecording={stopVoiceMemoRecording}
-        lastPlaybackFailed={lastPlaybackFailed}
-        playLastFailedPlayback={playLastFailedPlayback}
-        commitManual={commitManual}
-        typedInput={typedInput}
-        setTypedInput={setTypedInput}
-        handleSendTypedInput={handleSendTypedInput}
-        transcript={transcript}
-        interimTranscript={interimTranscript}
-        expandedLogIndex={expandedLogIndex}
-        setExpandedLogIndex={setExpandedLogIndex}
-        transcriptScrollRef={transcriptScrollRef}
-        handleTranscriptScroll={handleTranscriptScroll}
-      />
+      {/* Footer — on md+ the composer lives in the left rail; mobile keeps a fixed dock */}
+      <footer className="pointer-events-none relative z-10 flex-shrink-0 px-4 pb-[calc(4.5rem+env(safe-area-inset-bottom))] pt-1 text-center md:pb-5">
+        <p className="pointer-events-auto text-xs text-white/60">
+          Chat from the bottom of the sidebar. On Home, record or attach audio to add journal entries. On phones, the composer stays at the bottom.
+        </p>
+        <p className="pointer-events-auto mx-auto mt-1 max-w-xl text-[10px] leading-relaxed text-white/40">
+          This is a prototype. Please avoid sharing highly sensitive personal information until our data pipeline is more secure. For private or stress testing, run the app locally and use local LLMs.
+        </p>
+        <div className="pointer-events-auto pt-1">
+          <p className="flex flex-wrap items-center justify-center gap-2 text-[10px] text-white/40">
+            <a
+              href="https://github.com/MrFunnything99/Open-Journal"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-white/50 transition-colors hover:text-white/80"
+              aria-label="View on GitHub"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="currentColor" className="inline-block">
+                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
+              </svg>
+              GitHub
+            </a>
+          </p>
+        </div>
+      </footer>
+
+      <MobileAskComposerDock hidden={mobileRailOpen} />
+      </div>
 
       {libraryEditingId ? (() => {
         const editingEntry = [...libraryItems.books, ...libraryItems.podcasts, ...libraryItems.articles, ...libraryItems.research].find((e) => e.id === libraryEditingId);
@@ -1562,37 +1383,7 @@ export const Personaplex = () => {
         );
       })() : null}
 
-      {/* Footer — muted, ethereal */}
-      <footer className="pointer-events-none relative z-10 mt-auto flex-shrink-0 px-4 pb-3 pt-1 text-center">
-        <p className="pointer-events-auto text-xs text-white/60">
-          {!isConnected
-            ? "Connect to begin your journaling session."
-            : isProcessing
-              ? "Thinking..."
-              : inputMode === "text"
-                ? "Type your message to the AI."
-              : "Speak naturally. The AI is listening."}
-        </p>
-        <p className="pointer-events-auto mx-auto mt-1 max-w-xl text-[10px] leading-relaxed text-white/40">
-          This is a prototype. Please avoid sharing highly sensitive personal information until our data pipeline is more secure. For private or stress testing, run the app locally and use local LLMs.
-        </p>
-        <div className="pointer-events-auto pt-1">
-          <p className="flex flex-wrap items-center justify-center gap-2 text-[10px] text-white/40">
-            <a
-              href="https://github.com/MrFunnything99/Open-Journal"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-white/50 transition-colors hover:text-white/80"
-              aria-label="View on GitHub"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="currentColor" className="inline-block">
-                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
-              </svg>
-              GitHub
-            </a>
-          </p>
-        </div>
-      </footer>
     </div>
+    </PersonaplexChatProvider>
   );
 };

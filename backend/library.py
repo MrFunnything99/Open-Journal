@@ -2,15 +2,21 @@
 Library for Selfmeridian: gist_facts (semantic) and episodic_log (episodic) memory,
 and consumed_content (library). Uses SQLite + sqlite-vec for vector storage.
 
-Embeddings: Perplexity only (`_embed_texts` → PERPLEXITY_API_KEY).
-Extraction / Gemini helpers: `_get_gemini_client` + `generate_content` (GEMINI_API_KEY) — never used for embeddings.
+Embeddings: Perplexity (`_embed_texts` → PERPLEXITY_API_KEY); without a key, placeholder vectors match EMBEDDING_DIM so library rows still persist (semantic search degraded).
+Extraction / chat helpers: OpenRouter (OPENROUTER_API_KEY + OPENROUTER_GEMINI_MODEL, default Gemini 3 Pro preview)
+when GEMINI_VIA_OPENROUTER is enabled, else `_get_gemini_client` + `generate_content` (GEMINI_API_KEY) — never used for embeddings.
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import math
 import os
+import struct
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,12 +29,136 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Gemini client for extraction / helpers only — embeddings use Perplexity (`_embed_texts`).
 _gemini_client: genai.Client | None = None
+_PERPLEXITY_EMBED_FALLBACK_WARNED = False
 
 PPLX_EMBEDDINGS_URL = "https://api.perplexity.ai/v1/embeddings"
 PPLX_CONTEXTUAL_EMBEDDINGS_URL = "https://api.perplexity.ai/v1/contextualizedembeddings"
 # Context model: use contextualized endpoint (one chunk per pseudo-document for unrelated texts).
 PPLX_EMBED_BATCH_DOCS = 480
 DEFAULT_PERPLEXITY_EMBEDDING_MODEL = "pplx-embed-context-v1-4b"
+PPLX_SEARCH_URL = "https://api.perplexity.ai/search"
+OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_OPENROUTER_GEMINI_MODEL = "google/gemini-3-pro-preview"
+
+
+def _openrouter_gemini_disabled_explicitly() -> bool:
+    v = (os.getenv("GEMINI_VIA_OPENROUTER") or "").strip().lower()
+    return v in ("0", "false", "no", "off")
+
+
+def openrouter_gemini_enabled() -> bool:
+    """When True, `_call_gemini` uses OpenRouter instead of the Google Gemini SDK."""
+    if _openrouter_gemini_disabled_explicitly():
+        return False
+    return bool((os.getenv("OPENROUTER_API_KEY") or "").strip())
+
+
+def openrouter_gemini_model() -> str:
+    return (os.getenv("OPENROUTER_GEMINI_MODEL") or DEFAULT_OPENROUTER_GEMINI_MODEL).strip()
+
+
+def gemini_extraction_backend() -> str:
+    """Startup label: how library extraction/helpers resolve the chat model."""
+    if openrouter_gemini_enabled():
+        return f"openrouter ({openrouter_gemini_model()})"
+    if (os.getenv("GEMINI_API_KEY") or "").strip():
+        return f"google ({(os.getenv('GEMINI_CHAT_MODEL') or 'gemini-3-flash-preview').strip()})"
+    return "none (set OPENROUTER_API_KEY or GEMINI_API_KEY)"
+
+
+def _openrouter_normalize_message_content(msg: dict | None) -> str:
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+                elif block.get("type") == "text":
+                    tx = block.get("text")
+                    if isinstance(tx, str) and tx.strip():
+                        parts.append(tx.strip())
+            elif isinstance(block, str) and block.strip():
+                parts.append(block.strip())
+        return "\n".join(parts).strip() if parts else ""
+    return str(content).strip()
+
+
+def _openrouter_chat_completion(
+    prompt: str,
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout_sec: float | None = None,
+) -> str:
+    key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not key:
+        return ""
+    eff_timeout = float(timeout_sec) if timeout_sec is not None else float(
+        os.getenv("OPENROUTER_GEMINI_TIMEOUT_SEC", "75")
+    )
+    m = (model or openrouter_gemini_model()).strip() or DEFAULT_OPENROUTER_GEMINI_MODEL
+    temp_raw = os.getenv("OPENROUTER_GEMINI_TEMPERATURE")
+    if temperature is not None:
+        temp = float(temperature)
+    elif temp_raw is not None and str(temp_raw).strip() != "":
+        temp = float(temp_raw)
+    else:
+        temp = 0.7
+    payload: dict = {
+        "model": m,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temp,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        OPENROUTER_CHAT_COMPLETIONS_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://selfmeridian.local"),
+            "X-Title": os.getenv("OPENROUTER_TITLE", "SelfMeridian"),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
+            raw_text = resp.read().decode("utf-8")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            raw_text = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw_text = ""
+        try:
+            err_j = json.loads(raw_text) if raw_text else {}
+            detail = err_j.get("error", {}).get("message") if isinstance(err_j.get("error"), dict) else err_j.get("error")
+        except Exception:
+            detail = raw_text[:500] if raw_text else None
+        print("[backend] OpenRouter chat error:", status, detail or "")
+        return ""
+    if status < 200 or status >= 300:
+        print("[backend] OpenRouter chat error: HTTP", status)
+        return ""
+    try:
+        data = json.loads(raw_text) if raw_text else {}
+    except json.JSONDecodeError:
+        print("[backend] OpenRouter chat: invalid JSON response")
+        return ""
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return ""
+    msg0 = choices[0].get("message") if isinstance(choices[0], dict) else None
+    return _openrouter_normalize_message_content(msg0 if isinstance(msg0, dict) else None)
 
 
 def _ensure_storage() -> None:
@@ -82,6 +212,27 @@ def _perplexity_post_json(url: str, payload: dict, api_key: str, timeout_sec: fl
         raise
 
 
+def _placeholder_embeddings(texts: list[str], dim: int) -> list[list[float]]:
+    """L2-normalized pseudo-vectors (same dim as vec tables) when Perplexity is unavailable."""
+    out: list[list[float]] = []
+    u32_max = float(2**32 - 1)
+    for i, t in enumerate(texts):
+        seed = hashlib.blake2b(f"{i}\0{t}".encode(), digest_size=64).digest()
+        buf = bytearray(seed)
+        while len(buf) < dim * 4:
+            seed = hashlib.blake2b(seed, digest_size=64).digest()
+            buf.extend(seed)
+        words = struct.unpack(f"{dim}I", bytes(buf[: dim * 4]))
+        floats = [(w / u32_max) * 2.0 - 1.0 for w in words]
+        n = math.sqrt(sum(x * x for x in floats))
+        if n < 1e-12:
+            floats = [1.0 / math.sqrt(dim)] * dim
+        else:
+            floats = [x / n for x in floats]
+        out.append(floats)
+    return out
+
+
 def _embed_texts(texts: list[str]) -> list[list[float]]:
     """
     Embed texts via Perplexity (default: pplx-embed-context-v1-4b on contextualized API).
@@ -92,9 +243,15 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
         return []
     api_key = (os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY") or "").strip()
     if not api_key:
-        raise ValueError(
-            "PERPLEXITY_API_KEY is required for embeddings. See https://docs.perplexity.ai/docs/getting-started/quickstart"
-        )
+        global _PERPLEXITY_EMBED_FALLBACK_WARNED
+        if not _PERPLEXITY_EMBED_FALLBACK_WARNED:
+            _PERPLEXITY_EMBED_FALLBACK_WARNED = True
+            print(
+                "[backend] PERPLEXITY_API_KEY unset — using placeholder embeddings "
+                "(library and memory rows still save; semantic retrieval is degraded)."
+            )
+        dim = int(os.getenv("EMBEDDING_DIM", "2560"))
+        return _placeholder_embeddings(texts, dim)
     model = os.getenv("PERPLEXITY_EMBEDDING_MODEL", DEFAULT_PERPLEXITY_EMBEDDING_MODEL).strip()
     use_contextual = "context" in model.lower()
 
@@ -169,10 +326,18 @@ def _gemini_response_to_text(result) -> str:
 
 def _call_gemini(prompt: str) -> str:
     """
-    Call the primary Gemini chat model (Flash 3.1 by default) with a single text prompt.
+    Call the primary chat model for extraction/helpers: OpenRouter (Gemini 3 Pro preview by default)
+    when OPENROUTER_API_KEY is set and GEMINI_VIA_OPENROUTER is not disabled; otherwise Google Gemini SDK
+    (GEMINI_CHAT_MODEL, default gemini-3-flash-preview).
     Returns the response text (empty string on failure).
-    Uses full response text including thought parts so JSON extraction is not lost.
+    For Google SDK responses, uses full text including thought parts so JSON extraction is not lost.
     """
+    if openrouter_gemini_enabled():
+        try:
+            return _openrouter_chat_completion(prompt)
+        except Exception as e:
+            print("[backend] _call_gemini (OpenRouter) error:", e)
+            return ""
     try:
         client = _get_gemini_client()
         model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
@@ -187,8 +352,11 @@ def _call_gemini(prompt: str) -> str:
 def _call_gemini_with_google_search(prompt: str) -> str:
     """
     Same as _call_gemini but with Google Search grounding so the model can use real-time web results.
+    When using OpenRouter, there is no Google Search tool — this calls the same completion as _call_gemini.
     Falls back to _call_gemini if grounding is unavailable (e.g. SDK or model support).
     """
+    if openrouter_gemini_enabled():
+        return _call_gemini(prompt)
     try:
         from google.genai import types
         client = _get_gemini_client()
@@ -299,6 +467,7 @@ def add_consumed(
     note: str | None = None,
     date_completed: str | None = None,
     instance_id: str = "",
+    id_override: str | None = None,
 ) -> None:
     """
     Record that the user has read/listened to a recommendation (book, podcast, article, research).
@@ -318,7 +487,9 @@ def add_consumed(
     if note:
         doc += f" Note: {note}"
     emb = _embed_texts([doc])[0]
-    uid = f"consumed_{ts_safe}_{hash(title) % 10**8}"
+    uid = (id_override or "").strip()
+    if not uid:
+        uid = f"consumed_{ts_safe}_{abs(hash(title + content_type)) % 10**8}"
     vec_store.add_consumed(
         uid,
         doc,
@@ -333,6 +504,50 @@ def add_consumed(
         date_completed=(date_completed or "")[:50],
         instance_id=instance_id or "",
     )
+
+
+def apply_library_tool_items(items: object, instance_id: str = "") -> tuple[int, list[str]]:
+    """
+    Validate structured items from the chat agent (LLM tool calls) and insert into the library.
+    Returns (count_added, short labels for confirmation).
+    """
+    if not isinstance(items, list):
+        return 0, []
+    added = 0
+    labels: list[str] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        ctype = str(raw.get("type", "")).lower().strip()
+        if ctype not in ("book", "podcast", "article", "research"):
+            continue
+        title = (raw.get("title") or "").strip()
+        if not title:
+            continue
+        author = (raw.get("author") or "").strip() or None
+        url = (raw.get("url") or "").strip() or None
+        liked = raw.get("liked", True)
+        if isinstance(liked, str):
+            liked = liked.strip().lower() in ("true", "1", "yes")
+        note = (raw.get("note") or "").strip() or None
+        try:
+            add_consumed(
+                ctype,
+                title,
+                author=author,
+                url=url,
+                liked=bool(liked),
+                note=note,
+                instance_id=instance_id,
+            )
+            added += 1
+            labels.append(
+                f"{ctype}: {title[:80]}" + (f" ({author[:60]})" if author else "")
+            )
+        except Exception as e:
+            print("[backend] apply_library_tool_items add_consumed error:", e)
+            continue
+    return added, labels
 
 
 def process_library_note(text: str, type_filter: str | None = None, instance_id: str = "") -> int:
@@ -411,8 +626,8 @@ Rules:
 
 def get_consumed_context(max_items: int = 80, instance_id: str = "") -> str:
     """
-    Return a single string describing what the user has consumed and liked,
-    for injection into the recommendation agent prompt.
+    Return a single string describing what the user has consumed, liked/disliked,
+    and notes — for injection into recommendation prompts and Perplexity query builders.
     """
     import vec_store
 
@@ -431,13 +646,17 @@ def get_consumed_context(max_items: int = 80, instance_id: str = "") -> str:
             line = f"- {t}: {title}"
             if author:
                 line += f" ({author})"
-            line += " — liked" if liked else " — read/listened"
+            if liked:
+                line += " — enjoyed / liked"
+            else:
+                line += " — did not enjoy (avoid similar items, authors, outlets, or angles; respect any note below)"
             if note:
-                line += f". User reflection: {note}"
+                line += f". User note: {note}"
             lines.append(line)
         return (
-            "What the user has already consumed (books, podcasts, articles, research) and their reflections. "
-            "Do not recommend these same items again. Use their tastes and reflections from ALL categories to inform your suggestions—e.g. their notes on a research paper or podcast can shape book recommendations, and vice versa.\n"
+            "What the user has already consumed (books, podcasts, articles, research). "
+            "Do NOT recommend the same titles/URLs again. "
+            "Honor **liked** items as taste signals; honor **did not enjoy** rows and **User note** as signals to steer away (themes, tone, subject matter) while staying useful.\n"
             + "\n".join(lines)
         )
     except Exception:
@@ -1433,33 +1652,251 @@ def _parse_recommendation_json(text: str, default: list) -> list:
     ]
 
 
-def _books_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
-    """Dedicated agent for book recommendations only."""
-    recent_section = ""
-    if recent_summaries_blob:
-        recent_section = f"""
-MOST RECENT JOURNAL ENTRIES (give ~20% more weight to themes and needs that appear here—what's most present for them right now):
+def _pplx_search_api_key() -> str:
+    return (os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY") or "").strip()
+
+
+def _perplexity_search_api(
+    query: str,
+    *,
+    max_results: int = 8,
+    search_recency_filter: str | None = "month",
+    country: str | None = None,
+    timeout_sec: float = 45.0,
+) -> list[dict]:
+    """Call Perplexity Search POST /search; return list of {title, url, snippet, date}."""
+    api_key = _pplx_search_api_key()
+    if not api_key or not (query or "").strip():
+        return []
+    payload: dict = {
+        "query": query.strip(),
+        "max_results": max(1, min(20, int(max_results))),
+    }
+    if search_recency_filter:
+        payload["search_recency_filter"] = search_recency_filter
+    if country and len(str(country).strip()) >= 2:
+        payload["country"] = str(country).strip()[:2].upper()
+    try:
+        body = _perplexity_post_json(PPLX_SEARCH_URL, payload, api_key, timeout_sec=timeout_sec)
+    except Exception as e:
+        print("[backend] Perplexity Search error:", e)
+        return []
+    raw_list = body.get("results") or []
+    out: list[dict] = []
+    for r in raw_list:
+        if not isinstance(r, dict):
+            continue
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        snippet = (r.get("snippet") or "").strip()
+        if not title or not url:
+            continue
+        out.append({
+            "title": title[:500],
+            "url": url[:2000],
+            "snippet": snippet[:2500],
+            "date": r.get("date"),
+        })
+    return out
+
+
+def _parse_json_string_list(text: str) -> list[str]:
+    """Extract a JSON array of strings from Gemini (or similar) output."""
+    if not text or not isinstance(text, str):
+        return []
+    t = text.strip()
+    if t.startswith("```"):
+        parts = t.split("```")
+        t = parts[1] if len(parts) > 1 else t
+        if t.startswith("json"):
+            t = t[4:]
+    t = t.strip()
+    if "[" in t and "]" in t:
+        t = t[t.index("[") : t.rindex("]") + 1]
+    try:
+        raw = json.loads(t)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if isinstance(x, (str, int, float)) and str(x).strip()]
+
+
+def _recent_journals_block(recent_summaries_blob: str) -> str:
+    if not (recent_summaries_blob or "").strip():
+        return ""
+    return f"""
+══════════════════════════════════════════════════════════════════
+HIGHEST PRIORITY — MOST RECENT JOURNAL SESSIONS (weight heavily; most alive for the user now)
+══════════════════════════════════════════════════════════════════
 {recent_summaries_blob}
 
 """
-    prompt = f"""You are a book curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 3–5 books they might find helpful or comforting.
 
-FACTS AND THEMES FROM THEIR JOURNALS:
+
+def _merge_perplexity_queries(
+    queries: list[str],
+    *,
+    max_per_query: int = 6,
+    search_recency_filter: str | None = "month",
+    country: str | None = None,
+    max_total_hits: int = 24,
+    timeout_per_query: float = 30.0,
+) -> list[dict]:
+    """Run Perplexity Search for each query in parallel threads; merge with URL dedupe (stable query order)."""
+    clean = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+    if not clean:
+        return []
+
+    def _one(q: str) -> list[dict]:
+        return _perplexity_search_api(
+            q,
+            max_results=max_per_query,
+            search_recency_filter=search_recency_filter,
+            country=country,
+            timeout_sec=timeout_per_query,
+        )
+
+    merge_cap = float(os.getenv("RECOMMENDATIONS_PPLX_MERGE_WAIT_CAP_SEC", "52"))
+    merge_wait = min(timeout_per_query + 12.0, merge_cap)
+    n_workers = min(8, len(clean))
+    rows_per_query: list[list[dict]] = [[] for _ in clean]
+    executor = ThreadPoolExecutor(max_workers=n_workers)
+    try:
+        future_to_i = {executor.submit(_one, q): i for i, q in enumerate(clean)}
+        futures_list = list(future_to_i.keys())
+        futures_wait(futures_list, timeout=merge_wait)
+        for fut, i in future_to_i.items():
+            if not fut.done():
+                continue
+            try:
+                rows_per_query[i] = fut.result(timeout=0)
+            except Exception as e:
+                print("[backend] Perplexity merge worker error:", e)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    seen_urls: set[str] = set()
+    merged: list[dict] = []
+    for rows in rows_per_query:
+        for row in rows:
+            u = (row.get("url") or "").strip().lower()
+            if not u or u in seen_urls:
+                continue
+            seen_urls.add(u)
+            merged.append(row)
+            if len(merged) >= max_total_hits:
+                return merged
+    return merged
+
+
+def _search_hits_context_lines(hits: list[dict], max_chars: int = 10000) -> str:
+    buf: list[str] = []
+    n = 0
+    for i, h in enumerate(hits[:35], 1):
+        t = h.get("title") or ""
+        u = h.get("url") or ""
+        s = (h.get("snippet") or "")[:450]
+        line = f"{i}. {t} | {u}\n   {s}"
+        if n + len(line) > max_chars:
+            break
+        buf.append(line)
+        n += len(line) + 1
+    return "\n".join(buf)
+
+
+def _filter_hits_basic(hits: list[dict], consumed_lower: str) -> list[dict]:
+    """Drop paywalled domains, video/replay junk, and obvious consumed URL/title overlaps."""
+    out: list[dict] = []
+    for h in hits:
+        url = h.get("url") or ""
+        title = h.get("title") or ""
+        if _is_paywalled_domain(url):
+            continue
+        if _is_video_or_replay_result(title, url):
+            continue
+        tl = title.lower()
+        ul = url.lower()
+        if tl and tl in consumed_lower:
+            continue
+        # Light overlap: skip if URL path appears quoted in consumed
+        if ul and ul in consumed_lower:
+            continue
+        out.append(h)
+    return out
+
+
+def _books_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
+    """Book recommendations via Perplexity Search + Gemini structuring (no duplicate titles vs consumed)."""
+    recent_section = _recent_journals_block(recent_summaries_blob)
+    if not _pplx_search_api_key():
+        prompt = f"""You are a book curator. Based on this person's journal-derived memory and consumed library, suggest 3–5 books (title + author + one-sentence reason). No URLs.
+
+FACTS:
 {facts_blob or "(none yet)"}
 
-JOURNAL SESSION SUMMARIES (all themes over time):
+SUMMARIES:
 {summaries_blob or "(none yet)"}
 {recent_section}{consumed}
 
-Rules: Do NOT suggest books they have already consumed. Use their reflections and tastes from podcasts, articles, and research too—e.g. if they liked a paper or podcast on a topic, that can inform book picks. For each book give title, author, and a short "reason" (one sentence) tied to their life or journal themes. No URLs.
-Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "..."}}, ...]"""
-    text = _call_gemini_with_google_search(prompt)
-    return _parse_recommendation_json(text, [])
+Return ONLY JSON: [{{"title": "...", "author": "...", "reason": "..."}}, ...]"""
+        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+
+    q_prompt = f"""Suggest 3 short **web search** queries to discover **nonfiction or fiction books** (lists, reviews, "best books on…") for this person. Queries must help find real book titles and authors on the open web.
+Respect **did not enjoy** rows in CONSUMED — steer away from similar themes or authors they rejected.
+
+FACTS:
+{facts_blob or "(none)"}
+
+SUMMARIES:
+{summaries_blob or "(none)"}
+{recent_section}{consumed[:6000]}
+
+Return ONLY a JSON array of 3 strings. Example: ["best psychology books for anxiety 2024", "literary fiction grief healing"]"""
+    queries = _parse_json_string_list(_call_gemini(q_prompt))
+    if len(queries) < 2:
+        queries = ["best nonfiction books personal growth highly rated", "literary fiction book recommendations deep characters"]
+    consumed_lower = (consumed or "").lower()
+    hits = _merge_perplexity_queries(
+        queries[:4],
+        max_per_query=5,
+        search_recency_filter="year",
+        max_total_hits=22,
+    )
+    hits = _filter_hits_basic(hits, consumed_lower)
+    blob = _search_hits_context_lines(hits)
+    if not blob.strip():
+        prompt = f"""Suggest 3–5 books for this person (title, author, reason). {recent_section}{consumed[:4000]}
+facts: {facts_blob[:2000]}
+summaries: {summaries_blob[:2000]}
+Return ONLY JSON array: [{{"title","author","reason","url"}}] url optional."""
+        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+
+    curate = f"""You are a book curator. Pick **3–5 distinct books** for this user using ONLY information grounded in SEARCH_RESULTS (real books mentioned there). Map each to canonical **title** and **author** as in the source; **url** must be copied exactly from SEARCH_RESULTS when present (review, publisher, Goodreads, etc.) or "".
+Tie each **reason** to the user's themes in CONTEXT; keep reasons one sentence, honest.
+
+CONTEXT — FACTS:
+{facts_blob or "(none)"}
+
+CONTEXT — SUMMARIES:
+{summaries_blob or "(none)"}
+{recent_section}{consumed[:5000]}
+
+SEARCH_RESULTS:
+{blob}
+
+Rules: Do NOT output books that appear in CONSUMED as already read. Avoid books/authors clearly similar to **did not enjoy** notes.
+Return ONLY JSON: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
+    out = _parse_recommendation_json(_call_gemini(curate), [])
+    # Fallback if Gemini returned empty
+    if not out:
+        return _parse_recommendation_json(_call_gemini_with_google_search(curate), [])
+    return out[:8]
 
 
 LISTEN_NOTES_BASE = "https://listen-api.listennotes.com/api/v2"
 # Set to True to skip calling the Listen Notes API (use LLM-only fallback for podcast suggestions).
-PODCAST_API_PAUSED = True
+PODCAST_API_PAUSED = False
 
 
 def _listen_notes_search_episodes(
@@ -1550,13 +1987,7 @@ Return ONLY a JSON array of {len(episodes)} strings, one reason per episode, in 
 
 def _podcasts_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
     """Dedicated podcast agent: uses Listen Notes API for real episode links when key is set."""
-    recent_section = ""
-    if recent_summaries_blob:
-        recent_section = f"""
-MOST RECENT JOURNAL ENTRIES (weight these ~20% more when picking topics):
-{recent_summaries_blob}
-
-"""
+    recent_section = _recent_journals_block(recent_summaries_blob)
     api_key = (os.getenv("LISTENNOTES_API_KEY") or "").strip()
     if api_key and not PODCAST_API_PAUSED:
         prompt = f"""Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 2–3 short search queries (topics or themes) to find relevant podcast episodes. Use tastes from their book notes, article reads, and research too—e.g. themes from a book they loved can become podcast queries. We will prioritize episodes from the last 3 months, so prefer queries that are likely to surface recent, timely episodes. Examples: "mindfulness sleep", "anxiety therapy", "Huberman Lab sleep".
@@ -1805,84 +2236,70 @@ def _tavily_search_articles(
 
 
 def _articles_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
-    """Dedicated agent for article recommendations. Uses Tavily Search (topic=news) when TAVILY_API_KEY is set for real URLs."""
-    recent_section = ""
-    if recent_summaries_blob:
-        recent_section = f"""
-MOST RECENT JOURNAL ENTRIES (weight these ~20% more when matching interests):
-{recent_summaries_blob}
+    """Informational / thought-provoking articles via Perplexity Search + personalized reasons."""
+    recent_section = _recent_journals_block(recent_summaries_blob)
+    if not _pplx_search_api_key():
+        prompt = f"""You are an article curator. Suggest 3–5 **informational** articles or essays (helpful, thought-provoking explainers—not clickbait). Real URLs only.
 
-"""
-    api_key = (os.getenv("TAVILY_API_KEY") or "").strip()
-    if api_key:
-        print("[backend] Articles: using Tavily Search (topic=news) for real article URLs.")
-        prompt = f"""Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 2–3 short search queries to find relevant news articles or long-reads. Use tastes from books, podcasts, and research too. We will search the web for real articles, so prefer clear topic queries. Examples: "mindfulness and sleep research", "anxiety therapy evidence", "work-life balance psychology".
-
-FACTS AND THEMES FROM THEIR JOURNALS:
+FACTS:
 {facts_blob or "(none yet)"}
 
-JOURNAL SESSION SUMMARIES (all themes):
+SUMMARIES:
 {summaries_blob or "(none yet)"}
 {recent_section}{consumed}
 
-Return ONLY a JSON array of 2–3 short search query strings, no markdown. Example: ["mindfulness sleep research", "therapy for anxiety"]"""
+Return ONLY JSON: [{{"title","author","reason","url"}}, ...]"""
+        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+
+    q_prompt = f"""Suggest 2–3 short **web search** queries for **in-depth readable articles**: explainers, essays, analysis, studies written for educated readers—not breaking headline chyrons.
+Honor CONSUMED: respect **did not enjoy** and negative notes.
+
+FACTS:
+{facts_blob or "(none)"}
+
+SUMMARIES:
+{summaries_blob or "(none)"}
+{recent_section}{consumed[:6000]}
+
+Return ONLY JSON array of 2–3 strings. Example: ["long read climate adaptation solutions", "cognitive science of habit formation explainer"]"""
+    queries = _parse_json_string_list(_call_gemini(q_prompt))
+    if len(queries) < 2:
+        queries = ["thought-provoking long read science society", "deep dive psychology well-being evidence"]
+    consumed_lower = (consumed or "").lower()
+    hits = _merge_perplexity_queries(
+        queries[:3],
+        max_per_query=6,
+        search_recency_filter="month",
+        max_total_hits=18,
+    )
+    hits = _filter_hits_basic(hits, consumed_lower)
+    out: list[dict] = []
+    for h in hits[:8]:
+        url = h.get("url") or ""
         try:
-            text = _call_gemini(prompt)
-            if not isinstance(text, str):
-                text = str(text or "")
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            text = text.strip()
-            # Extract a JSON array if response has extra content (e.g. thought_signature or wrapper text)
-            if "[" in text and "]" in text:
-                start = text.index("[")
-                end = text.rindex("]") + 1
-                text = text[start:end]
-            queries = json.loads(text)
-            if not isinstance(queries, list):
-                queries = []
-            queries = [str(q).strip() for q in queries if q]
-        except Exception as e:
-            try:
-                snippet = (text[:200] + "…") if text else "(empty)"
-            except Exception:
-                snippet = "(parse error)"
-            print("[backend] Articles agent query parsing:", e, "| snippet:", snippet)
-            queries = []
-        print(f"[backend] Articles: parsed {len(queries)} search queries for Tavily: {queries!r}")
-        consumed_lower = consumed.lower()
-        seen_urls: set[str] = set()
-        out = []
-        for item in _tavily_search_articles(queries[:3], api_key, max_per_query=4, topic="news"):
-            if item["url"] in seen_urls:
-                continue
-            if item["title"].lower() in consumed_lower or (item.get("author") and item["author"].lower() in consumed_lower):
-                continue
-            seen_urls.add(item["url"])
-            out.append(item)
-        out = out[:5]
-        if out:
-            reasons = _generate_article_reasons(out, facts_blob, summaries_blob, consumed)
-            for i, item in enumerate(out):
-                item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "Matches your interests.")
-            print(f"[backend] Articles: Tavily path returning {len(out)} articles.")
-            return out
-        print("[backend] Articles: Tavily returned no articles; falling back to LLM-only.")
-    prompt = f"""You are an article curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections on any of them, suggest 3–5 news articles or long-reads. Use their tastes from books, podcasts, and research too—e.g. themes from a book or paper they liked can inform article picks.
-
-FACTS AND THEMES FROM THEIR JOURNALS:
-{facts_blob or "(none yet)"}
-
-JOURNAL SESSION SUMMARIES (all themes):
-{summaries_blob or "(none yet)"}
-{recent_section}{consumed}
-
-CRITICAL: Every article MUST have a "url" that is a real, working link to the actual article page—no 404s. Use only URLs you are certain exist (exact paths from nytimes.com, theatlantic.com, healthline.com, bbc.com, nature.com, apa.org, etc.). Do NOT guess or construct URLs. If you cannot provide a verified working URL for an article, do NOT include it. For each give title, author/source, reason, and url.
-Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    text = _call_gemini_with_google_search(prompt)
-    return _parse_recommendation_json(text, [])
+            parsed = urllib.parse.urlparse(url)
+            author = (parsed.netloc or "").lower()
+            if author.startswith("www."):
+                author = author[4:]
+        except Exception:
+            author = ""
+        snip = (h.get("snippet") or "")[:200]
+        out.append({
+            "title": (h.get("title") or "Article")[:500],
+            "author": author[:200],
+            "reason": (snip + "…") if len(h.get("snippet") or "") > 200 else (h.get("snippet") or "Suggested read."),
+            "url": url,
+        })
+    out = out[:6]
+    if out:
+        reasons = _generate_article_reasons(out, facts_blob, summaries_blob, consumed)
+        for i, item in enumerate(out):
+            item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "")
+        print(f"[backend] Articles: Perplexity path returning {len(out)} articles.")
+        return out
+    return _parse_recommendation_json(_call_gemini_with_google_search(
+        f"Suggest 3 articles with real URLs for this user. {recent_section}{consumed[:3000]}\nfacts:{facts_blob[:1500]}"
+    ), [])
 
 
 # --- Research: Semantic Scholar + PMC/PubMed (E-Utilities) ---
@@ -2101,120 +2518,242 @@ Return ONLY a JSON array of {len(papers)} strings, one reason per paper, same or
     return [p.get("reason", "Relevant to your interests.") for p in papers]
 
 
+SCHOLARLY_URL_MARKERS = (
+    "doi.org",
+    "arxiv.org",
+    "pubmed.ncbi.nlm.nih.gov",
+    "semanticscholar.org",
+    "biorxiv.org",
+    "medrxiv.org",
+    "/pmc/articles/",
+    "nature.com/articles",
+    "science.org/doi",
+    "cell.com",
+    "plos.org",
+    "frontiersin.org",
+    "springer.com/article",
+    "wiley.com",
+    "ieee.org",
+    "acm.org",
+    "pnas.org",
+    "journals.",
+)
+
+
+def _prefer_scholarly_hits(hits: list[dict]) -> list[dict]:
+    good: list[dict] = []
+    rest: list[dict] = []
+    for h in hits:
+        u = (h.get("url") or "").lower()
+        if any(m in u for m in SCHOLARLY_URL_MARKERS):
+            good.append(h)
+        else:
+            rest.append(h)
+    return good + rest
+
+
 def _research_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
-    """Research paper recommendations using Gemini with Google Search grounding. (Semantic Scholar + PubMed APIs are commented out for now.)"""
-    recent_section = ""
-    if recent_summaries_blob:
-        recent_section = f"""
-MOST RECENT JOURNAL ENTRIES (weight these ~20% more when matching interests):
-{recent_summaries_blob}
+    """Research papers via Perplexity Search (scholarly URLs preferred) + grounded reasons."""
+    recent_section = _recent_journals_block(recent_summaries_blob)
+    if not _pplx_search_api_key():
+        prompt = f"""You are a research curator. Suggest 3–5 peer-reviewed or preprint papers with **verified** URLs (doi.org, PubMed, arXiv, Semantic Scholar only if certain).
 
-"""
-    # 1) Generate 2–3 search queries from journal + consumed context
-    prompt_queries = f"""Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections, suggest 2–3 short search queries to find relevant academic or scientific research papers (peer-reviewed articles, studies, reviews). We will search Semantic Scholar and PubMed. Prefer concrete topic queries. Examples: "mindfulness meditation meta-analysis", "sleep deprivation cognitive performance", "CBT anxiety systematic review".
-
-FACTS AND THEMES:
-{facts_blob or "(none)"}
-
-JOURNAL SUMMARIES:
-{summaries_blob or "(none)"}
-{recent_section}{consumed}
-
-Return ONLY a JSON array of 2–3 query strings, no markdown. Example: ["mindfulness meta-analysis", "sleep and cognition"]"""
-    queries: list[str] = []
-    try:
-        text = _call_gemini(prompt_queries)
-        text = str(text or "").strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        if "[" in text and "]" in text:
-            start, end = text.index("["), text.rindex("]") + 1
-            text = text[start:end]
-        queries = json.loads(text)
-        if not isinstance(queries, list):
-            queries = []
-    except Exception as e:
-        print("[backend] Research agent query parsing:", e)
-
-    # Semantic Scholar and PubMed APIs commented out for now; using Gemini (with Google Search grounding) for research recommendations.
-    # consumed_lower = (consumed or "").lower()
-    # seen_titles: set[str] = set()
-    # out: list[dict] = []
-    # # 2) Semantic Scholar (broad academic)
-    # for item in _semantic_scholar_search_papers(queries, max_per_query=5):
-    #     title = (item.get("title") or "").strip()
-    #     if not title or title.lower() in consumed_lower:
-    #         continue
-    #     key = title.lower()[:80]
-    #     if key in seen_titles:
-    #         continue
-    #     seen_titles.add(key)
-    #     out.append(item)
-    # # 3) PMC/PubMed (biomedical)
-    # for item in _pmc_pubmed_search_papers(queries, max_per_query=4):
-    #     title = (item.get("title") or "").strip()
-    #     if not title or title.lower() in consumed_lower:
-    #         continue
-    #     key = title.lower()[:80]
-    #     if key in seen_titles:
-    #         continue
-    #     seen_titles.add(key)
-    #     out.append(item)
-    # out = out[:5]
-    # if out:
-    #     reasons = _generate_research_reasons(out, facts_blob, summaries_blob, consumed)
-    #     for i, item in enumerate(out):
-    #         item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "Relevant to your interests.")
-    #     print(f"[backend] Research: API path returning {len(out)} papers (Semantic Scholar + PubMed).")
-    #     return out
-
-    # Use Gemini with Google Search grounding for research suggestions (no external APIs for now)
-    prompt = f"""You are a research curator. Based on this person's journal-derived memory and what they have consumed (books, podcasts, articles, research) and their reflections, suggest 3–5 academic or scientific research papers they might find relevant. Use their tastes from books, podcasts, and articles too.
-
-FACTS AND THEMES FROM THEIR JOURNALS:
+FACTS:
 {facts_blob or "(none yet)"}
 
-JOURNAL SESSION SUMMARIES (all themes):
+SUMMARIES:
 {summaries_blob or "(none yet)"}
 {recent_section}{consumed}
 
-Rules: Do NOT suggest papers they have already consumed. For each paper give: "title", "author" (e.g. "Smith et al." or journal and year), "reason" (one sentence), and "url" (working link: https://doi.org/..., https://pubmed.ncbi.nlm.nih.gov/PMID/, or https://www.semanticscholar.org/paper/...). Do not guess URLs; only include papers where you are sure of the URL.
-Return ONLY a JSON array, no markdown: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    text = _call_gemini_with_google_search(prompt)
-    return _parse_recommendation_json(text, [])
+Return ONLY JSON: [{{"title","author","reason","url"}}, ...]"""
+        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+
+    q_prompt = f"""Suggest 2–3 short **web search** queries to find **peer-reviewed research papers, systematic reviews, or reputable preprints** (PubMed, arXiv, journal DOI pages). Be concrete; include methodology terms when useful (RCT, meta-analysis, cohort).
+Honor CONSUMED — avoid subfields or angles the user disliked.
+
+FACTS:
+{facts_blob or "(none)"}
+
+SUMMARIES:
+{summaries_blob or "(none)"}
+{recent_section}{consumed[:6000]}
+
+Return ONLY JSON array of 2–3 strings."""
+    queries = _parse_json_string_list(_call_gemini(q_prompt))
+    if len(queries) < 2:
+        queries = [
+            "randomized controlled trial mental health well-being recent",
+            "systematic review climate health intersection pubmed",
+        ]
+    widened = []
+    for q in queries[:3]:
+        widened.append(q)
+        if "doi" not in q.lower() and "pubmed" not in q.lower():
+            widened.append(f"{q} peer-reviewed OR systematic review")
+    consumed_lower = (consumed or "").lower()
+    hits = _merge_perplexity_queries(
+        widened[:5],
+        max_per_query=5,
+        search_recency_filter="year",
+        max_total_hits=22,
+    )
+    hits = _prefer_scholarly_hits(_filter_hits_basic(hits, consumed_lower))
+    out: list[dict] = []
+    for h in hits[:10]:
+        url = h.get("url") or ""
+        title = (h.get("title") or "")[:500]
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.netloc or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+        except Exception:
+            host = ""
+        author_guess = host or "Source"
+        snip = (h.get("snippet") or "")[:180]
+        out.append({
+            "title": title or "Paper",
+            "author": author_guess[:200],
+            "reason": (snip + "…") if len(h.get("snippet") or "") > 180 else (h.get("snippet") or ""),
+            "url": url,
+        })
+    out = out[:6]
+    if out:
+        reasons = _generate_research_reasons(out, facts_blob, summaries_blob, consumed)
+        for i, item in enumerate(out):
+            item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "")
+        print(f"[backend] Research: Perplexity path returning {len(out)} papers.")
+        return out
+    prompt = f"""Suggest 3–5 research papers with verified doi.org / pubmed / arxiv URLs only.
+
+{recent_section}{consumed[:4000]}
+FACTS: {facts_blob[:2000]}
+SUMMARIES: {summaries_blob[:2000]}
+Return ONLY JSON array."""
+    return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+
+
+def _news_agent(facts_blob: str, summaries_blob: str, consumed: str, recent_summaries_blob: str = "") -> list:
+    """
+    Uplifting / constructive news via Perplexity Search (week recency, country-aware).
+    Extension point: conversational dislikes flow into `consumed` via get_consumed_context.
+    """
+    recent_section = _recent_journals_block(recent_summaries_blob)
+    cc = (os.getenv("PERPLEXITY_NEWS_COUNTRY") or "US").strip()
+    country = cc[:2].upper() if len(cc) >= 2 else "US"
+
+    queries: list[str] = [
+        "positive news breakthroughs science health environment progress this week",
+        "good news clean energy infrastructure innovation milestones",
+        "uplifting civic or global development stories solutions focused",
+    ]
+
+    if _pplx_search_api_key():
+        gq = f"""The user benefits from **uplifting, constructive news**: scientific progress, climate/energy wins, public-health advances, humanitarian or community solutions, inspiring engineering (e.g. new reactors, grid, transit)—**not** outrage or culture-war angles.
+Write **1–2 short web search queries** tailored to their **interests** in CONTEXT and (if journals mention it) **location**. Include phrases like "good news", "opens", "launches", "record", "milestones" where natural.
+Respect CONSUMED **did not enjoy** lines—avoid outlets/topics they rejected.
+
+FACTS:
+{facts_blob or "(none)"}
+
+SUMMARIES:
+{summaries_blob or "(none)"}
+{recent_section}{consumed[:5500]}
+
+Return ONLY a JSON array of 1–2 strings."""
+
+        extra = _parse_json_string_list(_call_gemini(gq))
+        for q in extra[:2]:
+            if q and q not in queries:
+                queries.append(q)
+
+    if not _pplx_search_api_key():
+        prompt = f"""Curate 3–6 **positive or solution-focused** news stories with verifiable URLs for this reader.
+
+FACTS:
+{facts_blob or "(none)"}
+
+SUMMARIES:
+{summaries_blob or "(none)"}
+{recent_section}{consumed}
+
+Return ONLY JSON: [{{"title","author","reason","url"}}, ...]"""
+        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+
+    consumed_lower = (consumed or "").lower()
+    hits = _merge_perplexity_queries(
+        queries[:6],
+        max_per_query=4,
+        search_recency_filter="week",
+        country=country,
+        max_total_hits=26,
+        timeout_per_query=30.0,
+    )
+    hits = _filter_hits_basic(hits, consumed_lower)
+    out: list[dict] = []
+    for h in hits[:14]:
+        url = h.get("url") or ""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.netloc or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+        except Exception:
+            host = ""
+        snip = (h.get("snippet") or "")[:200]
+        out.append({
+            "title": (h.get("title") or "News")[:500],
+            "author": host[:200],
+            "reason": (snip + "…") if len(h.get("snippet") or "") > 200 else (h.get("snippet") or ""),
+            "url": url,
+        })
+    out = out[:12]
+    if out:
+        reasons = _generate_article_reasons(out, facts_blob, summaries_blob, consumed)
+        for i, item in enumerate(out):
+            item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "")
+        print(f"[backend] News: Perplexity path returning {len(out)} items.")
+        return out
+    return _parse_recommendation_json(
+        _call_gemini_with_google_search(
+            f"Positive/solution-focused news with real URLs. {recent_section}{consumed[:3000]}\nfacts:{facts_blob[:1500]}"
+        ),
+        [],
+    )
 
 
 def generate_recommendations(instance_id: str = "") -> dict:
     """
-    Run four dedicated agents (books, podcasts, articles, research) in parallel, each with
-    its own prompt and specialization. Combines results into one response.
-    Uses full journal history for themes but gives ~20% more weight to the most recent entries.
+    Run five dedicated agents (books, podcasts, articles, research, news) in parallel.
+    Uses gist + episodic memory and consumed library; **recent** journal sessions get extra weight (~25%).
+    Books/articles/research/news use Perplexity Search when PERPLEXITY_API_KEY is set.
+
+    Extension: feed conversational or library **dislikes** into the same `consumed` string (e.g. via
+    `add_consumed` + `get_consumed_context`) so future chat-derived preferences affect the next run
+    without changing agent signatures.
     """
     gist_docs, episodic_docs = get_memory_for_visualization(instance_id=instance_id)
     consumed = get_consumed_context(instance_id=instance_id)
-    facts_blob = "\n".join(f"- {f}" for f in (gist_docs or [])[:60])
-    # Episodic from get_memory_for_visualization is oldest-first (ORDER BY id). Use all for themes.
-    summaries_blob = "\n".join(f"- {s}" for s in (episodic_docs or [])[:40])
-    # Most recent ~20% of journal entries (by count) for extra weight—what's most present right now.
+    facts_blob = "\n".join(f"- {f}" for f in (gist_docs or [])[:70])
+    summaries_blob = "\n".join(f"- {s}" for s in (episodic_docs or [])[:45])
     episodic_list = episodic_docs or []
-    n_recent = max(5, int(len(episodic_list) * 0.2)) if episodic_list else 0
+    n_recent = max(8, int(len(episodic_list) * 0.25)) if episodic_list else 0
     recent_episodic = episodic_list[-n_recent:] if n_recent else []
     recent_summaries_blob = "\n".join(f"- {s}" for s in recent_episodic) if recent_episodic else ""
 
-    from concurrent.futures import ThreadPoolExecutor
     books_list: list = []
     podcasts_list: list = []
     articles_list: list = []
     research_list: list = []
+    news_list: list = []
 
-    agent_timeout = 90  # seconds per agent so one hang doesn't block forever
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    agent_timeout = float(os.getenv("RECOMMENDATIONS_AGENT_TIMEOUT_SEC", "68"))
+    with ThreadPoolExecutor(max_workers=5) as executor:
         future_books = executor.submit(_books_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
         future_podcasts = executor.submit(_podcasts_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
         future_articles = executor.submit(_articles_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
         future_research = executor.submit(_research_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
+        future_news = executor.submit(_news_agent, facts_blob, summaries_blob, consumed, recent_summaries_blob)
         try:
             books_list = future_books.result(timeout=agent_timeout)
         except Exception as e:
@@ -2231,10 +2770,15 @@ def generate_recommendations(instance_id: str = "") -> dict:
             research_list = future_research.result(timeout=agent_timeout)
         except Exception as e:
             print("[backend] recommendations research_agent error:", e)
+        try:
+            news_list = future_news.result(timeout=agent_timeout)
+        except Exception as e:
+            print("[backend] recommendations news_agent error:", e)
 
     return {
         "books": books_list if isinstance(books_list, list) else [],
         "podcasts": podcasts_list if isinstance(podcasts_list, list) else [],
         "articles": articles_list if isinstance(articles_list, list) else [],
         "research": research_list if isinstance(research_list, list) else [],
+        "news": news_list if isinstance(news_list, list) else [],
     }
