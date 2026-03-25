@@ -100,10 +100,11 @@ async def lifespan(app: FastAPI):
 
     print(f"[backend] Extraction / library LLM: {gemini_extraction_backend()}")
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    chat_model = (os.getenv("OPENROUTER_CHAT_MODEL") or "openai/gpt-5.4").strip()
+    chat_model = (os.getenv("OPENROUTER_CHAT_MODEL") or "openai/gpt-4.1-mini").strip()
+    chat_fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or "openai/gpt-5.4").strip()
     if or_key:
         print(
-            f"[backend] OPENROUTER_API_KEY is set — /chat ({chat_model}), journal validation, "
+            f"[backend] OPENROUTER_API_KEY is set — /chat ({chat_model}; fallback {chat_fallback}), journal validation, "
             "and extraction when GEMINI_VIA_OPENROUTER is not off"
         )
     else:

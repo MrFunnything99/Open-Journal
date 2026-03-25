@@ -46,7 +46,8 @@ class JournalState(TypedDict):
     client_actions: NotRequired[list]  # UI: allowlisted navigate actions from navigate_ui tool
 
 
-DEFAULT_OPENROUTER_CHAT_MODEL = "openai/gpt-5.4"
+DEFAULT_OPENROUTER_CHAT_MODEL = "openai/gpt-4.1-mini"
+DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL = "openai/gpt-5.4"
 
 
 def _openrouter_chat_client_and_model():
@@ -69,6 +70,20 @@ def _openrouter_chat_client_and_model():
         },
     )
     return client, model
+
+
+def _openrouter_chat_client_models():
+    """
+    Return (client, primary_model, fallback_model) for /chat.
+    Primary should be cheap + good at tool calling; fallback should be stronger for ambiguity/errors.
+    """
+    client, primary = _openrouter_chat_client_and_model()
+    fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL).strip()
+    if not fallback:
+        fallback = DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL
+    if fallback == primary:
+        fallback = DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL
+    return client, primary, fallback
 
 
 LIBRARY_ITEMS_TOOL = {
@@ -291,15 +306,34 @@ def _interviewer_run_with_tools(
     agent_steps: list[dict] = []
     client_actions: list[dict] = []
     rounds = 0
+    fallback_model = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL).strip()
+    if not fallback_model:
+        fallback_model = DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL
+    active_model = model
+    escalated = False
     while rounds < max_tool_rounds:
         rounds += 1
-        resp = client.chat.completions.create(
-            model=model,
-            messages=oai_messages,
-            tools=_CHAT_TOOLS,
-            tool_choice="auto",
-            max_tokens=4096,
-        )
+        try:
+            resp = client.chat.completions.create(
+                model=active_model,
+                messages=oai_messages,
+                tools=_CHAT_TOOLS,
+                tool_choice="auto",
+                max_tokens=4096,
+            )
+        except Exception as e:
+            # If the cheap model fails (timeouts, provider errors, tool-call glitches), retry once on fallback.
+            if (not escalated) and fallback_model and active_model != fallback_model:
+                escalated = True
+                active_model = fallback_model
+                agent_steps.append(
+                    {
+                        "kind": "system",
+                        "summary": f"Escalated to a stronger model after an error ({str(e)[:80]})",
+                    }
+                )
+                continue
+            raise
         msg = resp.choices[0].message
         if not getattr(msg, "tool_calls", None):
             text = (msg.content or "").strip()
@@ -367,7 +401,7 @@ def _interviewer_run_with_tools(
 
 def _get_llm():
     """Plain chat completion via OpenRouter (no tools) for fallback when the tool loop errors."""
-    client, model = _openrouter_chat_client_and_model()
+    client, model, _fallback = _openrouter_chat_client_models()
 
     class _OpenRouterChatWrapper:
         def __init__(self, client, model: str):
@@ -458,7 +492,7 @@ def interviewer_node(state: JournalState) -> JournalState:
     client_actions: list[dict] = []
     response: AIMessage
     try:
-        client, model = _openrouter_chat_client_and_model()
+        client, model, _fallback = _openrouter_chat_client_models()
         response, library_added, tool_steps, nav_actions = _interviewer_run_with_tools(
             client, model, oai_messages, instance_id
         )
