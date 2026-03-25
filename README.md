@@ -93,7 +93,8 @@ flowchart LR
     FE --> VOICE[ElevenLabs Voice APIs]
     FE --> API[FastAPI Backend]
     API --> CHAT[Grok / XAI for chat]
-    API --> GEM[Gemini for memory extraction and embeddings]
+    API --> GEM[Gemini for extraction only]
+    API --> PPLX[Perplexity for embeddings]
     API --> DB[(SQLite + sqlite-vec)]
     API --> REC[Recommendations Engine]
     DB --> REC
@@ -115,7 +116,8 @@ sequenceDiagram
     Frontend->>Backend: /api/chat or /api/ingest-history
     Backend->>Gemini: Extract summary, facts, topics, people
     Gemini-->>Backend: Structured output
-    Backend->>DB: Save summary + facts + metadata
+    Backend->>Backend: Perplexity embeddings for vectors
+    Backend->>DB: Save summary + facts + metadata + vectors
     Frontend->>Backend: /api/recommendations
     Backend->>DB: Retrieve memory context
     Backend-->>Frontend: Personalized recommendations
@@ -131,7 +133,7 @@ sequenceDiagram
 | Voice | ElevenLabs | Speech-to-text and text-to-speech |
 | Main backend | FastAPI, LangGraph | Chat routes, memory sync, recommendations, auth, ingest |
 | Memory layer | SQLite, sqlite-vec | Persistent journal memory and vector search |
-| AI models | Gemini, Grok/XAI | Gemini for extraction/embeddings; Grok for conversational chat |
+| AI models | Perplexity, Gemini, Grok/XAI | Perplexity for vector embeddings; Gemini for extraction/helpers; Grok for chat |
 | Optional extras | LightRAG, Tavily, Semantic Scholar, Listen Notes | RAG, web/news search, paper lookup, podcast links |
 
 ### Important note about OpenRouter
@@ -139,10 +141,11 @@ sequenceDiagram
 OpenRouter is **not the main path** for this project right now.
 
 - The current main app flow uses:
-  - **Gemini** for embeddings, memory extraction, and some supporting tasks
+  - **Perplexity** for vector embeddings (sqlite-vec memory)
+  - **Gemini** for memory extraction and Gemini-backed helper tasks (not embeddings)
   - **Grok/XAI** for the core journaling chat experience
 - There are still some older or convenience-oriented Node routes in the repo where a developer could choose to use OpenRouter if they want to experiment locally.
-- If you are just running or deploying the main app, think of **Gemini + Grok** as the primary setup.
+- If you are just running or deploying the main app, think of **Perplexity + Gemini + Grok** as the primary setup (embeddings / extraction / chat).
 
 ---
 
@@ -354,7 +357,8 @@ More backend-only detail (run, endpoints, Fly volume) is in **`backend/README.md
 
 | Variable | Purpose |
 |---|---|
-| `GEMINI_API_KEY` | Memory extraction, embeddings, date inference |
+| `GEMINI_API_KEY` | Extraction and Gemini helpers only (not embeddings) |
+| `PERPLEXITY_API_KEY` | Vector embeddings for gist / episodic / library (sqlite-vec) |
 | `XAI_API_KEY` | Grok chat model for `/api/chat` |
 | `ELEVENLABS_API_KEY` | Voice transcription and voice playback |
 
@@ -364,9 +368,9 @@ More backend-only detail (run, endpoints, Fly volume) is in **`backend/README.md
 |---|---|
 | `JWT_SECRET` | Enables login / refresh-token auth |
 | `GEMINI_CHAT_MODEL` | Override backend Gemini model for helper tasks |
-| `GEMINI_EMBEDDING_MODEL` | Override embedding model |
-| `EMBEDDING_DIM` | Must match the embedding model output size |
-| `LIGHTRAG_ENABLED` | Turn LightRAG on or off |
+| `PERPLEXITY_EMBEDDING_MODEL` | e.g. `pplx-embed-context-v1-4b` (default) or `pplx-embed-v1-4b` |
+| `EMBEDDING_DIM` | Must match stored vector length (default `2560` for full Perplexity 4B embeddings) |
+| `LIGHTRAG_ENABLED` | Default off; set `true` to enable optional LightRAG (`lightrag_bridge.py`) |
 | `VECTOR_DB_PATH` | SQLite DB path, especially important in production |
 | `TAVILY_API_KEY` | Better article/news recommendations |
 | `SEMANTIC_SCHOLAR_API_KEY` | Better research paper recommendations |
@@ -502,7 +506,8 @@ If recommendations seem generic, it usually means one of these is true:
 ### Current model responsibilities
 
 - **Grok / XAI**: main journaling conversation
-- **Gemini**: embeddings, extraction, date inference, and helper generation
+- **Perplexity**: vector embeddings for sqlite-vec (gist, episodic, library)
+- **Gemini**: extraction, date inference, and helper generation (not embeddings)
 - **ElevenLabs**: speech input/output
 
 ### Optional or experimental pieces

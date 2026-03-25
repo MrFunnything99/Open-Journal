@@ -143,7 +143,7 @@ def interviewer_node(state: JournalState) -> JournalState:
 
 
 def librarian_node(state: JournalState) -> JournalState:
-    """Background worker: extract, embed, save to SQLite+sqlite-vec (and optionally LightRAG)."""
+    """Background worker: extract, embed, save to SQLite+sqlite-vec (primary memory pipeline)."""
     session_id = state.get("session_id", "default")
     instance_id = state.get("instance_id") or ""
     transcript = _messages_to_transcript(state["messages"])

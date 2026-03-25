@@ -30,6 +30,7 @@ for name in (".env", ".env.local"):
     load_dotenv(Path.cwd().parent / name)
 
 import vec_store
+from lightrag_bridge import query_for_context, schedule_lightrag_index_after_ingest
 from graph import build_graph, build_librarian_graph, JournalState
 from langchain_core.messages import HumanMessage
 from library import (
@@ -39,6 +40,7 @@ from library import (
     delete_consumed,
     delete_memory_fact,
     delete_memory_summary,
+    DEFAULT_PERPLEXITY_EMBEDDING_MODEL,
     generate_day_summary,
     generate_memory_mermaid,
     generate_recommendations,
@@ -87,17 +89,23 @@ async def lifespan(app: FastAPI):
     for v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ.pop(v, None)
     os.environ["NO_PROXY"] = "*"
-    # Startup: log whether env is loaded (no secrets)
-    gemini_key = os.getenv("GEMINI_API_KEY")
+    # Startup: pipeline roles (no secrets)
+    emb_model = (os.getenv("PERPLEXITY_EMBEDDING_MODEL") or DEFAULT_PERPLEXITY_EMBEDDING_MODEL).strip()
+    pplx_key = (os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY") or "").strip()
+    print(f"[backend] Embeddings: Perplexity ({emb_model})")
+    if not pplx_key:
+        print("[backend] WARNING: PERPLEXITY_API_KEY missing — vector ingest and retrieval will fail until set.")
+
     xai_key = os.getenv("XAI_API_KEY")
+    print("[backend] Generation: Grok")
+    if not (xai_key and xai_key.strip()):
+        print("[backend] WARNING: XAI_API_KEY missing — /chat interviewer will not work until set.")
+
+    gemini_key = os.getenv("GEMINI_API_KEY")
     if gemini_key and gemini_key.strip():
-        print("[backend] GEMINI_API_KEY is set (embeddings, memory, etc.)")
+        print("[backend] Extraction: Gemini (if still enabled — librarian / extraction / helpers; not embeddings)")
     else:
-        print("[backend] WARNING: GEMINI_API_KEY is missing. Set it in .env for embeddings and memory.")
-    if xai_key and xai_key.strip():
-        print("[backend] XAI_API_KEY is set (Grok 4.20 reasoning for interviewer)")
-    else:
-        print("[backend] WARNING: XAI_API_KEY is missing. Set it in .env for /chat interviewer.")
+        print("[backend] Extraction: Gemini not enabled — GEMINI_API_KEY missing (ingest extraction will fail)")
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if or_key:
         print("[backend] OPENROUTER_API_KEY is set (journal validation / OpenRouter)")
@@ -980,7 +988,7 @@ async def library_interview(req: LibraryInterviewRequest, request: Request):
 
 @api_router.post("/end-session", response_model=EndSessionResponse)
 async def end_session(req: EndSessionRequest, request: Request):
-    """Trigger Librarian: extract, embed, save to SQLite+sqlite-vec (and LightRAG when enabled)."""
+    """Trigger Librarian: extract, embed, save to SQLite+sqlite-vec. Optional LightRAG indexing via bridge when enabled."""
     instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     messages = sessions.get(session_id, [])
@@ -1002,16 +1010,7 @@ async def end_session(req: EndSessionRequest, request: Request):
         if facts:
             parts.append("Facts: " + "; ".join(facts))
         doc = "\n\n".join(parts)
-
-        async def _bg_lightrag():
-            try:
-                from lightrag_bridge import insert_text as lightrag_insert
-                await lightrag_insert(doc)
-            except Exception as e:
-                if "GenericAlias" not in str(e) and "NoneType" not in str(e):
-                    print("[backend] LightRAG insert after end_session:", e)
-
-        asyncio.create_task(_bg_lightrag())
+        asyncio.create_task(schedule_lightrag_index_after_ingest(doc))
 
     return EndSessionResponse(ok=True, session_id=session_id)
 
@@ -1022,8 +1021,8 @@ INGEST_HISTORY_TIMEOUT_SEC = 55
 @api_router.post("/ingest-history", response_model=IngestHistoryResponse)
 async def ingest_history(req: IngestHistoryRequest, request: Request):
     """
-    Ingest a prior journal text into SQLite+sqlite-vec and LightRAG.
-    Treats `text` as a single-session transcript. LightRAG gets same summary+facts as vec_store.
+    Ingest a prior journal text into SQLite+sqlite-vec.
+    Treats `text` as a single-session transcript. Optional LightRAG indexing when LIGHTRAG_ENABLED=true.
     Returns 200 always (so CORS headers are sent); ok=False on failure or timeout.
     """
     instance_id = _instance_id(request)
@@ -1046,16 +1045,7 @@ async def ingest_history(req: IngestHistoryRequest, request: Request):
             if facts:
                 parts.append("Facts: " + "; ".join(facts))
             doc = "\n\n".join(parts)
-
-            async def _bg_lightrag():
-                try:
-                    from lightrag_bridge import insert_text as lightrag_insert
-                    await lightrag_insert(doc)
-                except Exception as e:
-                    if "GenericAlias" not in str(e) and "NoneType" not in str(e):
-                        print("[backend] LightRAG insert after ingest:", e)
-
-            asyncio.create_task(_bg_lightrag())
+            asyncio.create_task(schedule_lightrag_index_after_ingest(doc))
 
         return IngestHistoryResponse(ok=True, session_id=session_id)
     except asyncio.TimeoutError:
@@ -1692,13 +1682,12 @@ async def library_notes(req: LibraryNoteRequest, request: Request):
 @api_router.get("/lightrag-context")
 async def lightrag_context(q: str = "", mode: str = "hybrid"):
     """
-    Optional RAG context from LightRAG (knowledge-graph + vector). Use when LightRAG is enabled.
+    Optional LightRAG-only RAG context (disabled by default). Primary retrieval is sqlite-vec via /chat.
     Query param: q=... (required), mode=local|global|hybrid|naive|mix (default hybrid).
     """
     if not (q or "").strip():
         return {"context": ""}
     try:
-        from lightrag_bridge import query_for_context
         context = await query_for_context(q.strip(), mode=mode)
         return {"context": context}
     except Exception as e:

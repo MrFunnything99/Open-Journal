@@ -26,8 +26,8 @@ except ImportError:
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-# Embedding dimension must match Gemini embedding model output (gemini-embedding-2* often returns 3072)
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "3072"))
+# Embedding dimension must match the active embedding model (Perplexity pplx-embed-context-v1-4b full = 2560)
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "2560"))
 # Use VECTOR_DB_PATH in production (e.g. Fly volume) so data persists across deploys
 _default_db = Path(__file__).resolve().parent.parent / "data" / "open_journal.db"
 DB_PATH = Path(os.getenv("VECTOR_DB_PATH", str(_default_db))).resolve()
@@ -56,7 +56,7 @@ def _get_conn() -> sqlite3.Connection:
 
 def _init_db(conn: sqlite3.Connection) -> None:
     """Create vec0 tables and sequence table if they don't exist. Recreates vec tables if embedding_dim changed."""
-    # Persist embedding dim so we can detect dimension changes (e.g. 768 -> 3072)
+    # Persist embedding dim so we can detect dimension changes (e.g. after switching embedding models)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _vec_config (
             key TEXT PRIMARY KEY,

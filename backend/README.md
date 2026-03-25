@@ -1,6 +1,6 @@
 # Selfmeridian Python Backend
 
-Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** for vector memory and **LightRAG** for knowledge-graph RAG. The main app uses **Gemini** (embeddings, memory extraction) and **Grok/XAI** (chat); OpenRouter is optional and used only in some Node-side routes if you enable it.
+Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** as the primary vector memory. **LightRAG** is optional and **off by default** (see `lightrag_bridge.py`). The main app uses **Perplexity** (vector embeddings), **Gemini** (memory extraction and helpers), and **Grok/XAI** (chat); OpenRouter is optional and used only in some Node-side routes if you enable it.
 
 ## Setup (1-time)
 
@@ -22,12 +22,13 @@ cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install 
 
 Copy `.env.example` to `.env` in the project root and set:
 
-- `GEMINI_API_KEY` – for embeddings, memory extraction, date inference (required)
+- `PERPLEXITY_API_KEY` – for vector embeddings (gist / episodic / library search); required for memory retrieval indexing
+- `GEMINI_API_KEY` – for Gemini `generate_content` only: extraction, recommendations helpers, date inference (not embeddings)
 - `XAI_API_KEY` – for interviewer chat (Grok 4.20 reasoning, required for /chat)
 - `GEMINI_CHAT_MODEL` – e.g. `gemini-3-flash-preview` (optional, for date inference etc.; interviewer uses Grok)
-- `GEMINI_EMBEDDING_MODEL` – e.g. `gemini-embedding-2-preview` (optional)
-- `EMBEDDING_DIM` – vector size, default `768` (optional)
-- `LIGHTRAG_ENABLED` – set to `false` to disable LightRAG indexing (optional)
+- `PERPLEXITY_EMBEDDING_MODEL` – default `pplx-embed-context-v1-4b` (contextualized API; use `pplx-embed-v1-4b` for standard `/v1/embeddings` if you switch)
+- `EMBEDDING_DIM` – must match model output (default `2560` for full-size 4B Perplexity embeddings; use Matryoshka `dimensions` in API only if you align this env)
+- `LIGHTRAG_ENABLED` – default `false`; set to `true` to enable optional LightRAG indexing (`lightrag_bridge.py`)
 - `VECTOR_DB_PATH` – full path to SQLite DB file (optional; for production so the vector DB persists)
 - `TAVILY_API_KEY` – optional; when set, News & article recommendations use [Tavily Search](https://docs.tavily.com/welcome) (topic=news) for real article URLs
 - `SEMANTIC_SCHOLAR_API_KEY` – **currently unused**; Semantic Scholar + PubMed are commented out. Research (and all recommendation categories) use Gemini with Google Search grounding for now.
@@ -56,7 +57,7 @@ On macOS, the system Python SQLite may not support extensions; install `pysqlite
 |--------|------|-------------|
 | POST | `/chat` | Send user text, get Interviewer response |
 | POST | `/end-session` | Trigger Librarian to extract & save to SQLite+sqlite-vec and LightRAG |
-| GET | `/lightrag-context?q=...` | Optional RAG context from LightRAG (hybrid/local/global) |
+| GET | `/lightrag-context?q=...` | LightRAG-only context (empty when LightRAG disabled; primary RAG is sqlite-vec in `/chat`) |
 | GET | `/health` | Health check |
 
 ## Fly.io: persistent vector DB

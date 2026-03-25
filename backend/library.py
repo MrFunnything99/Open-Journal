@@ -1,22 +1,34 @@
 """
 Library for Selfmeridian: gist_facts (semantic) and episodic_log (episodic) memory,
 and consumed_content (library). Uses SQLite + sqlite-vec for vector storage.
+
+Embeddings: Perplexity only (`_embed_texts` → PERPLEXITY_API_KEY).
+Extraction / Gemini helpers: `_get_gemini_client` + `generate_content` (GEMINI_API_KEY) — never used for embeddings.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 from dotenv import load_dotenv
-
 from google import genai
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-# Clients (lazy init)
-_embeddings_client: genai.Client | None = None
+# Gemini client for extraction / helpers only — embeddings use Perplexity (`_embed_texts`).
+_gemini_client: genai.Client | None = None
+
+PPLX_EMBEDDINGS_URL = "https://api.perplexity.ai/v1/embeddings"
+PPLX_CONTEXTUAL_EMBEDDINGS_URL = "https://api.perplexity.ai/v1/contextualizedembeddings"
+# Context model: use contextualized endpoint (one chunk per pseudo-document for unrelated texts).
+PPLX_EMBED_BATCH_DOCS = 480
+DEFAULT_PERPLEXITY_EMBEDDING_MODEL = "pplx-embed-context-v1-4b"
 
 
 def _ensure_storage() -> None:
@@ -26,29 +38,108 @@ def _ensure_storage() -> None:
     vec_store.ensure_db()
 
 
-def _get_embeddings_client() -> genai.Client:
-    global _embeddings_client
-    if _embeddings_client is None:
+def _get_gemini_client() -> genai.Client:
+    """Lazy Gemini SDK client for `generate_content` only (extraction, recommendations helpers). Not used for embeddings."""
+    global _gemini_client
+    if _gemini_client is None:
         key = os.getenv("GEMINI_API_KEY")
         if not key:
             raise ValueError(
-                "GEMINI_API_KEY is required for embeddings. See https://ai.google.dev/gemini-api/docs/get-started"
+                "GEMINI_API_KEY is required for Gemini extraction and helper calls (generate_content). "
+                "Embeddings use PERPLEXITY_API_KEY only. See https://ai.google.dev/gemini-api/docs/get-started"
             )
-        _embeddings_client = genai.Client(api_key=key)
-    return _embeddings_client
+        _gemini_client = genai.Client(api_key=key)
+    return _gemini_client
+
+
+def _decode_perplexity_int8_b64(b64: str) -> list[float]:
+    """Decode Perplexity base64_int8 embedding and L2-normalize for cosine search in sqlite-vec."""
+    raw = base64.b64decode(b64)
+    arr = np.frombuffer(raw, dtype=np.int8).astype(np.float32)
+    n = float(np.linalg.norm(arr))
+    if n > 0:
+        arr = arr / n
+    return arr.tolist()
+
+
+def _perplexity_post_json(url: str, payload: dict, api_key: str, timeout_sec: float = 120.0) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        print("[backend] Perplexity embeddings HTTP error:", e.code, err_body[:500])
+        raise
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
     """
-    Embed a batch of texts using Gemini Embedding 2.
-    Returns a list of embedding vectors (one per text).
+    Embed texts via Perplexity (default: pplx-embed-context-v1-4b on contextualized API).
+    Each unrelated string is sent as a single-chunk \"document\" so the context model applies per text.
+    Vectors are L2-normalized float32 for sqlite-vec cosine distance.
     """
     if not texts:
         return []
-    client = _get_embeddings_client()
-    model = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2-preview")
-    result = client.models.embed_content(model=model, contents=texts)
-    return [emb.values for emb in result.embeddings]
+    api_key = (os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError(
+            "PERPLEXITY_API_KEY is required for embeddings. See https://docs.perplexity.ai/docs/getting-started/quickstart"
+        )
+    model = os.getenv("PERPLEXITY_EMBEDDING_MODEL", DEFAULT_PERPLEXITY_EMBEDDING_MODEL).strip()
+    use_contextual = "context" in model.lower()
+
+    def _sanitize(t: str) -> str:
+        s = (t or "").strip()
+        return s if s else " "
+
+    out: list[list[float]] = []
+    for start in range(0, len(texts), PPLX_EMBED_BATCH_DOCS):
+        batch = [_sanitize(t) for t in texts[start : start + PPLX_EMBED_BATCH_DOCS]]
+        if use_contextual:
+            payload = {
+                "model": model,
+                "input": [[t] for t in batch],
+                "encoding_format": "base64_int8",
+            }
+            body = _perplexity_post_json(PPLX_CONTEXTUAL_EMBEDDINGS_URL, payload, api_key)
+            docs = sorted(body.get("data") or [], key=lambda x: x.get("index", 0))
+            if len(docs) != len(batch):
+                raise ValueError(
+                    f"Perplexity contextualized embeddings: expected {len(batch)} documents, got {len(docs)}"
+                )
+            for doc in docs:
+                chunks = sorted(doc.get("data") or [], key=lambda x: x.get("index", 0))
+                if not chunks or "embedding" not in chunks[0]:
+                    raise ValueError("Perplexity contextualized response missing embedding chunk")
+                out.append(_decode_perplexity_int8_b64(chunks[0]["embedding"]))
+        else:
+            payload = {
+                "model": model,
+                "input": batch,
+                "encoding_format": "base64_int8",
+            }
+            body = _perplexity_post_json(PPLX_EMBEDDINGS_URL, payload, api_key)
+            rows = sorted(body.get("data") or [], key=lambda x: x.get("index", 0))
+            if len(rows) != len(batch):
+                raise ValueError(
+                    f"Perplexity embeddings: expected {len(batch)} vectors, got {len(rows)}"
+                )
+            for row in rows:
+                if "embedding" not in row:
+                    raise ValueError("Perplexity embeddings response missing embedding")
+                out.append(_decode_perplexity_int8_b64(row["embedding"]))
+
+    return out
 
 
 def _gemini_response_to_text(result) -> str:
@@ -83,7 +174,7 @@ def _call_gemini(prompt: str) -> str:
     Uses full response text including thought parts so JSON extraction is not lost.
     """
     try:
-        client = _get_embeddings_client()
+        client = _get_gemini_client()
         model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
         result = client.models.generate_content(model=model, contents=prompt)
         text = _gemini_response_to_text(result)
@@ -100,7 +191,7 @@ def _call_gemini_with_google_search(prompt: str) -> str:
     """
     try:
         from google.genai import types
-        client = _get_embeddings_client()
+        client = _get_gemini_client()
         model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         config = types.GenerateContentConfig(tools=[grounding_tool])
@@ -880,7 +971,7 @@ People:
 
 def save_session_data(session_id: str, transcript: str, entry_date: str | None = None, instance_id: str = "") -> dict:
     """
-    Extract summary + facts + metadata from transcript via Gemini, embed via Gemini, save to SQLite+sqlite-vec.
+    Extract summary + facts + metadata from transcript via Gemini; embed with Perplexity; save to SQLite+sqlite-vec.
     Returns {"summary": str, "facts": list[str]} for callers (e.g. LightRAG feed).
     Episodic row also stores metadata_json for future time-series / pattern analysis; metadata is not embedded.
     If entry_date is provided (ISO date or datetime), use it as the stored timestamp; otherwise use now.

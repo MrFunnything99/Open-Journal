@@ -1,6 +1,9 @@
 """
-LightRAG bridge for Selfmeridian: index journal content and run RAG queries (hybrid/local/global).
-Uses the same Gemini embedding and LLM as the rest of the app. Data is stored under data/lightrag/.
+LightRAG bridge (optional, **off by default**).
+
+Selfmeridian’s primary memory path is SQLite + sqlite-vec (`vec_store` / `library.get_relevant_context`).
+This module is isolated here so it can be re-enabled with `LIGHTRAG_ENABLED=true` without touching
+the main retrieval pipeline. When disabled, public helpers return immediately and never import `lightrag`.
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 WORKING_DIR = Path(__file__).resolve().parent.parent / "data" / "lightrag"
-LIGHTRAG_ENABLED = os.getenv("LIGHTRAG_ENABLED", "true").lower() in ("true", "1", "yes")
+LIGHTRAG_ENABLED = os.getenv("LIGHTRAG_ENABLED", "false").lower() in ("true", "1", "yes")
 
 _rag = None
 _rag_ready = False
@@ -35,7 +38,7 @@ def _embed_texts_sync(texts: list[str]) -> list[list[float]]:
 
 
 def _call_gemini_sync(prompt: str, system_prompt: str | None = None, history_messages: list | None = None, **kwargs) -> str:
-    """Call library LLM (sync). history_messages ignored for single-turn."""
+    """Call library Gemini `generate_content` (extraction/chat helpers). Not used for embeddings."""
     from library import _call_gemini
     return _call_gemini(prompt)
 
@@ -66,7 +69,7 @@ async def _get_rag():
         return None
     WORKING_DIR.mkdir(parents=True, exist_ok=True)
     # LightRAG needs EmbeddingFunc with embedding_dim and max_token_size
-    embed_dim = int(os.getenv("EMBEDDING_DIM", "768"))
+    embed_dim = int(os.getenv("EMBEDDING_DIM", "2560"))
     embedding_func = EmbeddingFunc(
         embedding_dim=embed_dim,
         max_token_size=8192,
@@ -91,9 +94,23 @@ async def _get_rag():
     return rag
 
 
+async def schedule_lightrag_index_after_ingest(doc: str) -> None:
+    """
+    Background hook after session ingest: index summary+facts into LightRAG only when enabled.
+    No-op when `LIGHTRAG_ENABLED` is false (default). Safe to `asyncio.create_task(...)` from FastAPI.
+    """
+    if not LIGHTRAG_ENABLED or not (doc or "").strip():
+        return
+    try:
+        await insert_text(doc.strip())
+    except Exception as e:
+        if "GenericAlias" not in str(e) and "NoneType" not in str(e):
+            print("[backend] LightRAG schedule_lightrag_index_after_ingest:", e)
+
+
 async def insert_text(text: str) -> bool:
     """Index text into LightRAG (e.g. session summary or transcript). Returns True if inserted."""
-    if not text or not text.strip():
+    if not LIGHTRAG_ENABLED or not text or not text.strip():
         return False
     rag = await _get_rag()
     if rag is None:
@@ -115,8 +132,9 @@ async def query_for_context(query: str, mode: str = "hybrid", top_k: int = 20) -
     """
     Run LightRAG query with only_need_context=True and return the retrieved context string.
     mode: local | global | hybrid | naive | mix
+    Returns "" when LightRAG is disabled or unavailable.
     """
-    if not query or not query.strip():
+    if not LIGHTRAG_ENABLED or not query or not query.strip():
         return ""
     rag = await _get_rag()
     if rag is None:
