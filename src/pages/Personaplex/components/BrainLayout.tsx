@@ -1,4 +1,5 @@
 import { FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { backendFetch } from "../../../backendApi";
 import type { ChatMessage, JournalEntry } from "../hooks/useJournalHistory";
 import { formatCalendarDayHeading, localCalendarDayKey } from "../knowledgeBaseMarkdownZip";
 
@@ -208,6 +209,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   }, [onPrepareJournalDumpUpload]);
   const [journalEditing, setJournalEditing] = useState(false);
   const [journalDraft, setJournalDraft] = useState<ChatMessage[]>([]);
+  const [writingHints, setWritingHints] = useState<{
+    similar_past_entries?: { excerpt: string; date?: string }[];
+    insights?: { insight_text?: string; insight_kind?: string }[];
+    patterns?: { summary?: string; window_label?: string }[];
+  } | null>(null);
+  const [writingHintsLoading, setWritingHintsLoading] = useState(false);
 
   const journalSorted = useMemo(() => {
     const list = entries.filter((e) => !isConversationEntry(e));
@@ -335,6 +342,44 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
     setJournalEditing(false);
     setJournalDraft([]);
   }, [selectedTranscript?.id]);
+
+  const draftPlainForHints = useMemo(
+    () =>
+      journalDraft
+        .filter((m) => m.role === "user")
+        .map((m) => m.text)
+        .join("\n")
+        .trim(),
+    [journalDraft],
+  );
+
+  useEffect(() => {
+    if (!journalEditing || !selectedTranscript) {
+      setWritingHints(null);
+      setWritingHintsLoading(false);
+      return;
+    }
+    if (!draftPlainForHints) {
+      setWritingHints(null);
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      setWritingHintsLoading(true);
+      backendFetch("/memory/writing-hints", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draft: draftPlainForHints.slice(0, 8000) }),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (data && typeof data === "object") setWritingHints(data);
+          else setWritingHints(null);
+        })
+        .catch(() => setWritingHints(null))
+        .finally(() => setWritingHintsLoading(false));
+    }, 700);
+    return () => window.clearTimeout(handle);
+  }, [journalEditing, selectedTranscript?.id, draftPlainForHints]);
 
   const selectedLibrary = useMemo(() => {
     if (selection?.kind !== "library") return null;
@@ -943,6 +988,46 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 <p className="mb-6 text-sm text-gray-600 dark:text-white/70">
                   Editing — use <span className="font-medium">Save changes</span> to keep edits, or the pencil to discard.
                 </p>
+              ) : null}
+              {journalEditing && (writingHintsLoading || (writingHints && (writingHints.similar_past_entries?.length || writingHints.insights?.length || writingHints.patterns?.length))) ? (
+                <aside className="mb-6 max-w-3xl rounded-xl border border-gray-200 bg-gray-50/80 p-4 text-sm text-gray-700 dark:border-gray-600 dark:bg-[#343541]/90 dark:text-gray-200">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">Memory-informed continuations</p>
+                  {writingHintsLoading && !writingHints ? <p className="text-xs text-gray-500 dark:text-gray-400">Looking for related past entries…</p> : null}
+                  {writingHints?.similar_past_entries && writingHints.similar_past_entries.length > 0 ? (
+                    <div className="mb-3 space-y-2">
+                      <p className="text-xs font-medium text-gray-600 dark:text-gray-300">Resembles past journal themes</p>
+                      <ul className="list-disc pl-4 space-y-1.5 text-xs leading-relaxed text-gray-600 dark:text-gray-400">
+                        {writingHints.similar_past_entries.map((row, i) => (
+                          <li key={i}>
+                            {row.date ? <span className="tabular-nums text-gray-500 dark:text-gray-500">{row.date.slice(0, 10)}: </span> : null}
+                            {(row.excerpt || "").slice(0, 320)}
+                            {(row.excerpt || "").length > 320 ? "…" : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                  {writingHints?.patterns && writingHints.patterns.length > 0 ? (
+                    <div className="mb-3 space-y-1">
+                      <p className="text-xs font-medium text-gray-600 dark:text-gray-300">Patterns across recent entries</p>
+                      {writingHints.patterns.map((p, i) => (
+                        <p key={i} className="text-xs leading-relaxed text-gray-600 dark:text-gray-400">
+                          {(p.summary || "").slice(0, 400)}
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
+                  {writingHints?.insights && writingHints.insights.length > 0 ? (
+                    <div className="space-y-1">
+                      <p className="text-xs font-medium text-gray-600 dark:text-gray-300">Reflections (optional prompts)</p>
+                      <ul className="list-disc pl-4 space-y-1 text-xs text-gray-600 dark:text-gray-400">
+                        {writingHints.insights.slice(0, 4).map((ins, i) => (
+                          <li key={i}>{(ins.insight_text || "").slice(0, 280)}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </aside>
               ) : null}
               <div className="max-w-3xl space-y-8 text-[15px] md:text-base leading-[1.75] text-gray-800 dark:text-gray-200 font-sans">
                 {journalEditing

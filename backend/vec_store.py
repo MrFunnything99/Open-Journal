@@ -1,12 +1,14 @@
 """
-SQLite + sqlite-vec storage for Selfmeridian: gist_facts, episodic_log, consumed_content.
-Replaces ChromaDB with a single SQLite DB and vec0 virtual tables for vector search.
+SQLite + sqlite-vec storage for Selfmeridian: journal chunks (vec_journal), consumed_content, people, auth.
+Journal memory is raw text chunked + embedded; no separate gist/episodic tables.
 """
 from __future__ import annotations
 
+import functools
 import os
 import sys
 import datetime
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -33,6 +35,17 @@ _default_db = Path(__file__).resolve().parent.parent / "data" / "open_journal.db
 DB_PATH = Path(os.getenv("VECTOR_DB_PATH", str(_default_db))).resolve()
 
 _conn: sqlite3.Connection | None = None
+# Single shared connection + check_same_thread=False: serialize all use (ingest, chat, etc.).
+_SQLITE_CONN_LOCK = threading.RLock()
+
+
+def _sqlite_serialized(fn):
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with _SQLITE_CONN_LOCK:
+            return fn(*args, **kwargs)
+
+    return _wrapped
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -43,20 +56,45 @@ def _get_conn() -> sqlite3.Connection:
         raise RuntimeError(
             "sqlite-vec is required. Install with: pip install sqlite-vec"
         )
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
-    conn.enable_load_extension(False)
-    conn.row_factory = sqlite3.Row
-    _conn = conn
-    _init_db(conn)
-    return conn
+    with _SQLITE_CONN_LOCK:
+        if _conn is not None:
+            return _conn
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        conn.row_factory = sqlite3.Row
+        _init_db(conn)
+        _conn = conn
+        return _conn
+
+
+def _legacy_memory_drop(conn: sqlite3.Connection) -> None:
+    """One-time migration: remove gist/episodic/profile/extraction tables."""
+    for tbl in (
+        "vec_gist",
+        "vec_episodic",
+        "memory_facts",
+        "memory_episodic",
+        "ingest_meta",
+        "extraction_artifact",
+        "user_media_profile",
+        "pattern_memory",
+        "derived_insights",
+    ):
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+        except Exception:
+            pass
+    try:
+        conn.execute("DELETE FROM _vec_seq WHERE name IN ('gist', 'episodic')")
+    except sqlite3.OperationalError:
+        pass
 
 
 def _init_db(conn: sqlite3.Connection) -> None:
-    """Create vec0 tables and sequence table if they don't exist. Recreates vec tables if embedding_dim changed."""
-    # Persist embedding dim so we can detect dimension changes (e.g. after switching embedding models)
+    """Create vec0 tables and journal tables. Migrates away from legacy gist/episodic once."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _vec_config (
             key TEXT PRIMARY KEY,
@@ -65,57 +103,97 @@ def _init_db(conn: sqlite3.Connection) -> None:
     """)
     cur = conn.execute("SELECT value FROM _vec_config WHERE key = 'embedding_dim'")
     row = cur.fetchone()
-    vec_gist_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_gist'"
+    vec_journal_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_journal'"
     ).fetchone() is not None
     need_recreate = (row is not None and row[0] != EMBEDDING_DIM) or (
-        row is None and vec_gist_exists
+        row is None and vec_journal_exists
     )
     if need_recreate:
-        # Dimension changed or old DB without _vec_config: drop vec and memory tables
-        for tbl in ("vec_gist", "vec_episodic", "vec_consumed", "memory_facts", "memory_episodic"):
+        for tbl in ("vec_journal", "vec_consumed"):
             try:
                 conn.execute(f"DROP TABLE IF EXISTS {tbl}")
             except Exception:
                 pass
-        conn.execute("DELETE FROM _vec_seq WHERE name IN ('gist', 'episodic')")
     conn.execute(
         "INSERT OR REPLACE INTO _vec_config (key, value) VALUES ('embedding_dim', ?)",
         (EMBEDDING_DIM,),
     )
 
-    # Sequence for gist/episodic integer ids
+    ms_row = conn.execute(
+        "SELECT value FROM _vec_config WHERE key = 'memory_schema_v2'"
+    ).fetchone()
+    if ms_row is None or int(ms_row[0]) != 1:
+        _legacy_memory_drop(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO _vec_config (key, value) VALUES ('memory_schema_v2', 1)"
+        )
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _vec_seq (
             name TEXT PRIMARY KEY,
             val INTEGER NOT NULL DEFAULT 0
         )
     """)
-    for name in ("gist", "episodic"):
-        conn.execute(
-            "INSERT OR IGNORE INTO _vec_seq (name, val) VALUES (?, 0)",
-            (name,),
-        )
 
-    # Gist facts: id, embedding, session_id, timestamp, document
-    conn.execute(f"""
-        CREATE VIRTUAL TABLE IF NOT EXISTS vec_gist USING vec0(
-            doc_id INTEGER PRIMARY KEY,
-            embedding float[{EMBEDDING_DIM}] distance_metric=cosine,
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS journal_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT,
-            timestamp TEXT,
-            +document TEXT
+            instance_id TEXT NOT NULL DEFAULT '',
+            entry_date TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            char_count INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_journal_entries_instance ON journal_entries(instance_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_journal_entries_session ON journal_entries(instance_id, session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_journal_entries_date ON journal_entries(entry_date)"
+    )
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS journal_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id INTEGER NOT NULL,
+            instance_id TEXT NOT NULL DEFAULT '',
+            chunk_index INTEGER NOT NULL,
+            chunk_text TEXT NOT NULL,
+            entry_date TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (entry_id) REFERENCES journal_entries(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_journal_chunks_instance ON journal_chunks(instance_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_journal_chunks_entry ON journal_chunks(entry_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_journal_chunks_date ON journal_chunks(entry_date)"
+    )
+
+    conn.execute(f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_journal USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding float[{EMBEDDING_DIM}] distance_metric=cosine,
+            instance_id TEXT,
+            entry_date TEXT,
+            +chunk_text TEXT
         )
     """)
 
-    # Episodic log: same shape
-    conn.execute(f"""
-        CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodic USING vec0(
-            doc_id INTEGER PRIMARY KEY,
-            embedding float[{EMBEDDING_DIM}] distance_metric=cosine,
-            session_id TEXT,
-            timestamp TEXT,
-            +document TEXT
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS instance_settings (
+            instance_id TEXT PRIMARY KEY,
+            preferences_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
         )
     """)
 
@@ -152,34 +230,12 @@ def _init_db(conn: sqlite3.Connection) -> None:
         )
     """)
 
-    # Canonical list of gist/episodic for UI and edits (id = doc_id used in vec tables)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS memory_facts (
-            id INTEGER PRIMARY KEY,
-            document TEXT NOT NULL,
-            session_id TEXT,
-            timestamp TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS memory_episodic (
-            id INTEGER PRIMARY KEY,
-            document TEXT NOT NULL,
-            session_id TEXT,
-            timestamp TEXT
-        )
-    """)
-    # Optional structured metadata for time-series / pattern analysis (backwards compatible)
     try:
-        conn.execute("ALTER TABLE memory_episodic ADD COLUMN metadata_json TEXT")
+        conn.execute(
+            "ALTER TABLE consumed_meta ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''"
+        )
     except sqlite3.OperationalError:
-        pass  # column already exists
-    # Optional instance isolation (X-Instance-ID): each instance only sees/writes its own rows
-    for tbl, col in (("memory_facts", "instance_id"), ("memory_episodic", "instance_id"), ("consumed_meta", "instance_id")):
-        try:
-            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        pass
 
     # Simple login (no email): username + password_hash for persistent data (legacy)
     conn.execute("""
@@ -259,7 +315,76 @@ def _init_db(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    _ensure_extraction_and_ingest_schema(conn)
     conn.commit()
+
+
+def _ensure_extraction_and_ingest_schema(conn: sqlite3.Connection) -> None:
+    """Migrations: rec feedback, decision log, content feedback."""
+    for tbl in (
+        """
+        CREATE TABLE IF NOT EXISTS rec_feedback_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL,
+            content_type TEXT,
+            topic_tags TEXT,
+            intent_context TEXT,
+            item_title TEXT,
+            created_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+            instance_id TEXT NOT NULL DEFAULT '',
+            session_id TEXT,
+            action_type TEXT NOT NULL,
+            input_summary TEXT,
+            retrieved_items TEXT,
+            llm_prompt_summary TEXT,
+            llm_response TEXT,
+            final_output TEXT,
+            reasoning_notes TEXT,
+            duration_ms INTEGER,
+            model_used TEXT,
+            search_api_calls TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS content_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+            instance_id TEXT NOT NULL DEFAULT '',
+            content_url TEXT,
+            content_title TEXT,
+            content_type TEXT,
+            feedback TEXT NOT NULL,
+            user_notes TEXT,
+            extracted_tags TEXT,
+            extracted_reasoning TEXT,
+            connected_journal_themes TEXT
+        )
+        """,
+    ):
+        conn.execute(tbl)
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decision_log_instance_ts ON decision_log(instance_id, timestamp)"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_log_action ON decision_log(action_type)")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_feedback_instance ON content_feedback(instance_id, timestamp)"
+        )
+    except sqlite3.OperationalError:
+        pass
 
 
 def _next_id(conn: sqlite3.Connection, name: str) -> int:
@@ -280,11 +405,13 @@ def _blob_from_floats(emb: list[float]) -> bytes:
     return struct.pack(f"{len(emb)}f", *emb)
 
 
+@_sqlite_serialized
 def ensure_db() -> None:
     """Ensure DB and tables exist (idempotent)."""
     _get_conn()
 
 
+@_sqlite_serialized
 def auth_user_create(username: str, password_hash: str, salt: str) -> int | None:
     """Create a user; return user id or None if username taken."""
     conn = _get_conn()
@@ -300,6 +427,7 @@ def auth_user_create(username: str, password_hash: str, salt: str) -> int | None
         return None
 
 
+@_sqlite_serialized
 def auth_user_get_by_username(username: str) -> dict | None:
     """Return {id, username, password_hash, salt} or None."""
     conn = _get_conn()
@@ -312,6 +440,7 @@ def auth_user_get_by_username(username: str) -> dict | None:
     return {"id": row[0], "username": row[1], "password_hash": row[2], "salt": row[3]}
 
 
+@_sqlite_serialized
 def user_create(email: str, hashed_password: str) -> int | None:
     """Create user (email + passlib hash). Return user id or None if email taken."""
     conn = _get_conn()
@@ -327,6 +456,7 @@ def user_create(email: str, hashed_password: str) -> int | None:
         return None
 
 
+@_sqlite_serialized
 def user_get_by_email(email: str) -> dict | None:
     """Return {id, email, hashed_password} or None."""
     conn = _get_conn()
@@ -343,6 +473,7 @@ def user_get_by_email(email: str) -> dict | None:
 ANONYMOUS_EMAIL_SUFFIX = "@anonymous.local"
 
 
+@_sqlite_serialized
 def user_get_by_email_or_username(identifier: str) -> dict | None:
     """Look up by email or by username (tries identifier then identifier@anonymous.local). Return {id, email, hashed_password} or None."""
     ident = identifier.strip().lower()
@@ -354,417 +485,867 @@ def user_get_by_email_or_username(identifier: str) -> dict | None:
     return user
 
 
-def _instance_where(instance_id: str, table: str = "memory_facts") -> tuple[str, list]:
+def _instance_where(instance_id: str, table: str = "journal_entries") -> tuple[str, list]:
     """Return (WHERE clause fragment, params) for instance scoping. instance_id '' = legacy shared rows."""
     if not instance_id:
         return ("(instance_id = '' OR instance_id IS NULL)", [])
     return ("instance_id = ?", [instance_id])
 
 
-def add_gist(session_id: str, timestamp: str, document: str, embedding: list[float], instance_id: str = "") -> int:
-    """Insert gist fact; return stable id (doc_id) for later update/delete."""
+@_sqlite_serialized
+def instance_settings_get(instance_id: str) -> dict:
     conn = _get_conn()
-    doc_id = _next_id(conn, "gist")
-    blob = _blob_from_floats(embedding)
+    row = conn.execute(
+        "SELECT preferences_json FROM instance_settings WHERE instance_id = ?",
+        (instance_id or "",),
+    ).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        import json
+
+        return json.loads(row[0]) if isinstance(row[0], str) else {}
+    except Exception:
+        return {}
+
+
+@_sqlite_serialized
+def instance_settings_merge_json(instance_id: str, patch: dict) -> None:
+    import json
+
+    conn = _get_conn()
+    cur = instance_settings_get(instance_id)
+    for k, v in patch.items():
+        if v is None:
+            cur.pop(k, None)
+        else:
+            cur[k] = v
+    now = datetime.datetime.utcnow().isoformat() + "Z"
     conn.execute(
         """
-        INSERT INTO vec_gist (doc_id, embedding, session_id, timestamp, document)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO instance_settings (instance_id, preferences_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(instance_id) DO UPDATE SET
+            preferences_json = excluded.preferences_json,
+            updated_at = excluded.updated_at
         """,
-        (doc_id, blob, session_id, timestamp, document),
+        (instance_id or "", json.dumps(cur, ensure_ascii=False), now),
     )
-    try:
-        conn.execute(
-            "INSERT INTO memory_facts (id, document, session_id, timestamp, instance_id) VALUES (?, ?, ?, ?, ?)",
-            (doc_id, document, session_id, timestamp, instance_id or ""),
-        )
-    except sqlite3.OperationalError:
-        conn.execute(
-            "INSERT INTO memory_facts (id, document, session_id, timestamp) VALUES (?, ?, ?, ?)",
-            (doc_id, document, session_id, timestamp),
-        )
     conn.commit()
-    return doc_id
 
 
-def add_episodic(
-    session_id: str,
-    timestamp: str,
-    document: str,
-    embedding: list[float],
-    metadata_json: str | None = None,
-    instance_id: str = "",
+@_sqlite_serialized
+def instance_settings_get_with_meta(instance_id: str) -> tuple[dict, str | None]:
+    """Return (parsed preferences dict, updated_at or None)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT preferences_json, updated_at FROM instance_settings WHERE instance_id = ?",
+        (instance_id or "",),
+    ).fetchone()
+    if not row:
+        return {}, None
+    try:
+        import json
+
+        d = json.loads(row[0]) if row[0] and isinstance(row[0], str) else {}
+    except Exception:
+        d = {}
+    return d, (row[1] if len(row) > 1 else None)
+
+
+@_sqlite_serialized
+def user_media_profile_get(instance_id: str) -> dict:
+    """Legacy alias for instance_settings JSON prefs."""
+    return instance_settings_get(instance_id)
+
+
+@_sqlite_serialized
+def user_media_profile_merge_json(instance_id: str, patch: dict) -> None:
+    """Legacy alias for instance_settings."""
+    instance_settings_merge_json(instance_id, patch)
+
+
+@_sqlite_serialized
+def pattern_memory_add(
+    instance_id: str,
+    window_label: str,
+    summary: str,
+    structured_tags: str | None = None,
+    valid_from: str | None = None,
+    valid_to: str | None = None,
 ) -> int:
-    """Insert episodic summary; return stable id (doc_id). metadata_json is optional structured JSON."""
+    return 0
+
+
+@_sqlite_serialized
+def pattern_memory_recent(instance_id: str, limit: int = 5) -> list[dict]:
+    return []
+
+
+@_sqlite_serialized
+def derived_insights_list_active(instance_id: str, limit: int = 20) -> list[dict]:
+    return []
+
+
+@_sqlite_serialized
+def derived_insight_add(
+    instance_id: str, text: str, kind: str | None = None, pattern_ids: str | None = None
+) -> int:
+    return 0
+
+
+@_sqlite_serialized
+def derived_insight_dismiss(insight_id: int, instance_id: str) -> bool:
+    return False
+
+
+@_sqlite_serialized
+def journal_delete_by_session(instance_id: str, session_id: str) -> None:
+    """Remove journal entry + chunks + vectors for (instance_id, session_id)."""
+    if not session_id:
+        return
     conn = _get_conn()
-    doc_id = _next_id(conn, "episodic")
-    blob = _blob_from_floats(embedding)
+    inst = instance_id or ""
+    rows = conn.execute(
+        """
+        SELECT id FROM journal_entries
+        WHERE session_id = ? AND (instance_id = ? OR (? = '' AND (instance_id = '' OR instance_id IS NULL)))
+        """,
+        (session_id, inst, inst),
+    ).fetchall()
+    for (eid,) in rows:
+        chunk_ids = [
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM journal_chunks WHERE entry_id = ?", (eid,)
+            ).fetchall()
+        ]
+        for cid in chunk_ids:
+            conn.execute("DELETE FROM vec_journal WHERE chunk_id = ?", (cid,))
+        conn.execute("DELETE FROM journal_chunks WHERE entry_id = ?", (eid,))
     conn.execute(
         """
-        INSERT INTO vec_episodic (doc_id, embedding, session_id, timestamp, document)
+        DELETE FROM journal_entries
+        WHERE session_id = ? AND (instance_id = ? OR (? = '' AND (instance_id = '' OR instance_id IS NULL)))
+        """,
+        (session_id, inst, inst),
+    )
+    conn.commit()
+
+
+@_sqlite_serialized
+def journal_entry_insert(
+    *,
+    instance_id: str,
+    session_id: str,
+    entry_date: str,
+    raw_text: str,
+) -> int:
+    """Insert journal entry row; returns id. Caller adds chunks + vec rows."""
+    conn = _get_conn()
+    ed = (entry_date or "")[:10]
+    conn.execute(
+        """
+        INSERT INTO journal_entries (session_id, instance_id, entry_date, raw_text, char_count)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (doc_id, blob, session_id, timestamp, document),
+        (
+            session_id or "",
+            instance_id or "",
+            ed,
+            raw_text or "",
+            len(raw_text or ""),
+        ),
     )
-    try:
-        conn.execute(
-            "INSERT INTO memory_episodic (id, document, session_id, timestamp, metadata_json, instance_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (doc_id, document, session_id, timestamp, metadata_json, instance_id or ""),
-        )
-    except sqlite3.OperationalError:
-        conn.execute(
-            "INSERT INTO memory_episodic (id, document, session_id, timestamp, metadata_json) VALUES (?, ?, ?, ?, ?)",
-            (doc_id, document, session_id, timestamp, metadata_json),
-        )
     conn.commit()
-    return doc_id
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    return int(row[0]) if row and row[0] else 0
 
 
-def query_gist(embedding: list[float], k: int, instance_id: str = "") -> list[str]:
-    """Return top-k gist document strings by cosine similarity. Optional instance_id scopes to that instance."""
+@_sqlite_serialized
+def journal_chunk_insert(
+    entry_id: int,
+    *,
+    instance_id: str,
+    chunk_index: int,
+    chunk_text: str,
+    entry_date: str,
+    embedding: list[float],
+) -> int:
+    """Insert chunk + vec_journal row; returns chunk id."""
     conn = _get_conn()
-    blob = _blob_from_floats(embedding)
-    fetch_k = (k * 4 + 20) if instance_id else k
-    rows = conn.execute(
+    ed = (entry_date or "")[:10]
+    conn.execute(
         """
-        SELECT doc_id, document
-        FROM vec_gist
-        WHERE embedding MATCH ? AND k = ?
+        INSERT INTO journal_chunks (entry_id, instance_id, chunk_index, chunk_text, entry_date)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (blob, fetch_k),
-    ).fetchall()
-    if not instance_id:
-        return [r[1] for r in rows if r[1]][:k]
-    allowed = set(
-        r[0] for r in conn.execute(
-            "SELECT id FROM memory_facts WHERE instance_id = ?", (instance_id,)
-        ).fetchall()
+        (entry_id, instance_id or "", chunk_index, chunk_text or "", ed),
     )
-    out = []
-    for doc_id, doc in rows:
-        if doc_id in allowed and doc:
-            out.append(doc)
-            if len(out) >= k:
-                break
-    return out
+    conn.commit()
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    cid = int(row[0]) if row and row[0] else 0
+    if cid and embedding:
+        blob = _blob_from_floats(embedding)
+        conn.execute(
+            """
+            INSERT INTO vec_journal (chunk_id, embedding, instance_id, entry_date, chunk_text)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (cid, blob, instance_id or "", ed, chunk_text or ""),
+        )
+        conn.commit()
+    return cid
 
 
-def query_gist_nearest(
-    embedding: list[float], k: int = 1
-) -> list[tuple[int, str, float]]:
-    """Return top-k gist rows as (doc_id, document, distance). Uses cosine distance (lower = more similar)."""
+@_sqlite_serialized
+def query_journal_chunks(
+    embedding: list[float],
+    instance_id: str,
+    k: int = 8,
+    *,
+    max_distance: float | None = None,
+) -> list[dict]:
+    """Vector nearest journal chunks for instance. Each dict: chunk_text, entry_date, distance, chunk_id, entry_id."""
     conn = _get_conn()
     blob = _blob_from_floats(embedding)
+    fetch_k = max(k * 10, 32)
     rows = conn.execute(
         """
-        SELECT doc_id, document, distance
-        FROM vec_gist
-        WHERE embedding MATCH ? AND k = ?
-        """,
-        (blob, k),
-    ).fetchall()
-    return [(r[0], r[1] or "", r[2]) for r in rows]
-
-
-def query_episodic(embedding: list[float], k: int, instance_id: str = "") -> list[str]:
-    """Return top-k episodic document strings by cosine similarity. Optional instance_id scopes to that instance."""
-    conn = _get_conn()
-    blob = _blob_from_floats(embedding)
-    fetch_k = (k * 4 + 20) if instance_id else k
-    rows = conn.execute(
-        """
-        SELECT doc_id, document
-        FROM vec_episodic
+        SELECT chunk_id, chunk_text, entry_date, distance
+        FROM vec_journal
         WHERE embedding MATCH ? AND k = ?
         """,
         (blob, fetch_k),
     ).fetchall()
-    if not instance_id:
-        return [r[1] for r in rows if r[1]][:k]
-    allowed = set(
-        r[0] for r in conn.execute(
-            "SELECT id FROM memory_episodic WHERE instance_id = ?", (instance_id,)
-        ).fetchall()
-    )
-    out = []
-    for doc_id, doc in rows:
-        if doc_id in allowed and doc:
-            out.append(doc)
-            if len(out) >= k:
-                break
+    inst = instance_id or ""
+    out: list[dict] = []
+    for r in rows:
+        cid = int(r[0])
+        text = r[1] or ""
+        ed = r[2] or ""
+        dist = float(r[3])
+        if max_distance is not None and dist > max_distance:
+            continue
+        row_inst = conn.execute(
+            "SELECT instance_id, entry_id FROM journal_chunks WHERE id = ?", (cid,)
+        ).fetchone()
+        if not row_inst:
+            continue
+        row_i, eid = row_inst[0] or "", int(row_inst[1])
+        if inst:
+            if (row_i or "") != inst:
+                continue
+        elif row_i not in ("", None):
+            continue
+        out.append(
+            {
+                "chunk_id": cid,
+                "entry_id": eid,
+                "chunk_text": text,
+                "entry_date": ed,
+                "distance": dist,
+            }
+        )
+        if len(out) >= k:
+            break
     return out
 
 
-def query_episodic_with_timestamp(embedding: list[float], k: int, instance_id: str = "") -> list[tuple[str, str]]:
-    """Return top-k (document, timestamp) by cosine similarity. Optional instance_id scopes results."""
-    conn = _get_conn()
-    blob = _blob_from_floats(embedding)
-    fetch_k = (k * 4 + 20) if instance_id else k
-    rows = conn.execute(
-        """
-        SELECT doc_id, document, timestamp
-        FROM vec_episodic
-        WHERE embedding MATCH ? AND k = ?
-        """,
-        (blob, fetch_k),
-    ).fetchall()
-    if not instance_id:
-        return [(r[1] or "", r[2] or "") for r in rows if r[1]][:k]
-    allowed = set(r[0] for r in conn.execute("SELECT id FROM memory_episodic WHERE instance_id = ?", (instance_id,)).fetchall())
-    out = []
-    for doc_id, doc, ts in rows:
-        if doc_id in allowed and doc:
-            out.append((doc, ts or ""))
-            if len(out) >= k:
-                break
-    return out
-
-
-def query_gist_with_timestamp(embedding: list[float], k: int, instance_id: str = "") -> list[tuple[str, str]]:
-    """Return top-k (document, timestamp) by cosine similarity. Optional instance_id scopes results."""
-    conn = _get_conn()
-    blob = _blob_from_floats(embedding)
-    fetch_k = (k * 4 + 20) if instance_id else k
-    rows = conn.execute(
-        """
-        SELECT doc_id, document, timestamp
-        FROM vec_gist
-        WHERE embedding MATCH ? AND k = ?
-        """,
-        (blob, fetch_k),
-    ).fetchall()
-    if not instance_id:
-        return [(r[1] or "", r[2] or "") for r in rows if r[1]][:k]
-    allowed = set(r[0] for r in conn.execute("SELECT id FROM memory_facts WHERE instance_id = ?", (instance_id,)).fetchall())
-    out = []
-    for doc_id, doc, ts in rows:
-        if doc_id in allowed and doc:
-            out.append((doc, ts or ""))
-            if len(out) >= k:
-                break
-    return out
-
-
-def get_all_gist(instance_id: str = "") -> list[str]:
-    """Return all gist documents (for visualization); from canonical memory_facts."""
+@_sqlite_serialized
+def journal_entries_for_date_range(
+    instance_id: str, start_date: str, end_date: str, limit: int = 20
+) -> list[dict]:
+    """Journal entries with entry_date between start and end (YYYY-MM-DD), chronological."""
     conn = _get_conn()
     where, params = _instance_where(instance_id)
-    rows = conn.execute(
-        f"SELECT document FROM memory_facts WHERE {where} ORDER BY id",
-        params,
-    ).fetchall()
-    return [r[0] for r in rows if r[0]]
-
-
-def get_all_episodic(instance_id: str = "") -> list[str]:
-    """Return all episodic documents (for visualization); from canonical memory_episodic."""
-    conn = _get_conn()
-    where, params = _instance_where(instance_id, "memory_episodic")
-    rows = conn.execute(
-        f"SELECT document FROM memory_episodic WHERE {where} ORDER BY id",
-        params,
-    ).fetchall()
-    return [r[0] for r in rows if r[0]]
-
-
-def list_gist_with_ids(instance_id: str = "") -> list[dict]:
-    """Return all gist facts with id, document, session_id, timestamp for Memory UI."""
-    conn = _get_conn()
-    where, params = _instance_where(instance_id)
-    rows = conn.execute(
-        f"SELECT id, document, session_id, timestamp FROM memory_facts WHERE {where} ORDER BY id DESC",
-        params,
-    ).fetchall()
-    return [
-        {"id": r[0], "document": r[1] or "", "session_id": r[2] or "", "timestamp": r[3] or ""}
-        for r in rows
-    ]
-
-
-def list_episodic_with_ids(instance_id: str = "") -> list[dict]:
-    """Return all episodic summaries with id, document, session_id, timestamp, metadata_json for Memory UI."""
-    conn = _get_conn()
-    where, params = _instance_where(instance_id, "memory_episodic")
+    lim = max(1, min(limit, 200))
     try:
         rows = conn.execute(
-            f"SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic WHERE {where} ORDER BY id DESC",
-            params,
+            f"""
+            SELECT id, raw_text, session_id, entry_date, created_at
+            FROM journal_entries
+            WHERE date(entry_date) >= date(?) AND date(entry_date) <= date(?) AND {where}
+            ORDER BY entry_date ASC, id ASC
+            LIMIT ?
+            """,
+            [start_date[:10], end_date[:10], *params, lim],
         ).fetchall()
     except sqlite3.OperationalError:
-        rows = conn.execute(
-            f"SELECT id, document, session_id, timestamp FROM memory_episodic WHERE {where} ORDER BY id DESC",
-            params,
-        ).fetchall()
-        rows = [(*r, None) for r in rows]
+        return []
     return [
         {
             "id": r[0],
             "document": r[1] or "",
             "session_id": r[2] or "",
             "timestamp": r[3] or "",
-            "metadata_json": r[4] if len(r) > 4 else None,
+            "metadata_json": None,
+            "created_at": r[4] if len(r) > 4 else None,
         }
         for r in rows
     ]
 
 
-def get_episodic_for_date(date_iso: str, instance_id: str = "") -> list[dict]:
-    """Return episodic summaries whose timestamp falls on the given date (YYYY-MM-DD)."""
-    if not date_iso or len(date_iso) < 10:
-        return []
+@_sqlite_serialized
+def journal_this_day_in_history(
+    instance_id: str, month_day: str | None = None, years_back: int = 5
+) -> list[dict]:
+    """Entries where strftime('%m-%d', entry_date) matches month_day; excludes current calendar year."""
+    if not month_day or len(month_day) < 5:
+        now = datetime.datetime.utcnow()
+        month_day = now.strftime("%m-%d")
+    md = month_day.strip()[:5]
+    if len(md) == 4 and md[2] != "-":
+        md = md[:2] + "-" + md[2:]
+    cur_year = datetime.datetime.utcnow().year
+    oldest_year = cur_year - max(1, min(years_back, 50))
     conn = _get_conn()
-    where, params = _instance_where(instance_id, "memory_episodic")
-    params = [date_iso[:10]] + params
+    where, params = _instance_where(instance_id)
     try:
         rows = conn.execute(
-            f"SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic WHERE date(timestamp) = ? AND {where} ORDER BY timestamp DESC",
-            params,
+            f"""
+            SELECT id, raw_text, session_id, entry_date, created_at
+            FROM journal_entries
+            WHERE strftime('%m-%d', entry_date) = ?
+            AND CAST(strftime('%Y', entry_date) AS INTEGER) < ?
+            AND CAST(strftime('%Y', entry_date) AS INTEGER) >= ?
+            AND {where}
+            ORDER BY entry_date ASC
+            """,
+            [md, cur_year, oldest_year, *params],
         ).fetchall()
     except sqlite3.OperationalError:
-        where2, params2 = _instance_where(instance_id, "memory_episodic")
-        all_rows = conn.execute(
-            f"SELECT id, document, session_id, timestamp FROM memory_episodic WHERE {where2} ORDER BY id DESC",
-            params2,
-        ).fetchall()
-        out = []
-        for r in all_rows:
-            ts = (r[3] or "")[:10]
-            if ts == date_iso[:10]:
-                out.append({"id": r[0], "document": r[1] or "", "session_id": r[2] or "", "timestamp": r[3] or "", "metadata_json": None})
-        return out
+        return []
     return [
-        {"id": r[0], "document": r[1] or "", "session_id": r[2] or "", "timestamp": r[3] or "", "metadata_json": r[4] if len(r) > 4 else None}
+        {
+            "id": r[0],
+            "document": r[1] or "",
+            "session_id": r[2] or "",
+            "timestamp": r[3] or "",
+            "metadata_json": None,
+        }
         for r in rows
     ]
 
 
-def get_gist_for_date(date_iso: str, instance_id: str = "") -> list[dict]:
-    """Return gist facts whose timestamp falls on the given date (YYYY-MM-DD)."""
-    if not date_iso or len(date_iso) < 10:
-        return []
+@_sqlite_serialized
+def query_journal_timeline_by_topic(
+    embedding: list[float], instance_id: str, limit: int = 30
+) -> list[dict]:
+    """Vector-nearest journal chunks, resolved to entry rows, sorted chronologically by entry_date."""
     conn = _get_conn()
-    where, params = _instance_where(instance_id)
-    params = [date_iso[:10]] + params
-    try:
-        rows = conn.execute(
-            f"SELECT id, document, session_id, timestamp FROM memory_facts WHERE date(timestamp) = ? AND {where} ORDER BY timestamp DESC",
-            params,
-        ).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
-        for r in conn.execute(f"SELECT id, document, session_id, timestamp FROM memory_facts WHERE {where} ORDER BY id DESC", params).fetchall():
-            ts = r[3] or ""
-            if ts.startswith(date_iso[:10]):
-                rows.append(r)
-    return [{"id": r[0], "document": r[1] or "", "session_id": r[2] or "", "timestamp": r[3] or ""} for r in rows]
-
-
-def update_gist(fact_id: int, document: str, embedding: list[float]) -> bool:
-    """Update gist fact by id; rewrites vec_gist row with new embedding. Returns True if found."""
-    conn = _get_conn()
-    cur = conn.execute("SELECT id FROM memory_facts WHERE id = ?", (fact_id,))
-    if not cur.fetchone():
-        return False
     blob = _blob_from_floats(embedding)
-    conn.execute("UPDATE memory_facts SET document = ? WHERE id = ?", (document, fact_id))
-    conn.execute("DELETE FROM vec_gist WHERE doc_id = ?", (fact_id,))
-    conn.execute(
+    fetch_k = max(limit * 10, 40)
+    rows = conn.execute(
         """
-        INSERT OR REPLACE INTO vec_gist (doc_id, embedding, session_id, timestamp, document)
-        SELECT ?, ?, session_id, timestamp, ? FROM memory_facts WHERE id = ?
+        SELECT chunk_id, chunk_text, entry_date, distance
+        FROM vec_journal
+        WHERE embedding MATCH ? AND k = ?
         """,
-        (fact_id, blob, document, fact_id),
-    )
-    conn.commit()
-    return True
-
-
-def update_episodic(
-    summary_id: int,
-    document: str,
-    embedding: list[float],
-    metadata_json: str | None = None,
-) -> bool:
-    """Update episodic summary by id; rewrites vec_episodic row. Optionally update metadata_json."""
-    conn = _get_conn()
-    cur = conn.execute("SELECT id FROM memory_episodic WHERE id = ?", (summary_id,))
-    if not cur.fetchone():
-        return False
-    blob = _blob_from_floats(embedding)
-    conn.execute("UPDATE memory_episodic SET document = ? WHERE id = ?", (document, summary_id))
-    if metadata_json is not None:
-        conn.execute(
-            "UPDATE memory_episodic SET metadata_json = ? WHERE id = ?",
-            (metadata_json, summary_id),
+        (blob, fetch_k),
+    ).fetchall()
+    inst = instance_id or ""
+    by_chunk: dict[int, float] = {}
+    for r in rows:
+        cid = int(r[0])
+        dist = float(r[3])
+        row_inst = conn.execute(
+            "SELECT instance_id FROM journal_chunks WHERE id = ?", (cid,)
+        ).fetchone()
+        if not row_inst:
+            continue
+        ri = row_inst[0] or ""
+        if inst:
+            if ri != inst:
+                continue
+        elif ri not in ("", None):
+            continue
+        if cid not in by_chunk or dist < by_chunk[cid]:
+            by_chunk[cid] = dist
+    lim = max(1, min(limit, 100))
+    pairs = sorted(by_chunk.items(), key=lambda x: x[1])[: max(lim * 4, lim)]
+    out: list[dict] = []
+    seen_entry: set[int] = set()
+    for cid, dist in pairs:
+        row = conn.execute(
+            "SELECT entry_id FROM journal_chunks WHERE id = ?", (cid,)
+        ).fetchone()
+        if not row:
+            continue
+        eid = int(row[0])
+        if eid in seen_entry:
+            continue
+        seen_entry.add(eid)
+        er = conn.execute(
+            "SELECT id, raw_text, session_id, entry_date FROM journal_entries WHERE id = ?",
+            (eid,),
+        ).fetchone()
+        if not er:
+            continue
+        out.append(
+            {
+                "id": er[0],
+                "document": er[1] or "",
+                "session_id": er[2] or "",
+                "timestamp": er[3] or "",
+                "metadata_json": None,
+                "distance": dist,
+            }
         )
-    conn.execute("DELETE FROM vec_episodic WHERE doc_id = ?", (summary_id,))
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO vec_episodic (doc_id, embedding, session_id, timestamp, document)
-        SELECT ?, ?, session_id, timestamp, ? FROM memory_episodic WHERE id = ?
-        """,
-        (summary_id, blob, document, summary_id),
-    )
-    conn.commit()
-    return True
+        if len(out) >= lim:
+            break
+    out.sort(key=lambda x: x.get("timestamp") or "")
+    return out[:lim]
 
 
-def delete_gist(fact_id: int) -> bool:
-    """Remove gist fact by id. Returns True if found and deleted."""
-    conn = _get_conn()
-    cur = conn.execute("SELECT id FROM memory_facts WHERE id = ?", (fact_id,))
-    if not cur.fetchone():
-        return False
-    conn.execute("DELETE FROM memory_facts WHERE id = ?", (fact_id,))
-    conn.execute("DELETE FROM vec_gist WHERE doc_id = ?", (fact_id,))
-    conn.commit()
-    return True
-
-
-def delete_episodic(summary_id: int) -> bool:
-    """Remove episodic summary by id. Returns True if found and deleted."""
-    conn = _get_conn()
-    cur = conn.execute("SELECT id FROM memory_episodic WHERE id = ?", (summary_id,))
-    if not cur.fetchone():
-        return False
-    conn.execute("DELETE FROM memory_episodic WHERE id = ?", (summary_id,))
-    conn.execute("DELETE FROM vec_episodic WHERE doc_id = ?", (summary_id,))
-    conn.commit()
-    return True
-
-
-def gist_count(instance_id: str = "") -> int:
+@_sqlite_serialized
+def list_journal_entries_with_ids(instance_id: str = "") -> list[dict]:
+    """Journal entries for Memory UI (id, document=raw_text, session_id, timestamp=entry_date)."""
     conn = _get_conn()
     where, params = _instance_where(instance_id)
-    try:
-        r = conn.execute(f"SELECT COUNT(*) FROM memory_facts WHERE {where}", params).fetchone()
-    except sqlite3.OperationalError:
-        r = conn.execute("SELECT COUNT(*) FROM memory_facts").fetchone()
-    return r[0] if r else 0
+    rows = conn.execute(
+        f"""
+        SELECT id, raw_text, session_id, entry_date, created_at
+        FROM journal_entries WHERE {where} ORDER BY id DESC
+        """,
+        params,
+    ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "document": r[1] or "",
+            "session_id": r[2] or "",
+            "timestamp": r[3] or "",
+            "created_at": r[4] if len(r) > 4 else None,
+        }
+        for r in rows
+    ]
 
 
-def episodic_count(instance_id: str = "") -> int:
+@_sqlite_serialized
+def journal_entry_get(entry_id: int, instance_id: str) -> dict | None:
     conn = _get_conn()
-    where, params = _instance_where(instance_id, "memory_episodic")
-    try:
-        r = conn.execute(f"SELECT COUNT(*) FROM memory_episodic WHERE {where}", params).fetchone()
-    except sqlite3.OperationalError:
-        r = conn.execute("SELECT COUNT(*) FROM memory_episodic").fetchone()
-    return r[0] if r else 0
+    inst = instance_id or ""
+    row = conn.execute(
+        """
+        SELECT id, raw_text, session_id, entry_date, created_at
+        FROM journal_entries WHERE id = ?
+        AND (instance_id = ? OR (? = '' AND (instance_id = '' OR instance_id IS NULL)))
+        """,
+        (entry_id, inst, inst),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "document": row[1] or "",
+        "session_id": row[2] or "",
+        "timestamp": row[3] or "",
+        "created_at": row[4] if len(row) > 4 else None,
+    }
 
 
-def episodic_metadata_count() -> int:
-    """Count episodic rows that have non-null, non-empty metadata_json."""
+@_sqlite_serialized
+def journal_entry_delete_cascade(entry_id: int, instance_id: str) -> bool:
     conn = _get_conn()
+    inst = instance_id or ""
+    row = conn.execute(
+        "SELECT id FROM journal_entries WHERE id = ? AND (instance_id = ? OR (? = '' AND (instance_id = '' OR instance_id IS NULL)))",
+        (entry_id, inst, inst),
+    ).fetchone()
+    if not row:
+        return False
+    chunk_ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT id FROM journal_chunks WHERE entry_id = ?", (entry_id,)
+        ).fetchall()
+    ]
+    for cid in chunk_ids:
+        conn.execute("DELETE FROM vec_journal WHERE chunk_id = ?", (cid,))
+    conn.execute("DELETE FROM journal_chunks WHERE entry_id = ?", (entry_id,))
+    conn.execute("DELETE FROM journal_entries WHERE id = ?", (entry_id,))
+    conn.commit()
+    return True
+
+
+@_sqlite_serialized
+def journal_entry_count(instance_id: str = "") -> int:
+    conn = _get_conn()
+    where, params = _instance_where(instance_id)
     try:
         r = conn.execute(
-            "SELECT COUNT(*) FROM memory_episodic WHERE metadata_json IS NOT NULL AND trim(metadata_json) != ''"
+            f"SELECT COUNT(*) FROM journal_entries WHERE {where}", params
         ).fetchone()
-        return r[0] if r else 0
+        return int(r[0]) if r and r[0] is not None else 0
     except sqlite3.OperationalError:
         return 0
 
 
+@_sqlite_serialized
+def journal_chunk_count(instance_id: str = "") -> int:
+    conn = _get_conn()
+    where, params = _instance_where(instance_id, "journal_chunks")
+    try:
+        r = conn.execute(
+            f"SELECT COUNT(*) FROM journal_chunks WHERE {where}", params
+        ).fetchone()
+        return int(r[0]) if r and r[0] is not None else 0
+    except sqlite3.OperationalError:
+        return 0
+
+
+@_sqlite_serialized
+def wipe_journal_memory() -> None:
+    conn = _get_conn()
+    conn.execute("DELETE FROM vec_journal")
+    conn.execute("DELETE FROM journal_chunks")
+    conn.execute("DELETE FROM journal_entries")
+    conn.commit()
+
+
+@_sqlite_serialized
+def wipe_journal_memory_for_instance(instance_id: str) -> None:
+    if not instance_id:
+        return
+    conn = _get_conn()
+    eids = [
+        int(r[0])
+        for r in conn.execute(
+            "SELECT id FROM journal_entries WHERE instance_id = ?", (instance_id,)
+        ).fetchall()
+    ]
+    for eid in eids:
+        chunk_ids = [
+            int(r[0])
+            for r in conn.execute(
+                "SELECT id FROM journal_chunks WHERE entry_id = ?", (eid,)
+            ).fetchall()
+        ]
+        for cid in chunk_ids:
+            conn.execute("DELETE FROM vec_journal WHERE chunk_id = ?", (cid,))
+        conn.execute("DELETE FROM journal_chunks WHERE entry_id = ?", (eid,))
+    conn.execute("DELETE FROM journal_entries WHERE instance_id = ?", (instance_id,))
+    conn.commit()
+
+
+@_sqlite_serialized
+def rec_feedback_record(
+    instance_id: str,
+    action: str,
+    *,
+    content_type: str | None = None,
+    topic_tags: str | None = None,
+    intent_context: str | None = None,
+    item_title: str | None = None,
+) -> None:
+    conn = _get_conn()
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        """
+        INSERT INTO rec_feedback_events (instance_id, action, content_type, topic_tags, intent_context, item_title, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            instance_id or "",
+            action,
+            content_type,
+            topic_tags,
+            intent_context,
+            item_title[:500] if item_title else None,
+            now,
+        ),
+    )
+    conn.commit()
+
+
+_DECISION_LOG_INSERTS_SINCE_ROTATE = 0
+
+
+@_sqlite_serialized
+def decision_log_rotate(max_keep: int = 10_000) -> None:
+    """Delete oldest decision_log rows, keeping the newest max_keep."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            f"""
+            DELETE FROM decision_log WHERE id NOT IN (
+                SELECT id FROM decision_log ORDER BY id DESC LIMIT ?
+            )
+            """,
+            (max_keep,),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+@_sqlite_serialized
+def decision_log_insert(
+    *,
+    instance_id: str = "",
+    session_id: str | None = None,
+    action_type: str,
+    input_summary: str | None = None,
+    retrieved_items: str | None = None,
+    llm_prompt_summary: str | None = None,
+    llm_response: str | None = None,
+    final_output: str | None = None,
+    reasoning_notes: str | None = None,
+    duration_ms: int | None = None,
+    model_used: str | None = None,
+    search_api_calls: str | None = None,
+) -> int | None:
+    conn = _get_conn()
+    conn.execute(
+        """
+        INSERT INTO decision_log (
+            instance_id, session_id, action_type, input_summary, retrieved_items,
+            llm_prompt_summary, llm_response, final_output, reasoning_notes,
+            duration_ms, model_used, search_api_calls
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            instance_id or "",
+            session_id,
+            action_type,
+            input_summary,
+            retrieved_items,
+            llm_prompt_summary,
+            llm_response,
+            final_output,
+            reasoning_notes,
+            duration_ms,
+            model_used,
+            search_api_calls,
+        ),
+    )
+    conn.commit()
+    global _DECISION_LOG_INSERTS_SINCE_ROTATE
+    _DECISION_LOG_INSERTS_SINCE_ROTATE += 1
+    if _DECISION_LOG_INSERTS_SINCE_ROTATE >= 100:
+        _DECISION_LOG_INSERTS_SINCE_ROTATE = 0
+        decision_log_rotate()
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    return int(row[0]) if row and row[0] else None
+
+
+@_sqlite_serialized
+def decision_log_list(
+    instance_id: str,
+    *,
+    action_type: str | None = None,
+    session_id: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    conn = _get_conn()
+    inst = instance_id or ""
+    clauses = ["instance_id = ?"]
+    params: list = [inst]
+    if action_type:
+        clauses.append("action_type = ?")
+        params.append(action_type)
+    if session_id is not None and session_id != "":
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    where = " AND ".join(clauses)
+    params.append(max(1, min(limit, 500)))
+    rows = conn.execute(
+        f"""
+        SELECT id, timestamp, instance_id, session_id, action_type, input_summary,
+               retrieved_items, llm_prompt_summary, llm_response, final_output,
+               reasoning_notes, duration_ms, model_used, search_api_calls
+        FROM decision_log WHERE {where} ORDER BY id DESC LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r[0],
+                "timestamp": r[1] or "",
+                "instance_id": r[2] or "",
+                "session_id": r[3],
+                "action_type": r[4] or "",
+                "input_summary": r[5],
+                "retrieved_items": r[6],
+                "llm_prompt_summary": r[7],
+                "llm_response": r[8],
+                "final_output": r[9],
+                "reasoning_notes": r[10],
+                "duration_ms": r[11],
+                "model_used": r[12],
+                "search_api_calls": r[13],
+            }
+        )
+    return out
+
+
+@_sqlite_serialized
+def decision_log_get(log_id: int, instance_id: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        """
+        SELECT id, timestamp, instance_id, session_id, action_type, input_summary,
+               retrieved_items, llm_prompt_summary, llm_response, final_output,
+               reasoning_notes, duration_ms, model_used, search_api_calls
+        FROM decision_log WHERE id = ? AND instance_id = ?
+        """,
+        (log_id, instance_id or ""),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "timestamp": row[1] or "",
+        "instance_id": row[2] or "",
+        "session_id": row[3],
+        "action_type": row[4] or "",
+        "input_summary": row[5],
+        "retrieved_items": row[6],
+        "llm_prompt_summary": row[7],
+        "llm_response": row[8],
+        "final_output": row[9],
+        "reasoning_notes": row[10],
+        "duration_ms": row[11],
+        "model_used": row[12],
+        "search_api_calls": row[13],
+    }
+
+
+@_sqlite_serialized
+def content_feedback_list_recent(instance_id: str, limit: int = 30) -> list[dict]:
+    import json as _json
+
+    conn = _get_conn()
+    lim = max(1, min(int(limit), 80))
+    rows = conn.execute(
+        """
+        SELECT id, timestamp, content_url, content_title, content_type, feedback, user_notes,
+               extracted_tags, extracted_reasoning, connected_journal_themes
+        FROM content_feedback WHERE instance_id = ? ORDER BY id DESC LIMIT ?
+        """,
+        (instance_id or "", lim),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        tags = None
+        themes = None
+        try:
+            if r[7]:
+                tags = _json.loads(r[7])
+        except Exception:
+            pass
+        try:
+            if r[9]:
+                themes = _json.loads(r[9])
+        except Exception:
+            pass
+        out.append(
+            {
+                "id": r[0],
+                "timestamp": r[1] or "",
+                "content_url": r[2],
+                "content_title": r[3] or "",
+                "content_type": r[4],
+                "feedback": r[5] or "",
+                "user_notes": r[6],
+                "extracted_tags": tags,
+                "extracted_reasoning": r[8],
+                "connected_journal_themes": themes,
+            }
+        )
+    return out
+
+
+@_sqlite_serialized
+def content_feedback_insert(
+    instance_id: str,
+    *,
+    content_url: str | None = None,
+    content_title: str | None = None,
+    content_type: str | None = None,
+    feedback: str,
+    user_notes: str | None = None,
+    extracted_tags: str | None = None,
+    extracted_reasoning: str | None = None,
+    connected_journal_themes: str | None = None,
+) -> int | None:
+    conn = _get_conn()
+    conn.execute(
+        """
+        INSERT INTO content_feedback (
+            instance_id, content_url, content_title, content_type, feedback,
+            user_notes, extracted_tags, extracted_reasoning, connected_journal_themes
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            instance_id or "",
+            content_url,
+            content_title,
+            content_type,
+            feedback,
+            user_notes,
+            extracted_tags,
+            extracted_reasoning,
+            connected_journal_themes,
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    return int(row[0]) if row and row[0] else None
+
+
+@_sqlite_serialized
+def query_episodic_by_date_range(
+    instance_id: str, start_date: str, end_date: str, limit: int = 20
+) -> list[dict]:
+    """Journal entries with entry_date between start and end (YYYY-MM-DD), chronological."""
+    return journal_entries_for_date_range(instance_id, start_date, end_date, limit=limit)
+
+
+@_sqlite_serialized
+def query_this_day_in_history(
+    instance_id: str, month_day: str | None = None, years_back: int = 5
+) -> list[dict]:
+    return journal_this_day_in_history(instance_id, month_day, years_back)
+
+
+@_sqlite_serialized
+def query_episodic_timeline_by_topic(
+    embedding: list[float], instance_id: str, limit: int = 30
+) -> list[dict]:
+    return query_journal_timeline_by_topic(embedding, instance_id, limit=limit)
+
+
+@_sqlite_serialized
+def user_media_profile_get_with_meta(instance_id: str) -> tuple[dict, str | None]:
+    """Alias for instance_settings (legacy name)."""
+    return instance_settings_get_with_meta(instance_id)
+
+
+@_sqlite_serialized
+def gist_count(instance_id: str = "") -> int:
+    """Deprecated alias: journal entry count."""
+    return journal_entry_count(instance_id)
+
+
+@_sqlite_serialized
+def episodic_count(instance_id: str = "") -> int:
+    """Deprecated alias: journal chunk count."""
+    return journal_chunk_count(instance_id)
+
+
+@_sqlite_serialized
+def episodic_metadata_count() -> int:
+    """Legacy field; journal chunks do not use episodic metadata."""
+    return 0
+
+
+@_sqlite_serialized
 def create_person(name: str) -> int:
     """Create a person row (if not exists) and return id."""
     conn = _get_conn()
@@ -777,6 +1358,7 @@ def create_person(name: str) -> int:
     return row[0] if row else 0
 
 
+@_sqlite_serialized
 def update_person(person_id: int, name: str) -> bool:
     """Rename a person."""
     conn = _get_conn()
@@ -788,6 +1370,7 @@ def update_person(person_id: int, name: str) -> bool:
     return True
 
 
+@_sqlite_serialized
 def list_people_with_groups() -> list[dict]:
     """Return all people with their groups."""
     conn = _get_conn()
@@ -810,6 +1393,7 @@ def list_people_with_groups() -> list[dict]:
     return result
 
 
+@_sqlite_serialized
 def get_person_profile(person_id: int) -> dict | None:
     """Return profile for a person, or None."""
     conn = _get_conn()
@@ -826,6 +1410,7 @@ def get_person_profile(person_id: int) -> dict | None:
     }
 
 
+@_sqlite_serialized
 def upsert_person_profile(
     person_id: int,
     relationship_summary: str,
@@ -855,6 +1440,7 @@ def upsert_person_profile(
     conn.commit()
 
 
+@_sqlite_serialized
 def get_person_ai_summary(person_id: int) -> dict | None:
     """Return cached AI relationship summary for a person, or None."""
     conn = _get_conn()
@@ -867,6 +1453,7 @@ def get_person_ai_summary(person_id: int) -> dict | None:
     return {"summary": row[0] or "", "updated_at": row[1] or ""}
 
 
+@_sqlite_serialized
 def set_person_ai_summary(person_id: int, summary: str) -> None:
     """Insert or update cached AI relationship summary for a person."""
     conn = _get_conn()
@@ -884,6 +1471,7 @@ def set_person_ai_summary(person_id: int, summary: str) -> None:
     conn.commit()
 
 
+@_sqlite_serialized
 def get_person_groups(person_id: int) -> list[str]:
     conn = _get_conn()
     rows = conn.execute(
@@ -893,6 +1481,7 @@ def get_person_groups(person_id: int) -> list[str]:
     return [r[0] for r in rows]
 
 
+@_sqlite_serialized
 def set_person_groups(person_id: int, groups: list[str]) -> None:
     """Replace a person's groups with the given list."""
     conn = _get_conn()
@@ -906,6 +1495,7 @@ def set_person_groups(person_id: int, groups: list[str]) -> None:
     conn.commit()
 
 
+@_sqlite_serialized
 def list_person_thoughts(person_id: int) -> list[dict]:
     """Return all thoughts for a person ordered by date descending."""
     conn = _get_conn()
@@ -916,6 +1506,7 @@ def list_person_thoughts(person_id: int) -> list[dict]:
     return [{"id": r[0], "date": r[1] or "", "thought_text": r[2] or ""} for r in rows]
 
 
+@_sqlite_serialized
 def add_person_thought(person_id: int, date: str | None, text: str) -> int:
     conn = _get_conn()
     conn.execute(
@@ -927,6 +1518,7 @@ def add_person_thought(person_id: int, date: str | None, text: str) -> int:
     return int(row[0]) if row else 0
 
 
+@_sqlite_serialized
 def update_person_thought(thought_id: int, date: str | None, text: str) -> bool:
     conn = _get_conn()
     cur = conn.execute("SELECT id FROM person_thoughts WHERE id = ?", (thought_id,))
@@ -940,6 +1532,7 @@ def update_person_thought(thought_id: int, date: str | None, text: str) -> bool:
     return True
 
 
+@_sqlite_serialized
 def delete_person_thought(thought_id: int) -> bool:
     conn = _get_conn()
     cur = conn.execute("SELECT id FROM person_thoughts WHERE id = ?", (thought_id,))
@@ -950,6 +1543,7 @@ def delete_person_thought(thought_id: int) -> bool:
     return True
 
 
+@_sqlite_serialized
 def list_person_facts(person_id: int) -> list[dict]:
     """Return stored person facts for a person, newest first."""
     conn = _get_conn()
@@ -974,6 +1568,7 @@ def list_person_facts(person_id: int) -> list[dict]:
     ]
 
 
+@_sqlite_serialized
 def replace_person_facts(person_id: int, facts: list[dict]) -> None:
     """
     Replace all person_facts for a person with the provided list.
@@ -997,6 +1592,7 @@ def replace_person_facts(person_id: int, facts: list[dict]) -> None:
         )
     conn.commit()
 
+@_sqlite_serialized
 def add_consumed(
     item_id: str,
     document: str,
@@ -1051,6 +1647,7 @@ def add_consumed(
     conn.commit()
 
 
+@_sqlite_serialized
 def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict]:
     """Return all consumed rows from consumed_meta (source of truth for listing)."""
     conn = _get_conn()
@@ -1089,6 +1686,7 @@ def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict
     ]
 
 
+@_sqlite_serialized
 def update_consumed(
     item_id: str,
     *,
@@ -1177,6 +1775,7 @@ def update_consumed(
     return True
 
 
+@_sqlite_serialized
 def delete_consumed(item_id: str, instance_id: str = "") -> bool:
     """Remove consumed item by id_original from both vec_consumed and consumed_meta. When instance_id is set, only delete rows for that instance."""
     conn = _get_conn()
@@ -1198,6 +1797,7 @@ def delete_consumed(item_id: str, instance_id: str = "") -> bool:
         return False
 
 
+@_sqlite_serialized
 def get_consumed_context_rows(max_items: int = 80, instance_id: str = "") -> list[dict]:
     """Return consumed rows with type, title, author, liked, note from consumed_meta."""
     conn = _get_conn()
@@ -1235,31 +1835,30 @@ def get_consumed_context_rows(max_items: int = 80, instance_id: str = "") -> lis
     ]
 
 
+@_sqlite_serialized
 def wipe_memory() -> None:
-    """Clear gist and episodic (memory_facts, memory_episodic, vec_*) only; keep consumed."""
+    """Clear journal memory, instance prefs, and rec feedback; keep consumed and people."""
     conn = _get_conn()
-    conn.execute("DELETE FROM memory_facts")
-    conn.execute("DELETE FROM memory_episodic")
-    conn.execute("DELETE FROM vec_gist")
-    conn.execute("DELETE FROM vec_episodic")
-    conn.execute("UPDATE _vec_seq SET val = 0 WHERE name IN ('gist', 'episodic')")
+    conn.execute("DELETE FROM vec_journal")
+    conn.execute("DELETE FROM journal_chunks")
+    conn.execute("DELETE FROM journal_entries")
+    conn.execute("DELETE FROM instance_settings")
+    conn.execute("DELETE FROM rec_feedback_events")
     conn.commit()
 
 
+@_sqlite_serialized
 def wipe_memory_for_instance(instance_id: str) -> None:
-    """Clear gist and episodic for one instance only; leave vec tables in sync by deleting by doc_id."""
     if not instance_id:
         return
     conn = _get_conn()
-    for doc_id, in conn.execute("SELECT id FROM memory_facts WHERE instance_id = ?", (instance_id,)).fetchall():
-        conn.execute("DELETE FROM vec_gist WHERE doc_id = ?", (doc_id,))
-    conn.execute("DELETE FROM memory_facts WHERE instance_id = ?", (instance_id,))
-    for doc_id, in conn.execute("SELECT id FROM memory_episodic WHERE instance_id = ?", (instance_id,)).fetchall():
-        conn.execute("DELETE FROM vec_episodic WHERE doc_id = ?", (doc_id,))
-    conn.execute("DELETE FROM memory_episodic WHERE instance_id = ?", (instance_id,))
+    wipe_journal_memory_for_instance(instance_id)
+    conn.execute("DELETE FROM instance_settings WHERE instance_id = ?", (instance_id,))
+    conn.execute("DELETE FROM rec_feedback_events WHERE instance_id = ?", (instance_id,))
     conn.commit()
 
 
+@_sqlite_serialized
 def wipe_consumed_for_instance(instance_id: str) -> None:
     """Remove consumed library rows and embeddings for this instance (or legacy unscoped rows if instance_id is '')."""
     conn = _get_conn()
@@ -1282,6 +1881,7 @@ def wipe_consumed_for_instance(instance_id: str) -> None:
     conn.commit()
 
 
+@_sqlite_serialized
 def wipe_all_vector_memory_for_instance(instance_id: str) -> None:
     """
     Clear gist, episodic, and consumed vectors for one instance (full knowledge-base reset before re-import).
@@ -1295,6 +1895,7 @@ def wipe_all_vector_memory_for_instance(instance_id: str) -> None:
         wipe_consumed_for_instance("")
 
 
+@_sqlite_serialized
 def memory_count_for_instance(instance_id: str) -> tuple[int, int]:
     """Return (gist_count, episodic_count) for the given instance_id. Used to ask anonymous user if they want to sync."""
     if not instance_id or not instance_id.strip():
@@ -1302,64 +1903,76 @@ def memory_count_for_instance(instance_id: str) -> tuple[int, int]:
     return (gist_count(instance_id), episodic_count(instance_id))
 
 
+@_sqlite_serialized
 def merge_instance_memory(from_instance_id: str, to_instance_id: str) -> None:
-    """Copy all memory (gist, episodic, consumed) from from_instance_id to to_instance_id. Used when anonymous user logs in and opts to sync."""
+    """Copy journal memory, instance prefs, and consumed from from_instance_id to to_instance_id."""
     if not from_instance_id or not to_instance_id or from_instance_id == to_instance_id:
         return
     conn = _get_conn()
-    # Copy gist: memory_facts + vec_gist
-    try:
-        mrows = conn.execute(
-            "SELECT id, document, session_id, timestamp FROM memory_facts WHERE instance_id = ?",
-            (from_instance_id,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        mrows = []
-    for (doc_id, document, session_id, timestamp) in mrows:
-        row = conn.execute(
-            "SELECT embedding FROM vec_gist WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
-        if not row:
+    erows = conn.execute(
+        """
+        SELECT id, session_id, entry_date, raw_text, char_count, created_at
+        FROM journal_entries WHERE instance_id = ?
+        """,
+        (from_instance_id,),
+    ).fetchall()
+    for eid, session_id, entry_date, raw_text, char_count, created_at in erows:
+        conn.execute(
+            """
+            INSERT INTO journal_entries (session_id, instance_id, entry_date, raw_text, char_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id or "",
+                to_instance_id,
+                entry_date or "",
+                raw_text or "",
+                char_count,
+                created_at
+                or datetime.datetime.utcnow().isoformat() + "Z",
+            ),
+        )
+        new_eid_row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        new_eid = int(new_eid_row[0]) if new_eid_row and new_eid_row[0] else 0
+        if not new_eid:
             continue
-        new_id = _next_id(conn, "gist")
-        conn.execute(
-            "INSERT INTO vec_gist (doc_id, embedding, session_id, timestamp, document) VALUES (?, ?, ?, ?, ?)",
-            (new_id, row[0], session_id or "", timestamp or "", document or ""),
-        )
-        conn.execute(
-            "INSERT INTO memory_facts (id, document, session_id, timestamp, instance_id) VALUES (?, ?, ?, ?, ?)",
-            (new_id, document, session_id, timestamp, to_instance_id),
-        )
-    # Copy episodic: memory_episodic + vec_episodic
-    try:
-        erows = conn.execute(
-            "SELECT id, document, session_id, timestamp, metadata_json FROM memory_episodic WHERE instance_id = ?",
-            (from_instance_id,),
+        crows = conn.execute(
+            """
+            SELECT id, chunk_index, chunk_text, entry_date
+            FROM journal_chunks WHERE entry_id = ?
+            """,
+            (eid,),
         ).fetchall()
-    except sqlite3.OperationalError:
-        erows = []
-    for row in erows:
-        doc_id, document, session_id, timestamp, metadata_json = row[0], row[1], row[2], row[3], row[4] if len(row) > 4 else None
-        vrow = conn.execute(
-            "SELECT embedding FROM vec_episodic WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
-        if not vrow:
-            continue
-        new_id = _next_id(conn, "episodic")
-        conn.execute(
-            "INSERT INTO vec_episodic (doc_id, embedding, session_id, timestamp, document) VALUES (?, ?, ?, ?, ?)",
-            (new_id, vrow[0], session_id or "", timestamp or "", document or ""),
-        )
-        try:
+        for old_cid, chunk_index, chunk_text, ed in crows:
             conn.execute(
-                "INSERT INTO memory_episodic (id, document, session_id, timestamp, metadata_json, instance_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (new_id, document, session_id, timestamp, metadata_json, to_instance_id),
+                """
+                INSERT INTO journal_chunks (entry_id, instance_id, chunk_index, chunk_text, entry_date)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (new_eid, to_instance_id, chunk_index, chunk_text or "", ed or ""),
             )
-        except sqlite3.OperationalError:
-            conn.execute(
-                "INSERT INTO memory_episodic (id, document, session_id, timestamp, instance_id) VALUES (?, ?, ?, ?, ?)",
-                (new_id, document, session_id, timestamp, to_instance_id),
-            )
+            nc_row = conn.execute("SELECT last_insert_rowid()").fetchone()
+            new_cid = int(nc_row[0]) if nc_row and nc_row[0] else 0
+            vrow = conn.execute(
+                "SELECT embedding FROM vec_journal WHERE chunk_id = ?", (old_cid,)
+            ).fetchone()
+            if vrow and new_cid:
+                conn.execute(
+                    """
+                    INSERT INTO vec_journal (chunk_id, embedding, instance_id, entry_date, chunk_text)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_cid,
+                        vrow[0],
+                        to_instance_id,
+                        (ed or "")[:10],
+                        chunk_text or "",
+                    ),
+                )
+    patch = instance_settings_get(from_instance_id)
+    if patch:
+        instance_settings_merge_json(to_instance_id, patch)
     # Copy consumed_meta + vec_consumed (by id_original from consumed_meta for from_id)
     try:
         crows = conn.execute(

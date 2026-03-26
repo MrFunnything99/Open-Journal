@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional, List, Dict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi import FastAPI, Request, HTTPException, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -43,10 +43,14 @@ from library import (
     DEFAULT_PERPLEXITY_EMBEDDING_MODEL,
     generate_day_summary,
     generate_memory_mermaid,
+    _embed_texts,
     generate_recommendations,
+    generate_recommendations_category,
+    generate_derived_insights,
     get_memory_for_date,
     get_memory_for_visualization,
     get_person_events,
+    get_writing_loop_hints,
     list_consumed,
     list_memory_facts,
     list_memory_summaries,
@@ -54,6 +58,9 @@ from library import (
     run_person_facts_agent,
     run_relationship_summary_agent,
     run_people_grouping_agent,
+    process_content_feedback,
+    record_rec_feedback_for_recs,
+    refresh_pattern_memory,
     save_session_data,
     gemini_extraction_backend,
     update_consumed,
@@ -111,6 +118,11 @@ async def lifespan(app: FastAPI):
         print(
             "[backend] WARNING: OPENROUTER_API_KEY missing — /chat interviewer and journal validation will not work until set."
         )
+    vec_store.ensure_db()
+    try:
+        vec_store.decision_log_rotate()
+    except Exception as e:
+        print("[backend] decision_log_rotate startup:", e)
     yield
     # Cleanup if needed
     pass
@@ -192,6 +204,7 @@ class IngestHistoryRequest(BaseModel):
     text: str
     session_id: Optional[str] = None
     entry_date: Optional[str] = None  # ISO date/datetime when the journal was written; used for vector DB timestamp
+    content_hash: Optional[str] = None  # optional client hint; server uses canonical normalized SHA-256 for skip gate
 
 
 class IngestHistoryResponse(BaseModel):
@@ -234,9 +247,11 @@ class MemorySummaryCreate(BaseModel):
 
 
 class MemoryStats(BaseModel):
-    gist_facts_count: int
-    episodic_log_count: int
-    episodic_metadata_count: int = 0  # summaries with metadata (people, topics, etc.)
+    gist_facts_count: int  # journal entry count (legacy field name for API clients)
+    episodic_log_count: int  # journal chunk count (legacy field name)
+    episodic_metadata_count: int = 0  # unused; journal chunks have no episodic metadata
+    journal_entry_count: int = 0
+    journal_chunk_count: int = 0
 
 
 class BrainPersonNode(BaseModel):
@@ -340,6 +355,30 @@ class ConsumedRequest(BaseModel):
 
 class ConsumedResponse(BaseModel):
     ok: bool
+
+
+class WritingHintsRequest(BaseModel):
+    draft: str = ""
+
+
+class RecFeedbackRequest(BaseModel):
+    action: str
+    content_type: Optional[str] = None
+    topic_tags: Optional[str] = None
+    intent_context: Optional[str] = None
+    item_title: Optional[str] = None
+
+
+class RecFeedbackResponse(BaseModel):
+    ok: bool
+
+
+class ContentFeedbackRequest(BaseModel):
+    content_title: str
+    content_type: str = "article"
+    content_url: Optional[str] = None
+    feedback: str = "liked"
+    user_notes: Optional[str] = None
 
 
 class LibraryNoteRequest(BaseModel):
@@ -1082,9 +1121,18 @@ async def ingest_history(req: IngestHistoryRequest, request: Request):
             return IngestHistoryResponse(ok=True, session_id=session_id)
         entry_date = (req.entry_date or "").strip() or None
         extracted = await asyncio.wait_for(
-            asyncio.to_thread(save_session_data, session_id, text, entry_date, instance_id),
+            asyncio.to_thread(
+                save_session_data,
+                session_id,
+                text,
+                entry_date,
+                instance_id,
+                req.content_hash,
+            ),
             timeout=INGEST_HISTORY_TIMEOUT_SEC,
         )
+        if extracted.get("skipped"):
+            return IngestHistoryResponse(ok=True, session_id=session_id)
         summary = extracted.get("summary") or ""
         facts = extracted.get("facts") or []
         if summary or facts:
@@ -1105,6 +1153,128 @@ async def ingest_history(req: IngestHistoryRequest, request: Request):
         print("[backend] ingest_history error:", e)
         traceback.print_exc()
         return IngestHistoryResponse(ok=False, session_id=session_id)
+
+
+@api_router.post("/memory/writing-hints")
+async def memory_writing_hints(req: WritingHintsRequest, request: Request):
+    """Continuity + similarity for the journal composer (episodic retrieval + active insights)."""
+    instance_id = _instance_id(request)
+    return await asyncio.to_thread(get_writing_loop_hints, req.draft, instance_id)
+
+
+@api_router.get("/memory/insights")
+async def memory_insights_list(request: Request):
+    instance_id = _instance_id(request)
+    rows = await asyncio.to_thread(vec_store.derived_insights_list_active, instance_id, 20)
+    return {"insights": rows}
+
+
+@api_router.post("/memory/insights/refresh")
+async def memory_insights_refresh(request: Request):
+    instance_id = _instance_id(request)
+    return await asyncio.to_thread(generate_derived_insights, instance_id)
+
+
+@api_router.post("/memory/patterns/refresh")
+async def memory_patterns_refresh(request: Request):
+    instance_id = _instance_id(request)
+    return await asyncio.to_thread(refresh_pattern_memory, instance_id)
+
+
+@api_router.post("/recommendations/feedback", response_model=RecFeedbackResponse)
+async def recommendations_feedback(req: RecFeedbackRequest, request: Request):
+    instance_id = _instance_id(request)
+
+    def _run() -> None:
+        record_rec_feedback_for_recs(
+            instance_id,
+            req.action,
+            content_type=req.content_type,
+            topic_tags=req.topic_tags,
+            intent_context=req.intent_context,
+            item_title=req.item_title,
+        )
+
+    await asyncio.to_thread(_run)
+    return RecFeedbackResponse(ok=True)
+
+
+@api_router.post("/feedback")
+async def submit_content_feedback(req: ContentFeedbackRequest, request: Request):
+    instance_id = _instance_id(request)
+
+    def _run():
+        return process_content_feedback(
+            instance_id,
+            content_title=req.content_title,
+            content_type=req.content_type,
+            content_url=req.content_url,
+            feedback=req.feedback,
+            user_notes=req.user_notes,
+        )
+
+    return await asyncio.to_thread(_run)
+
+
+@api_router.get("/profile")
+async def get_media_profile(request: Request):
+    instance_id = _instance_id(request)
+    prof, updated_at = vec_store.user_media_profile_get_with_meta(instance_id)
+    return {"profile": prof, "updated_at": updated_at}
+
+
+@api_router.get("/logs/decisions")
+async def list_decision_logs(
+    request: Request,
+    action_type: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = 50,
+):
+    instance_id = _instance_id(request)
+    rows = vec_store.decision_log_list(
+        instance_id,
+        action_type=action_type,
+        session_id=session_id,
+        limit=limit,
+    )
+    return {"logs": rows}
+
+
+@api_router.get("/logs/decisions/{log_id}")
+async def get_decision_log_detail(log_id: int, request: Request):
+    instance_id = _instance_id(request)
+    row = vec_store.decision_log_get(log_id, instance_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Log not found")
+    return row
+
+
+@api_router.get("/memory/date-range")
+async def memory_date_range(start: str, end: str, request: Request, limit: int = 20):
+    instance_id = _instance_id(request)
+    rows = vec_store.query_episodic_by_date_range(instance_id, start, end, limit=limit)
+    return {"entries": rows}
+
+
+@api_router.get("/memory/on-this-day")
+async def memory_on_this_day(request: Request, month_day: Optional[str] = None, years_back: int = 5):
+    instance_id = _instance_id(request)
+    rows = vec_store.query_this_day_in_history(instance_id, month_day=month_day, years_back=years_back)
+    return {"entries": rows}
+
+
+@api_router.get("/memory/timeline")
+async def memory_timeline(topic: str, request: Request, limit: int = 30):
+    instance_id = _instance_id(request)
+    if not topic.strip():
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    def _run():
+        emb = _embed_texts([topic.strip()[:2000]])[0]
+        return vec_store.query_episodic_timeline_by_topic(emb, instance_id, limit=limit)
+
+    rows = await asyncio.to_thread(_run)
+    return {"entries": rows}
 
 
 def _parse_date_from_entry_text(text: str) -> Optional[str]:
@@ -1253,10 +1423,14 @@ async def memory_stats(request: Request):
 
     vec_store.ensure_db()
     instance_id = _instance_id(request)
+    je = vec_store.journal_entry_count(instance_id)
+    jc = vec_store.journal_chunk_count(instance_id)
     return MemoryStats(
-        gist_facts_count=vec_store.gist_count(instance_id),
-        episodic_log_count=vec_store.episodic_count(instance_id),
+        gist_facts_count=je,
+        episodic_log_count=jc,
         episodic_metadata_count=vec_store.episodic_metadata_count(),
+        journal_entry_count=je,
+        journal_chunk_count=jc,
     )
 
 
@@ -1367,7 +1541,7 @@ async def brain_people_graph():
 
     # Auto-populate people table from episodic metadata (people list) so the graph is never empty
     try:
-        summaries = library.list_memory_summaries()
+        summaries = library.list_memory_facts()
         seen_names: set[str] = set()
         for item in summaries:
             meta_json = item.get("metadata_json")
@@ -1571,15 +1745,31 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
 RECOMMENDATIONS_TIMEOUT_SEC = float(os.getenv("RECOMMENDATIONS_HTTP_TIMEOUT_SEC", "78"))
 
 @api_router.get("/recommendations", response_model=RecommendationsResponse)
-async def get_recommendations(request: Request):
+async def get_recommendations(
+    request: Request,
+    category: Optional[str] = Query(
+        None,
+        description="If set (books, podcasts, articles, research, news), only that column is regenerated; other lists are empty.",
+    ),
+):
     """
     Personalized books, podcasts, articles, research, and news from journal memory and consumed library.
     May take ~35–80s depending on Perplexity + LLM latency; override RECOMMENDATIONS_HTTP_TIMEOUT_SEC if needed.
+    With ?category=books (etc.), only that agent runs — faster for per-column refresh; merge client-side with cache.
     """
     instance_id = _instance_id(request)
+    cat = (category or "").strip().lower()
+    allowed = ("books", "podcasts", "articles", "research", "news")
+    if cat and cat not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid category. Use one of: {', '.join(allowed)}",
+        )
+    gen_fn = generate_recommendations_category if cat else generate_recommendations
+    gen_args = (instance_id, cat) if cat else (instance_id,)
     try:
         data = await asyncio.wait_for(
-            asyncio.to_thread(generate_recommendations, instance_id),
+            asyncio.to_thread(gen_fn, *gen_args),
             timeout=RECOMMENDATIONS_TIMEOUT_SEC,
         )
     except asyncio.CancelledError:
@@ -1587,6 +1777,8 @@ async def get_recommendations(request: Request):
     except asyncio.TimeoutError:
         print("[backend] /recommendations timed out after", RECOMMENDATIONS_TIMEOUT_SEC, "s")
         return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[], news=[])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         print("[backend] /recommendations error:", e)
         return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[], news=[])
@@ -1648,7 +1840,7 @@ async def mark_consumed(req: ConsumedRequest, request: Request):
     """
     instance_id = _instance_id(request)
     content_type = (req.type or "article").lower()
-    if content_type not in ("book", "podcast", "article", "research"):
+    if content_type not in ("book", "podcast", "article", "research", "news"):
         content_type = "article"
     try:
         add_consumed(
@@ -1676,7 +1868,7 @@ async def get_library(request: Request):
         return data
     except Exception as e:
         print("[backend] GET /library error:", e)
-        return {"books": [], "podcasts": [], "articles": [], "research": []}
+        return {"books": [], "podcasts": [], "articles": [], "research": [], "news": []}
 
 
 @api_router.patch("/library/{item_id}")
@@ -1819,6 +2011,15 @@ async def health():
 
 # Mount API under /api
 app.include_router(api_router, prefix="/api")
+
+_LOGS_HTML = Path(__file__).resolve().parent / "static" / "logs.html"
+
+
+@app.get("/logs", include_in_schema=False)
+def serve_decision_logs_html():
+    if not _LOGS_HTML.is_file():
+        raise HTTPException(status_code=404, detail="logs UI missing (backend/static/logs.html)")
+    return FileResponse(_LOGS_HTML)
 
 
 @app.post("/api/transcribe", include_in_schema=False)
@@ -1981,10 +2182,14 @@ async def api_journal_validate(req: JournalValidateRequest):
     )
 
 
-# Serve built frontend (monolith: only when static dir exists, e.g. Docker build)
+# Serve built frontend (monolith: when built assets exist, e.g. Docker build).
+# Do not mount /assets when only auxiliary files (e.g. logs.html) live under static/.
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-if STATIC_DIR.exists():
-    app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="static_assets")
+_ASSETS_DIR = STATIC_DIR / "assets"
+if _ASSETS_DIR.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_ASSETS_DIR)), name="static_assets")
+
+if STATIC_DIR.exists() and (STATIC_DIR / "index.html").is_file():
 
     @app.get("/", include_in_schema=False)
     def _index():

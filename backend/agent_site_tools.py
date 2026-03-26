@@ -16,10 +16,18 @@ Guardrails: allowlisted tool names only; payload size limits; structured logging
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 from typing import Any
 
-from library import add_consumed, list_consumed, update_consumed
+from library import (
+    PODCAST_API_PAUSED,
+    add_consumed,
+    list_consumed,
+    process_content_feedback,
+    update_consumed,
+)
 
 _MAX_NOTE_LEN = 2000
 _MAX_TITLE_QUERY = 240
@@ -202,3 +210,120 @@ def log_tool_invocation(name: str, instance_id: str, args_preview: str) -> None:
     inst = (instance_id or "")[:12]
     preview = (args_preview or "")[:_MAX_LOG_ARG_LEN]
     print(f"[agent_tool] name={name} instance_id={inst!r} args_preview={preview!r}")
+
+
+def tool_update_content_preferences(raw_args: object, instance_id: str) -> tuple[dict[str, Any], str]:
+    import vec_store
+    from decision_logger import DecisionLogger
+
+    if not isinstance(raw_args, dict):
+        return {"ok": False, "error": "invalid_args"}, "Preferences not updated"
+    inst = instance_id or ""
+    prof = vec_store.instance_settings_get(inst)
+    cp = prof.get("content_preferences") if isinstance(prof.get("content_preferences"), dict) else {}
+    cp = dict(cp)
+    subs = [str(s).lower().strip().removeprefix("www.") for s in (cp.get("subscriptions") or []) if s]
+    for d in raw_args.get("add_subscriptions") or []:
+        t = str(d).lower().strip().removeprefix("www.")
+        if t and t not in subs:
+            subs.append(t)
+    for d in raw_args.get("remove_subscriptions") or []:
+        t = str(d).lower().strip().removeprefix("www.")
+        subs = [x for x in subs if x != t]
+    cp["subscriptions"] = subs
+    if raw_args.get("paywall_policy"):
+        cp["paywall_policy"] = str(raw_args["paywall_policy"])
+    if raw_args.get("preferred_types") is not None:
+        cp["preferred_types"] = [str(x) for x in raw_args["preferred_types"] if x]
+    if raw_args.get("avoid_types") is not None:
+        cp["avoid_types"] = [str(x) for x in raw_args["avoid_types"] if x]
+    vec_store.instance_settings_merge_json(inst, {"content_preferences": cp})
+    DecisionLogger.log_profile_update(
+        instance_id=inst,
+        input_summary="chat_tool update_content_preferences",
+        final_output=json.dumps(cp, ensure_ascii=False)[:4000],
+        reasoning_notes=json.dumps(
+            {k: raw_args.get(k) for k in ("add_subscriptions", "remove_subscriptions", "paywall_policy")},
+            default=str,
+        )[:2000],
+    )
+    return {"ok": True, "content_preferences": cp}, "Updated your content preferences"
+
+
+def tool_submit_content_feedback(raw_args: object, instance_id: str) -> tuple[dict[str, Any], str]:
+    if not isinstance(raw_args, dict):
+        return {"ok": False, "error": "invalid_args"}, "Feedback not recorded"
+    title = (raw_args.get("content_title") or "").strip()
+    if not title:
+        return {"ok": False, "error": "title_required"}, "Need a content title"
+    fb = str(raw_args.get("feedback") or "liked").lower()
+    try:
+        out = process_content_feedback(
+            instance_id or "",
+            content_title=title,
+            content_type=str(raw_args.get("content_type") or "article"),
+            content_url=(raw_args.get("content_url") or None),
+            feedback=fb,
+            user_notes=raw_args.get("user_notes"),
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}, f"Feedback error: {str(e)[:60]}"
+    return {"ok": True, **out}, "Recorded your feedback"
+
+
+def tool_request_focused_recommendation(raw_args: object, instance_id: str) -> tuple[dict[str, Any], str]:
+    import time
+
+    import vec_store
+    from decision_logger import DecisionLogger
+
+    from library import (
+        _filter_hits_basic,
+        _merge_perplexity_queries,
+        _listen_notes_search_episodes,
+        _pplx_search_api_key,
+        _subscriptions_from_profile_dict,
+        get_consumed_context,
+    )
+
+    if not isinstance(raw_args, dict):
+        return {"ok": False, "error": "invalid_args"}, "Search failed"
+    topic = (raw_args.get("topic") or "").strip()
+    if not topic:
+        return {"ok": False, "error": "topic_required"}, "Need a topic"
+    ctype = str(raw_args.get("content_type") or "any").lower()
+    inst = instance_id or ""
+    profile = vec_store.instance_settings_get(inst)
+    subs = _subscriptions_from_profile_dict(profile)
+    consumed_lower = (get_consumed_context(instance_id=inst) or "").lower()
+    t0 = time.perf_counter()
+    items: list[dict] = []
+    search_calls: list[dict] = []
+    if ctype == "podcast":
+        key = (os.getenv("LISTENNOTES_API_KEY") or "").strip()
+        if key and not PODCAST_API_PAUSED:
+            items = _listen_notes_search_episodes(topic, key, max_results=5)
+            for it in items:
+                it.pop("pub_date_ms", None)
+            search_calls.append({"api": "listen_notes", "query": topic, "results_count": len(items)})
+    elif _pplx_search_api_key():
+        hits = _merge_perplexity_queries([topic], max_per_query=6, max_total_hits=12)
+        hits = _filter_hits_basic(hits, consumed_lower, subs)
+        search_calls.append({"api": "perplexity_search", "query": topic, "results_count": len(hits)})
+        for h in hits[:5]:
+            items.append({
+                "title": h.get("title"),
+                "url": h.get("url"),
+                "snippet": (h.get("snippet") or "")[:320],
+            })
+    ms = int((time.perf_counter() - t0) * 1000)
+    urls = [str(i.get("url") or "") for i in items if i.get("url")]
+    DecisionLogger.log_link_search(
+        instance_id=inst,
+        input_summary=f"focused_rec topic={topic[:240]} type={ctype}",
+        final_output=json.dumps(items, ensure_ascii=False)[:8000],
+        search_api_calls=search_calls
+        + [{"urls_returned": urls[:15]}],
+        duration_ms=ms,
+    )
+    return {"ok": True, "results": items}, f"Found {len(items)} link(s) about that topic"

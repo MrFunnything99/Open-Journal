@@ -21,11 +21,14 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-from library import apply_library_tool_items, get_relevant_context, save_session_data
+from library import apply_library_tool_items, get_relevant_context_dual, ingest_journal_entry
 from agent_site_tools import (
     log_tool_invocation,
     tool_mark_recommendation_consumed,
     tool_navigate_ui,
+    tool_request_focused_recommendation,
+    tool_submit_content_feedback,
+    tool_update_content_preferences,
     tool_update_library_item,
 )
 
@@ -240,11 +243,91 @@ NAVIGATE_UI_TOOL = {
     },
 }
 
+UPDATE_CONTENT_PREFERENCES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "update_content_preferences",
+        "description": (
+            "Update subscriptions, paywall policy, and preferred/avoided content types when the user "
+            "mentions sources they subscribe to, paywalls, or what formats they want more/less of."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "add_subscriptions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Domains e.g. nytimes.com",
+                },
+                "remove_subscriptions": {"type": "array", "items": {"type": "string"}},
+                "paywall_policy": {
+                    "type": "string",
+                    "enum": ["only_subscribed", "allow_all", "no_paywalled"],
+                },
+                "preferred_types": {"type": "array", "items": {"type": "string"}},
+                "avoid_types": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+}
+
+SUBMIT_CONTENT_FEEDBACK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_content_feedback",
+        "description": (
+            "Record feedback on content they consumed (articles, books, podcasts). Capture why in user_notes when they explain."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content_title": {"type": "string"},
+                "content_type": {
+                    "type": "string",
+                    "enum": ["article", "book", "podcast", "video", "paper"],
+                },
+                "feedback": {
+                    "type": "string",
+                    "enum": ["liked", "disliked", "loved", "not_relevant"],
+                },
+                "user_notes": {"type": "string"},
+                "content_url": {"type": "string"},
+            },
+            "required": ["content_title", "feedback"],
+        },
+    },
+}
+
+REQUEST_FOCUSED_REC_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "request_focused_recommendation",
+        "description": (
+            "Search for real links on a topic the user asks about. Returns URLs from search APIs only."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "content_type": {
+                    "type": "string",
+                    "enum": ["article", "podcast", "book", "research", "any"],
+                    "default": "any",
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+}
+
 _CHAT_TOOLS = [
     LIBRARY_ITEMS_TOOL,
     UPDATE_LIBRARY_ITEM_TOOL,
     MARK_RECOMMENDATION_CONSUMED_TOOL,
     NAVIGATE_UI_TOOL,
+    UPDATE_CONTENT_PREFERENCES_TOOL,
+    SUBMIT_CONTENT_FEEDBACK_TOOL,
+    REQUEST_FOCUSED_REC_TOOL,
 ]
 
 
@@ -380,6 +463,15 @@ def _interviewer_run_with_tools(
                 agent_steps.append({"kind": "tool", "name": name, "summary": summ})
                 if action:
                     client_actions.append(action)
+            elif name == "update_content_preferences":
+                result, summ = tool_update_content_preferences(args, instance_id)
+                agent_steps.append({"kind": "tool", "name": name, "summary": summ})
+            elif name == "submit_content_feedback":
+                result, summ = tool_submit_content_feedback(args, instance_id)
+                agent_steps.append({"kind": "tool", "name": name, "summary": summ})
+            elif name == "request_focused_recommendation":
+                result, summ = tool_request_focused_recommendation(args, instance_id)
+                agent_steps.append({"kind": "tool", "name": name, "summary": summ})
             else:
                 result = {"ok": False, "error": f"unknown_tool:{name}"}
                 agent_steps.append({
@@ -466,6 +558,9 @@ def interviewer_node(state: JournalState) -> JournalState:
             "Use **update_library_item** to change an existing library item's **note** or **date_completed** when they ask to edit, rename phrasing in a note, or fix metadata (prefer **title_query** if you don't have an id). "
             "Use **mark_recommendation_consumed** when they say they finished or consumed a recommendation. "
             "Use **navigate_ui** when they explicitly ask to open another main screen (Recommendations, Brain, Chat, Home). "
+            "Use **update_content_preferences** when they mention subscriptions, outlets, paywalls, or types of media they want more/less of. "
+            "Use **submit_content_feedback** when they share how they felt about something they read, watched, or listened to — capture why in user_notes. "
+            "Use **request_focused_recommendation** when they want links on a specific topic; it returns verified URLs from search. "
             "Never claim you changed data unless the corresponding tool returned ok. Do not offer **navigate_ui** for destructive operations. "
             "After tool success, reply briefly and warmly. ",
     ]
@@ -477,9 +572,26 @@ def interviewer_node(state: JournalState) -> JournalState:
             query = str(state["messages"][-1])[:500]
         instance_id = state.get("instance_id") or ""
         try:
-            context = get_relevant_context(query, top_k_gist=10, top_k_episodic=6, instance_id=instance_id)
-            system_parts.append("\n\nRelevant context from the user's journals (use only as broad inspiration; do not assert or invent details not explicitly stated):\n" + context)
-            retrieval_log = context
+            processed, raw = get_relevant_context_dual(
+                query,
+                top_k_gist=10,
+                top_k_episodic=6,
+                instance_id=instance_id,
+                session_id=state.get("session_id"),
+                log=True,
+            )
+            ctx = (
+                "## Who This Person Is (your understanding)\n"
+                + (processed or "(no profile signals yet)")
+                + "\n\n## Relevant Context (from their actual entries)\n"
+                + raw
+            )
+            system_parts.append(
+                "\n\n"
+                + ctx
+                + "\n\n(use only as broad inspiration; do not assert or invent details not explicitly stated)"
+            )
+            retrieval_log = ctx
         except Exception:
             system_parts.append("\n\n(Memory retrieval unavailable; respond without prior context.)")
 
@@ -526,7 +638,7 @@ def librarian_node(state: JournalState) -> JournalState:
     session_id = state.get("session_id", "default")
     instance_id = state.get("instance_id") or ""
     transcript = _messages_to_transcript(state["messages"])
-    extracted = save_session_data(session_id, transcript, instance_id=instance_id)
+    extracted = ingest_journal_entry(session_id, transcript, instance_id=instance_id)
     return {
         "messages": [],
         "last_transcript": transcript,

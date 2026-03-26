@@ -28,6 +28,45 @@ const EMPTY_RECOMMENDATIONS: RecommendationsBundle = {
   news: [],
 };
 
+function RecFeedbackLinks({
+  category,
+  item,
+}: {
+  category: "book" | "podcast" | "article" | "research" | "news";
+  item: RecItem;
+}) {
+  const send = (action: "like" | "dislike") => {
+    void backendFetch("/recommendations/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action,
+        content_type: category,
+        item_title: item.title,
+        topic_tags: [item.title, item.author].filter(Boolean).join(" · ").slice(0, 200),
+      }),
+    });
+  };
+  return (
+    <div className="mt-1.5 flex flex-wrap gap-3 text-[11px]">
+      <button
+        type="button"
+        className="text-gray-500 hover:text-[#10a37f] dark:text-gray-400 dark:hover:text-emerald-400"
+        onClick={() => send("like")}
+      >
+        More like this
+      </button>
+      <button
+        type="button"
+        className="text-gray-500 hover:text-amber-800 dark:text-gray-400 dark:hover:text-amber-400/90"
+        onClick={() => send("dislike")}
+      >
+        Not for me
+      </button>
+    </div>
+  );
+}
+
 function readRecommendationsCache(): RecommendationsBundle {
   try {
     const raw = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
@@ -119,6 +158,8 @@ export const Personaplex = () => {
   const [recommendations, setRecommendations] = useState<RecommendationsBundle>(() => readRecommendationsCache());
   const [recommendationsLoading, setRecommendationsLoading] = useState(false);
   const recommendationsInFlightRef = useRef(false);
+  const [recColumnLoading, setRecColumnLoading] = useState<Partial<Record<keyof RecommendationsBundle, boolean>>>({});
+  const recColumnInFlightRef = useRef<Set<string>>(new Set());
   const [consumedIds, setConsumedIds] = useState<Set<string>>(new Set());
   const [removingKeys, setRemovingKeys] = useState<Set<string>>(new Set());
   const [libraryAddCategory, setLibraryAddCategory] = useState<"book" | "podcast" | "article" | "research" | null>(null);
@@ -517,6 +558,41 @@ export const Personaplex = () => {
     doFetch(retryCount >= 1);
   }, []);
 
+  const recColumnBtnClass =
+    "shrink-0 px-2 py-1 rounded-md text-[11px] font-medium bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-[#404040] dark:text-gray-400 dark:hover:bg-[#505050] disabled:opacity-50 disabled:cursor-not-allowed transition-colors";
+
+  const refreshRecommendationsColumn = useCallback((cat: keyof RecommendationsBundle) => {
+    if (recommendationsInFlightRef.current || recColumnInFlightRef.current.has(cat)) return;
+    recColumnInFlightRef.current.add(cat);
+    setRecColumnLoading((s) => ({ ...s, [cat]: true }));
+    const ac = new AbortController();
+    const timeoutId = setTimeout(() => ac.abort(), 125000);
+    backendFetch(`/recommendations?category=${encodeURIComponent(cat)}`, { signal: ac.signal })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
+      .then((data: Partial<RecommendationsBundle>) => {
+        const slice = data[cat];
+        if (!Array.isArray(slice)) return;
+        setRecommendations((prev) => {
+          const next = { ...prev, [cat]: slice };
+          try {
+            localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
+          } catch {
+            /* ignore */
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        setToastMessage("Could not refresh this column. Try again.");
+        setTimeout(() => setToastMessage(null), 4000);
+      })
+      .finally(() => {
+        clearTimeout(timeoutId);
+        recColumnInFlightRef.current.delete(cat);
+        setRecColumnLoading((s) => ({ ...s, [cat]: false }));
+      });
+  }, []);
+
   useEffect(() => {
     if (view !== "recommendations") return;
     void syncUnsyncedEntries();
@@ -550,7 +626,7 @@ export const Personaplex = () => {
   }, [view, recommendations]);
 
   const markConsumed = useCallback(
-    (type: "book" | "podcast" | "article" | "research", item: RecItem) => {
+    (type: "book" | "podcast" | "article" | "research" | "news", item: RecItem) => {
       const key = `${type}:${item.title}`;
       if (consumedIds.has(key)) return;
       backendFetch("/recommendations/consumed", {
@@ -572,7 +648,11 @@ export const Personaplex = () => {
         })
         .then(() => {
           setConsumedIds((prev) => new Set(prev).add(key));
-          setToastMessage(type === "book" || type === "article" || type === "research" ? "Marked as read." : type === "podcast" ? "Marked as listened." : "Marked as read.");
+          setToastMessage(
+            type === "podcast"
+              ? "Marked as listened."
+              : "Marked as read.",
+          );
           setTimeout(() => setToastMessage(null), 2500);
           setRemovingKeys((prev) => new Set(prev).add(key));
           const removeAfter = 320;
@@ -583,6 +663,7 @@ export const Personaplex = () => {
               podcasts: type === "podcast" ? prev.podcasts.filter((x) => x.title !== item.title) : prev.podcasts,
               articles: type === "article" ? prev.articles.filter((x) => x.title !== item.title) : prev.articles,
               research: type === "research" ? prev.research.filter((x) => x.title !== item.title) : prev.research,
+              news: type === "news" ? prev.news.filter((x) => x.title !== item.title) : prev.news,
             }));
             setRemovingKeys((prev) => {
               const next = new Set(prev);
@@ -853,7 +934,8 @@ export const Personaplex = () => {
                   </h2>
                   <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">
                     Based on your journal memory and what you’ve already read or listened to. Suggestions are kept on this
-                    device until you refresh. Mark items as read/listened so future runs get better.
+                    device until you refresh. Use <strong className="font-medium text-gray-600 dark:text-gray-300">Refresh</strong> in a
+                    column to update only that category (faster). Mark items as read/listened so future runs get better.
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -888,45 +970,20 @@ export const Personaplex = () => {
                   generate a new set (heavy; runs only when you ask).
                 </p>
               ) : (
-                <div className="space-y-6 pb-0">
-                  {recommendations.news.length > 0 && (
-                    <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4">
-                      <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
-                        <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">
-                          News — mostly uplifting
-                        </h3>
-                        <span className="text-[10px] text-gray-400 dark:text-gray-500">Open web via Perplexity Search</span>
-                      </div>
-                      <ul className="space-y-2.5">
-                        {recommendations.news.map((item, i) => (
-                          <li key={`news-${i}-${item.title}`} className="text-sm">
-                            <a
-                              href={
-                                item.url && item.url.startsWith("http")
-                                  ? item.url
-                                  : `https://www.google.com/search?q=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`
-                              }
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="font-medium text-gray-900 dark:text-gray-100 hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline"
-                            >
-                              {item.title}
-                            </a>
-                            {item.author ? (
-                              <span className="text-gray-500 dark:text-gray-400 text-xs ml-1.5">· {item.author}</span>
-                            ) : null}
-                            {item.reason ? (
-                              <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5 leading-snug">{item.reason}</p>
-                            ) : null}
-                          </li>
-                        ))}
-                      </ul>
-                    </section>
-                  )}
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 pb-0">
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-6 pb-0">
                   {/* Books */}
                   <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
-                    <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3">Books</h3>
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                      <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Books</h3>
+                      <button
+                        type="button"
+                        className={recColumnBtnClass}
+                        disabled={recommendationsLoading || recColumnLoading.books}
+                        onClick={() => refreshRecommendationsColumn("books")}
+                      >
+                        {recColumnLoading.books ? "…" : "Refresh"}
+                      </button>
+                    </div>
                     <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
                       {recommendations.books.length === 0 ? (
                         <p className="text-gray-500 dark:text-gray-400 text-xs">No book suggestions right now.</p>
@@ -955,6 +1012,7 @@ export const Personaplex = () => {
                               </a>
                               {item.author && <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">{item.author}</p>}
                               {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
+                              <RecFeedbackLinks category="book" item={item} />
                               <button
                                 type="button"
                                 onClick={() => markConsumed("book", item)}
@@ -971,18 +1029,28 @@ export const Personaplex = () => {
                   </section>
                   {/* Podcasts */}
                   <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
-                    <div className="flex flex-wrap items-baseline gap-2 mb-3">
-                      <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Podcasts</h3>
-                      <a
-                        href="https://www.listennotes.com/"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-[10px] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition-colors flex items-baseline gap-0.5"
-                        title="Podcast data by Listen Notes"
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                      <div className="flex flex-wrap items-baseline gap-2 min-w-0">
+                        <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Podcasts</h3>
+                        <a
+                          href="https://www.listennotes.com/"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-[10px] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition-colors flex items-baseline gap-0.5"
+                          title="Podcast data by Listen Notes"
+                        >
+                          <span className="lowercase font-normal">powered by</span>
+                          <span className="uppercase font-semibold text-gray-500 dark:text-gray-400">LISTEN NOTES</span>
+                        </a>
+                      </div>
+                      <button
+                        type="button"
+                        className={recColumnBtnClass}
+                        disabled={recommendationsLoading || recColumnLoading.podcasts}
+                        onClick={() => refreshRecommendationsColumn("podcasts")}
                       >
-                        <span className="lowercase font-normal">powered by</span>
-                        <span className="uppercase font-semibold text-gray-500 dark:text-gray-400">LISTEN NOTES</span>
-                      </a>
+                        {recColumnLoading.podcasts ? "…" : "Refresh"}
+                      </button>
                     </div>
                     <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
                       {recommendations.podcasts.length === 0 ? (
@@ -1034,6 +1102,7 @@ export const Personaplex = () => {
                                 </p>
                               )}
                               {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
+                              <RecFeedbackLinks category="podcast" item={item} />
                               <button
                                 type="button"
                                 onClick={() => markConsumed("podcast", item)}
@@ -1050,7 +1119,17 @@ export const Personaplex = () => {
                   </section>
                   {/* Articles */}
                   <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
-                    <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3">Articles</h3>
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                      <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Articles</h3>
+                      <button
+                        type="button"
+                        className={recColumnBtnClass}
+                        disabled={recommendationsLoading || recColumnLoading.articles}
+                        onClick={() => refreshRecommendationsColumn("articles")}
+                      >
+                        {recColumnLoading.articles ? "…" : "Refresh"}
+                      </button>
+                    </div>
                     <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
                       {recommendations.articles.length === 0 ? (
                         <p className="text-gray-500 dark:text-gray-400 text-xs">No article suggestions right now.</p>
@@ -1075,6 +1154,7 @@ export const Personaplex = () => {
                               </a>
                               {item.author && <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">{item.author}</p>}
                               {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
+                              <RecFeedbackLinks category="article" item={item} />
                               <button
                                 type="button"
                                 onClick={() => markConsumed("article", item)}
@@ -1091,7 +1171,17 @@ export const Personaplex = () => {
                   </section>
                   {/* Research papers */}
                   <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
-                    <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3">Research papers</h3>
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                      <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Research papers</h3>
+                      <button
+                        type="button"
+                        className={recColumnBtnClass}
+                        disabled={recommendationsLoading || recColumnLoading.research}
+                        onClick={() => refreshRecommendationsColumn("research")}
+                      >
+                        {recColumnLoading.research ? "…" : "Refresh"}
+                      </button>
+                    </div>
                     <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
                       {recommendations.research.length === 0 ? (
                         <p className="text-gray-500 dark:text-gray-400 text-xs">No research suggestions right now.</p>
@@ -1116,6 +1206,7 @@ export const Personaplex = () => {
                               </a>
                               {item.author && <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">{item.author}</p>}
                               {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
+                              <RecFeedbackLinks category="research" item={item} />
                               <button
                                 type="button"
                                 onClick={() => markConsumed("research", item)}
@@ -1130,7 +1221,65 @@ export const Personaplex = () => {
                       )}
                     </div>
                   </section>
-                </div>
+                  {/* News */}
+                  <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                      <div className="flex flex-wrap items-baseline gap-2 min-w-0">
+                        <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">News</h3>
+                        <span className="text-[10px] text-gray-400 dark:text-gray-500">Perplexity</span>
+                      </div>
+                      <button
+                        type="button"
+                        className={recColumnBtnClass}
+                        disabled={recommendationsLoading || recColumnLoading.news}
+                        onClick={() => refreshRecommendationsColumn("news")}
+                      >
+                        {recColumnLoading.news ? "…" : "Refresh"}
+                      </button>
+                    </div>
+                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
+                      {recommendations.news.length === 0 ? (
+                        <p className="text-gray-500 dark:text-gray-400 text-xs">No news suggestions right now.</p>
+                      ) : (
+                        recommendations.news.map((item, i) => {
+                          const cardKey = `news:${item.title}`;
+                          const isRemoving = removingKeys.has(cardKey);
+                          return (
+                            <div
+                              key={`news-${i}-${item.title}`}
+                              className={`rounded-lg bg-white dark:bg-[#343541] p-3 border border-gray-200 dark:border-gray-600 shadow-sm transition-all duration-300 ease-out ${
+                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
+                              }`}
+                            >
+                              <a
+                                href={
+                                  item.url && item.url.startsWith("http")
+                                    ? item.url
+                                    : `https://www.google.com/search?q=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`
+                                }
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-gray-900 dark:text-gray-100 text-sm font-medium hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline cursor-pointer"
+                              >
+                                {item.title}
+                              </a>
+                              {item.author && <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">{item.author}</p>}
+                              {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
+                              <RecFeedbackLinks category="news" item={item} />
+                              <button
+                                type="button"
+                                onClick={() => markConsumed("news", item)}
+                                disabled={consumedIds.has(cardKey)}
+                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-[#10a37f] hover:bg-[#0d8c6e] disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
+                              >
+                                {consumedIds.has(cardKey) ? "Marked as read" : "I've read this"}
+                              </button>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </section>
                 </div>
               )}
               </div>

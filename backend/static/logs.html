@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Decision logs</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem;
+      color: #e8e8e8; background: #111; }
+    h1 { font-size: 1.4rem; }
+    .row { border-bottom: 1px solid #333; padding: 0.65rem 0; cursor: pointer; }
+    .row:hover { background: #1a1a1a; }
+    .badge { display: inline-block; padding: 0.15rem 0.45rem; border-radius: 4px; font-size: 0.75rem;
+      margin-right: 0.5rem; background: #2a4a6a; color: #cfe8ff; }
+    pre { white-space: pre-wrap; background: #0d0d0d; padding: 1rem; border-radius: 6px; font-size: 0.82rem;
+      overflow-x: auto; }
+    label, input, button, select { margin-right: 0.5rem; }
+    input, select { background: #222; color: #eee; border: 1px solid #444; padding: 0.35rem; border-radius: 4px; }
+    button { background: #335; color: #fff; border: none; padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; }
+    .hint { color: #888; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Decision logs</h1>
+  <p class="hint">Scoped by <code>X-Instance-ID</code> (use a browser extension to set the header if needed).</p>
+  <div>
+    <label>action_type <input id="at" placeholder="optional" /></label>
+    <label>session_id <input id="sid" placeholder="optional" /></label>
+    <label>limit <input id="lim" type="number" value="50" style="width:4rem" /></label>
+    <button type="button" id="go">Load</button>
+  </div>
+  <div id="list"></div>
+  <h2 style="margin-top:1.5rem;font-size:1.1rem">Detail</h2>
+  <div id="detail"><p class="hint">Click a row</p></div>
+  <script>
+    const listEl = document.getElementById("list");
+    const detailEl = document.getElementById("detail");
+    function escapeHtml(s) {
+      return String(s || "").replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      }[c]));
+    }
+    async function load() {
+      const p = new URLSearchParams();
+      const at = document.getElementById("at").value.trim();
+      const sid = document.getElementById("sid").value.trim();
+      const lim = document.getElementById("lim").value || "50";
+      if (at) p.set("action_type", at);
+      if (sid) p.set("session_id", sid);
+      p.set("limit", lim);
+      let r;
+      try {
+        r = await fetch("/api/logs/decisions?" + p.toString());
+      } catch (e) {
+        listEl.innerHTML = "<p>Fetch failed (CORS or backend down?)</p>";
+        return;
+      }
+      if (!r.ok) {
+        listEl.innerHTML = "<p>HTTP " + r.status + "</p>";
+        return;
+      }
+      const j = await r.json();
+      listEl.innerHTML = "";
+      (j.logs || []).forEach((row) => {
+        const d = document.createElement("div");
+        d.className = "row";
+        d.innerHTML =
+          '<span class="badge">' + escapeHtml(row.action_type) + "</span>" +
+          "<strong>#" + escapeHtml(row.id) + "</strong> " + escapeHtml(row.timestamp || "") +
+          "<br><small>" + escapeHtml((row.input_summary || "").slice(0, 220)) + "</small>";
+        d.addEventListener("click", () => showDetail(row.id));
+        listEl.appendChild(d);
+      });
+    }
+    async function showDetail(id) {
+      detailEl.innerHTML = "<p>Loading…</p>";
+      const r = await fetch("/api/logs/decisions/" + id);
+      if (!r.ok) {
+        detailEl.innerHTML = "<p>Not found</p>";
+        return;
+      }
+      const row = await r.json();
+      detailEl.innerHTML = "<pre>" + escapeHtml(JSON.stringify(row, null, 2)) + "</pre>";
+    }
+    document.getElementById("go").addEventListener("click", load);
+    load();
+  </script>
+</body>
+</html>

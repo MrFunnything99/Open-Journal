@@ -264,7 +264,11 @@ export const useJournalHistory = () => {
         const r = await backendFetch("/ingest-history", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: text.trim(), entry_date: entry.date }),
+          body: JSON.stringify({
+            text: text.trim(),
+            entry_date: entry.date,
+            session_id: entry.id,
+          }),
         });
         const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };
         if (data && data.ok !== false) syncedIds.push(entry.id);
