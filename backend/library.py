@@ -3,9 +3,9 @@ Library for Selfmeridian: gist_facts (semantic) and episodic_log (episodic) memo
 and consumed_content (library). Uses SQLite + sqlite-vec for vector storage.
 
 Embeddings: Perplexity (`_embed_texts` → PERPLEXITY_API_KEY); without a key, placeholder vectors match EMBEDDING_DIM so library rows still persist (semantic search degraded).
-Extraction / chat helpers: OpenRouter (OPENROUTER_API_KEY + OPENROUTER_GEMINI_MODEL, default Gemini 3 Pro preview)
-when GEMINI_VIA_OPENROUTER is enabled, else `_get_gemini_client` + `generate_content` (GEMINI_API_KEY) — never used for embeddings.
-Set OPENROUTER_GEMINI_MAX_TOKENS (default 8192) so OpenRouter does not reserve ~65536 output tokens per call.
+Extraction / helpers: OpenRouter chat completions only (`OPENROUTER_API_KEY`; model `OPENROUTER_EXTRACTION_MODEL`, with legacy fallback `OPENROUTER_GEMINI_MODEL`).
+Books / articles / research agents: xAI Grok + OpenRouter web when `OPENROUTER_LIBRARY_WEB_MODEL` is set (default x-ai/grok-4.1-fast:online).
+Tune `OPENROUTER_EXTRACTION_MAX_TOKENS` (default 8192) so OpenRouter does not reserve huge output budgets per request.
 """
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
-from google import genai
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -62,8 +61,6 @@ def _rec_search_log_append(
     )
 
 
-# Gemini client for extraction / helpers only — embeddings use Perplexity (`_embed_texts`).
-_gemini_client: genai.Client | None = None
 _PERPLEXITY_EMBED_FALLBACK_WARNED = False
 
 PPLX_EMBEDDINGS_URL = "https://api.perplexity.ai/v1/embeddings"
@@ -73,32 +70,91 @@ PPLX_EMBED_BATCH_DOCS = 480
 DEFAULT_PERPLEXITY_EMBEDDING_MODEL = "pplx-embed-context-v1-4b"
 PPLX_SEARCH_URL = "https://api.perplexity.ai/search"
 OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_OPENROUTER_GEMINI_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_OPENROUTER_EXTRACTION_MODEL = "google/gemini-3-pro-preview"
+# Books / articles / research recommendation agents: xAI Grok + OpenRouter web plugin (`:online` = native provider search).
+DEFAULT_OPENROUTER_LIBRARY_WEB_MODEL = "x-ai/grok-4.1-fast:online"
 
 
-def _openrouter_gemini_disabled_explicitly() -> bool:
-    v = (os.getenv("GEMINI_VIA_OPENROUTER") or "").strip().lower()
-    return v in ("0", "false", "no", "off")
-
-
-def openrouter_gemini_enabled() -> bool:
-    """When True, `_call_gemini` uses OpenRouter instead of the Google Gemini SDK."""
-    if _openrouter_gemini_disabled_explicitly():
-        return False
+def openrouter_api_configured() -> bool:
     return bool((os.getenv("OPENROUTER_API_KEY") or "").strip())
 
 
-def openrouter_gemini_model() -> str:
-    return (os.getenv("OPENROUTER_GEMINI_MODEL") or DEFAULT_OPENROUTER_GEMINI_MODEL).strip()
+def openrouter_extraction_model() -> str:
+    return (
+        (os.getenv("OPENROUTER_EXTRACTION_MODEL") or os.getenv("OPENROUTER_GEMINI_MODEL") or DEFAULT_OPENROUTER_EXTRACTION_MODEL)
+        .strip()
+    )
+
+
+def _library_recommendations_openrouter_enabled() -> bool:
+    """When True, books/articles/research agents use OpenRouter (Grok + web) instead of Gemini (+ Google Search)."""
+    if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+        return False
+    v = (os.getenv("OPENROUTER_LIBRARY_WEB_MODEL") or DEFAULT_OPENROUTER_LIBRARY_WEB_MODEL).strip().lower()
+    return v not in ("0", "false", "no", "off", "disabled")
+
+
+def _openrouter_library_web_model() -> str:
+    return (os.getenv("OPENROUTER_LIBRARY_WEB_MODEL") or DEFAULT_OPENROUTER_LIBRARY_WEB_MODEL).strip()
+
+
+def _openrouter_library_fast_model() -> str:
+    """Same model family without `:online` for query-generation steps (no extra web plugin)."""
+    explicit = (os.getenv("OPENROUTER_LIBRARY_FAST_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    m = _openrouter_library_web_model()
+    if m.endswith(":online"):
+        return m[: -len(":online")] or "x-ai/grok-4.1-fast"
+    return m or "x-ai/grok-4.1-fast"
+
+
+def _call_library_rec_web(prompt: str) -> str:
+    if _library_recommendations_openrouter_enabled():
+        try:
+            to = float(os.getenv("OPENROUTER_LIBRARY_WEB_TIMEOUT_SEC", "120"))
+        except ValueError:
+            to = 120.0
+        return _openrouter_chat_completion(prompt, model=_openrouter_library_web_model(), timeout_sec=to)
+    if openrouter_api_configured():
+        return _call_gemini(prompt)
+    return ""
+
+
+def _call_library_rec_fast(prompt: str) -> str:
+    if _library_recommendations_openrouter_enabled():
+        try:
+            to = float(os.getenv("OPENROUTER_LIBRARY_FAST_TIMEOUT_SEC", "90"))
+        except ValueError:
+            to = 90.0
+        return _openrouter_chat_completion(prompt, model=_openrouter_library_fast_model(), timeout_sec=to)
+    if openrouter_api_configured():
+        return _call_gemini(prompt)
+    return ""
+
+
+def library_recommendations_llm_label() -> str:
+    """Short label for startup logs."""
+    if _library_recommendations_openrouter_enabled():
+        return (
+            f"OpenRouter {_openrouter_library_web_model()} (web) + "
+            f"{_openrouter_library_fast_model()} (query/planning)"
+        )
+    if openrouter_api_configured():
+        return f"OpenRouter {openrouter_extraction_model()} (set OPENROUTER_LIBRARY_WEB_MODEL for :online web)"
+    return "none (set OPENROUTER_API_KEY)"
+
+
+def extraction_llm_backend() -> str:
+    """Startup label: extraction / helper LLM (OpenRouter only)."""
+    if openrouter_api_configured():
+        return f"openrouter ({openrouter_extraction_model()})"
+    return "none (set OPENROUTER_API_KEY for extraction/helpers)"
 
 
 def gemini_extraction_backend() -> str:
-    """Startup label: how library extraction/helpers resolve the chat model."""
-    if openrouter_gemini_enabled():
-        return f"openrouter ({openrouter_gemini_model()})"
-    if (os.getenv("GEMINI_API_KEY") or "").strip():
-        return f"google ({(os.getenv('GEMINI_CHAT_MODEL') or 'gemini-3-flash-preview').strip()})"
-    return "none (set OPENROUTER_API_KEY or GEMINI_API_KEY)"
+    """Deprecated alias for startup logs; OpenRouter-only."""
+    return extraction_llm_backend()
 
 
 def _openrouter_normalize_message_content(msg: dict | None) -> str:
@@ -132,27 +188,34 @@ def _openrouter_chat_completion(
     model: str | None = None,
     temperature: float | None = None,
     timeout_sec: float | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
     if not key:
         return ""
     eff_timeout = float(timeout_sec) if timeout_sec is not None else float(
-        os.getenv("OPENROUTER_GEMINI_TIMEOUT_SEC", "75")
+        os.getenv("OPENROUTER_EXTRACTION_TIMEOUT_SEC") or os.getenv("OPENROUTER_GEMINI_TIMEOUT_SEC") or "75"
     )
-    m = (model or openrouter_gemini_model()).strip() or DEFAULT_OPENROUTER_GEMINI_MODEL
-    temp_raw = os.getenv("OPENROUTER_GEMINI_TEMPERATURE")
+    m = (model or openrouter_extraction_model()).strip() or DEFAULT_OPENROUTER_EXTRACTION_MODEL
+    temp_raw = os.getenv("OPENROUTER_EXTRACTION_TEMPERATURE") or os.getenv("OPENROUTER_GEMINI_TEMPERATURE")
     if temperature is not None:
         temp = float(temperature)
     elif temp_raw is not None and str(temp_raw).strip() != "":
         temp = float(temp_raw)
     else:
         temp = 0.7
-    # Without max_tokens, OpenRouter/Gemini often defaults to ~65536 and reserves budget per request → 402s on low credits.
-    _mt = (os.getenv("OPENROUTER_GEMINI_MAX_TOKENS") or "8192").strip()
-    try:
-        max_tokens = max(256, min(int(_mt), 65536))
-    except ValueError:
-        max_tokens = 8192
+    if max_tokens is not None:
+        try:
+            eff_max = max(32, min(int(max_tokens), 65536))
+        except (TypeError, ValueError):
+            eff_max = 256
+    else:
+        _mt = (os.getenv("OPENROUTER_EXTRACTION_MAX_TOKENS") or os.getenv("OPENROUTER_GEMINI_MAX_TOKENS") or "8192").strip()
+        try:
+            eff_max = max(256, min(int(_mt), 65536))
+        except ValueError:
+            eff_max = 8192
+    max_tokens = eff_max
     payload: dict = {
         "model": m,
         "messages": [{"role": "user", "content": prompt}],
@@ -208,20 +271,6 @@ def _ensure_storage() -> None:
     import vec_store
 
     vec_store.ensure_db()
-
-
-def _get_gemini_client() -> genai.Client:
-    """Lazy Gemini SDK client for `generate_content` only (extraction, recommendations helpers). Not used for embeddings."""
-    global _gemini_client
-    if _gemini_client is None:
-        key = os.getenv("GEMINI_API_KEY")
-        if not key:
-            raise ValueError(
-                "GEMINI_API_KEY is required for Gemini extraction and helper calls (generate_content). "
-                "Embeddings use PERPLEXITY_API_KEY only. See https://ai.google.dev/gemini-api/docs/get-started"
-            )
-        _gemini_client = genai.Client(api_key=key)
-    return _gemini_client
 
 
 def _decode_perplexity_int8_b64(b64: str) -> list[float]:
@@ -341,76 +390,26 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return out
 
 
-def _gemini_response_to_text(result) -> str:
-    """
-    Extract full text from a GenerateContentResponse, including parts that have thought=True.
-    The SDK's .text property skips thought parts, which can leave extraction (e.g. JSON) empty.
-    """
-    text = getattr(result, "text", "") or ""
-    if text and text.strip():
-        return text.strip()
-    try:
-        if not getattr(result, "candidates", None) or not result.candidates:
-            return ""
-        c0 = result.candidates[0]
-        if not getattr(c0, "content", None) or not getattr(c0.content, "parts", None):
-            return ""
-        out = []
-        for part in c0.content.parts:
-            ptext = getattr(part, "text", None)
-            if isinstance(ptext, str) and ptext.strip():
-                out.append(ptext)
-        return "\n".join(out).strip() if out else ""
-    except Exception as e:
-        print("[backend] _gemini_response_to_text fallback error:", e)
-        return ""
-
-
 def _call_gemini(prompt: str) -> str:
     """
-    Call the primary chat model for extraction/helpers: OpenRouter (Gemini 3 Pro preview by default)
-    when OPENROUTER_API_KEY is set and GEMINI_VIA_OPENROUTER is not disabled; otherwise Google Gemini SDK
-    (GEMINI_CHAT_MODEL, default gemini-3-flash-preview).
-    Returns the response text (empty string on failure).
-    For Google SDK responses, uses full text including thought parts so JSON extraction is not lost.
+    Extraction / helper LLM: OpenRouter chat completions only (`OPENROUTER_API_KEY`).
+    Returns empty string if OpenRouter is not configured or the request fails.
     """
-    if openrouter_gemini_enabled():
-        try:
-            return _openrouter_chat_completion(prompt)
-        except Exception as e:
-            print("[backend] _call_gemini (OpenRouter) error:", e)
-            return ""
+    if not openrouter_api_configured():
+        return ""
     try:
-        client = _get_gemini_client()
-        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
-        result = client.models.generate_content(model=model, contents=prompt)
-        text = _gemini_response_to_text(result)
-        return text.strip()
+        return _openrouter_chat_completion(prompt)
     except Exception as e:
-        print("[backend] _call_gemini error:", e)
+        print("[backend] _call_gemini (OpenRouter) error:", e)
         return ""
 
 
 def _call_gemini_with_google_search(prompt: str) -> str:
     """
-    Same as _call_gemini but with Google Search grounding so the model can use real-time web results.
-    When using OpenRouter, there is no Google Search tool — this calls the same completion as _call_gemini.
-    Falls back to _call_gemini if grounding is unavailable (e.g. SDK or model support).
+    Legacy name: previously Gemini + Google Search. Now identical to `_call_gemini`
+    unless `OPENROUTER_LIBRARY_WEB_MODEL` enables the `:online` path via `_call_library_rec_web`.
     """
-    if openrouter_gemini_enabled():
-        return _call_gemini(prompt)
-    try:
-        from google.genai import types
-        client = _get_gemini_client()
-        model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3-flash-preview")
-        grounding_tool = types.Tool(google_search=types.GoogleSearch())
-        config = types.GenerateContentConfig(tools=[grounding_tool])
-        result = client.models.generate_content(model=model, contents=prompt, config=config)
-        text = _gemini_response_to_text(result)
-        return text.strip()
-    except Exception as e:
-        print("[backend] _call_gemini_with_google_search fallback to plain _call_gemini:", e)
-        return _call_gemini(prompt)
+    return _call_gemini(prompt)
 
 
 def run_library_interview(
@@ -1249,7 +1248,7 @@ Profile (JSON):
         final_output=summary_text[:2000],
         reasoning_notes=f"threshold={threshold} episodic_chunks={len(texts)}",
         duration_ms=ms,
-        model_used=gemini_extraction_backend(),
+        model_used=extraction_llm_backend(),
     )
 
 
@@ -1361,7 +1360,7 @@ Recent journal excerpts (for connection only):
         final_output=f"tags={tags_str[:500]}",
         reasoning_notes=f"journal_themes={themes_str[:500]}",
         duration_ms=ms,
-        model_used=gemini_extraction_backend(),
+        model_used=extraction_llm_backend(),
     )
     return {"ok": True, "tags": tags_json, "reasoning": reasoning, "journal_themes": themes_json}
 
@@ -2126,7 +2125,7 @@ RECENT SESSION SUMMARIES:
 {recent_section}{consumed}
 
 Return ONLY JSON: [{{"title": "...", "author": "...", "reason": "..."}}, ...]"""
-        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+        return _parse_recommendation_json(_call_library_rec_web(prompt), [])
 
     q_prompt = f"""Suggest 3 short **web search** queries to discover **nonfiction or fiction books** (lists, reviews, "best books on…") for this person. Queries must help find real book titles and authors on the open web.
 Respect **did not enjoy** rows in CONSUMED — steer away from similar themes or authors they rejected.
@@ -2139,7 +2138,7 @@ RECENT SESSION SUMMARIES:
 {recent_section}{consumed[:6000]}
 
 Return ONLY a JSON array of 3 strings. Example: ["best psychology books for anxiety 2024", "literary fiction grief healing"]"""
-    queries = _parse_json_string_list(_call_gemini(q_prompt))
+    queries = _parse_json_string_list(_call_library_rec_fast(q_prompt))
     if len(queries) < 2:
         queries = ["best nonfiction books personal growth highly rated", "literary fiction book recommendations deep characters"]
     consumed_lower = (consumed or "").lower()
@@ -2156,7 +2155,7 @@ Return ONLY a JSON array of 3 strings. Example: ["best psychology books for anxi
 facts: {facts_blob[:2000]}
 summaries: {summaries_blob[:2000]}
 Return ONLY JSON array: [{{"title","author","reason","url"}}] url optional."""
-        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+        return _parse_recommendation_json(_call_library_rec_web(prompt), [])
 
     curate = f"""You are a book curator. Pick **3–5 distinct books** for this user using ONLY information grounded in SEARCH_RESULTS (real books mentioned there). Map each to canonical **title** and **author** as in the source; **url** must be copied exactly from SEARCH_RESULTS when present (review, publisher, Goodreads, etc.) or "".
 Tie each **reason** to the user's themes in CONTEXT; keep reasons one sentence, honest.
@@ -2173,10 +2172,10 @@ SEARCH_RESULTS:
 
 Rules: Do NOT output books that appear in CONSUMED as already read. Avoid books/authors clearly similar to **did not enjoy** notes.
 Return ONLY JSON: [{{"title": "...", "author": "...", "reason": "...", "url": "..."}}, ...]"""
-    out = _parse_recommendation_json(_call_gemini(curate), [])
+    out = _parse_recommendation_json(_call_library_rec_fast(curate), [])
     # Fallback if Gemini returned empty
     if not out:
-        return _parse_recommendation_json(_call_gemini_with_google_search(curate), [])
+        return _parse_recommendation_json(_call_library_rec_web(curate), [])
     return out[:8]
 
 
@@ -2558,7 +2557,7 @@ RECENT SESSION SUMMARIES:
 {recent_section}{consumed}
 
 Return ONLY JSON: [{{"title","author","reason","url"}}, ...]"""
-        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+        return _parse_recommendation_json(_call_library_rec_web(prompt), [])
 
     q_prompt = f"""Suggest 2–3 short **web search** queries for **in-depth readable articles**: explainers, essays, analysis, studies written for educated readers—not breaking headline chyrons.
 Honor CONSUMED: respect **did not enjoy** and negative notes.
@@ -2571,7 +2570,7 @@ RECENT SESSION SUMMARIES:
 {recent_section}{consumed[:6000]}
 
 Return ONLY JSON array of 2–3 strings. Example: ["long read climate adaptation solutions", "cognitive science of habit formation explainer"]"""
-    queries = _parse_json_string_list(_call_gemini(q_prompt))
+    queries = _parse_json_string_list(_call_library_rec_fast(q_prompt))
     if len(queries) < 2:
         queries = ["thought-provoking long read science society", "deep dive psychology well-being evidence"]
     consumed_lower = (consumed or "").lower()
@@ -2606,7 +2605,7 @@ Return ONLY JSON array of 2–3 strings. Example: ["long read climate adaptation
             item["reason"] = reasons[i] if i < len(reasons) else item.get("reason", "")
         print(f"[backend] Articles: Perplexity path returning {len(out)} articles.")
         return out
-    return _parse_recommendation_json(_call_gemini_with_google_search(
+    return _parse_recommendation_json(_call_library_rec_web(
         f"Suggest 3 articles with real URLs for this user. {recent_section}{consumed[:3000]}\nfacts:{facts_blob[:1500]}"
     ), [])
 
@@ -2890,7 +2889,7 @@ RECENT SESSION SUMMARIES:
 {recent_section}{consumed}
 
 Return ONLY JSON: [{{"title","author","reason","url"}}, ...]"""
-        return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+        return _parse_recommendation_json(_call_library_rec_web(prompt), [])
 
     q_prompt = f"""Suggest 2–3 short **web search** queries to find **peer-reviewed research papers, systematic reviews, or reputable preprints** (PubMed, arXiv, journal DOI pages). Be concrete; include methodology terms when useful (RCT, meta-analysis, cohort).
 Honor CONSUMED — avoid subfields or angles the user disliked.
@@ -2903,7 +2902,7 @@ RECENT SESSION SUMMARIES:
 {recent_section}{consumed[:6000]}
 
 Return ONLY JSON array of 2–3 strings."""
-    queries = _parse_json_string_list(_call_gemini(q_prompt))
+    queries = _parse_json_string_list(_call_library_rec_fast(q_prompt))
     if len(queries) < 2:
         queries = [
             "randomized controlled trial mental health well-being recent",
@@ -2954,7 +2953,7 @@ Return ONLY JSON array of 2–3 strings."""
 JOURNAL CONTEXT: {facts_blob[:2000]}
 RECENT SESSION SUMMARIES: {summaries_blob[:2000]}
 Return ONLY JSON array."""
-    return _parse_recommendation_json(_call_gemini_with_google_search(prompt), [])
+    return _parse_recommendation_json(_call_library_rec_web(prompt), [])
 
 
 def _news_agent(
@@ -3132,7 +3131,7 @@ Profile JSON:
 Library/consumed excerpt:
 {consumed[:2800]}
 """
-    raw = (_call_gemini(prompt) or "").strip()
+    raw = (_call_library_rec_fast(prompt) or "").strip()
     suggestions: list = []
     try:
         txt = raw
@@ -3222,7 +3221,7 @@ Library/consumed excerpt:
         reasoning_notes=f"subscription_domains={subs[:2]}",
         duration_ms=ms,
         search_api_calls=_rec_search_log_snapshot(),
-        model_used=gemini_extraction_backend(),
+        model_used=extraction_llm_backend(),
     )
     return out
 
@@ -3339,7 +3338,7 @@ def generate_recommendations_category(instance_id: str, category: str) -> dict:
         final_output=json.dumps(out, ensure_ascii=False, default=str)[:12000],
         reasoning_notes=json.dumps({f"{cat}_ms": total_ms}),
         duration_ms=total_ms,
-        model_used=gemini_extraction_backend(),
+        model_used=extraction_llm_backend(),
         search_api_calls=_rec_search_log_snapshot(),
     )
     return out
@@ -3448,7 +3447,7 @@ def generate_recommendations(instance_id: str = "") -> dict:
         final_output=json.dumps(out, ensure_ascii=False, default=str)[:12000],
         reasoning_notes=json.dumps(per_agent),
         duration_ms=total_ms,
-        model_used=gemini_extraction_backend(),
+        model_used=extraction_llm_backend(),
         search_api_calls=_rec_search_log_snapshot(),
     )
     return out

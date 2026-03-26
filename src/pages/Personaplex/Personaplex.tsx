@@ -6,8 +6,9 @@ import { BrainLayout, type BrainLibraryCategory } from "./components/BrainLayout
 import { VoiceMemoTab } from "./components/VoiceMemoTab";
 import { BrainCalendarPanel } from "./components/BrainCalendarPanel";
 import { PersonaplexChatProvider, type PersonaplexNavigateAction } from "./PersonaplexChatContext";
-import { MobileAskComposerDock } from "./components/GlobalAskAnythingBar";
+import { MobileAskComposerDockGate } from "./components/GlobalAskAnythingBar";
 import { PersonaplexLeftRail } from "./components/PersonaplexLeftRail";
+import { HomeChatSidebar } from "./components/HomeChatSidebar";
 
 const RECOMMENDATIONS_CACHE_KEY = "openjournal-recommendations-cache";
 const LIBRARY_CACHE_KEY = "openjournal-library-cache";
@@ -56,13 +57,13 @@ function RecFeedbackLinks({
       >
         More like this
       </button>
-      <button
-        type="button"
+            <button
+              type="button"
         className="text-gray-500 hover:text-amber-800 dark:text-gray-400 dark:hover:text-amber-400/90"
         onClick={() => send("dislike")}
-      >
+            >
         Not for me
-      </button>
+            </button>
     </div>
   );
 }
@@ -131,7 +132,7 @@ function librarySnapshotToBulkPayload(next: {
   return items;
 }
 
-type PersonaplexView = "voice_memo" | "brain" | "recommendations" | "journal";
+type PersonaplexView = "voice_memo" | "brain" | "recommendations";
 
 export const Personaplex = () => {
   const [view, setView] = useState<PersonaplexView>("voice_memo");
@@ -147,8 +148,9 @@ export const Personaplex = () => {
       let navigated = false;
       for (const a of actions) {
         if (a.type !== "navigate") continue;
-        setView(a.view);
-        if (a.view === "brain" && a.brainSection) setBrainSection(a.brainSection);
+        const target: PersonaplexView = a.view === "journal" ? "voice_memo" : a.view;
+        setView(target);
+        if (target === "brain" && a.brainSection) setBrainSection(a.brainSection);
         navigated = true;
       }
       if (navigated) chatToast("Opened the screen you asked for.");
@@ -732,25 +734,29 @@ export const Personaplex = () => {
         setView={setView}
       />
 
+      <div className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
       <div className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       {/* Header — centered brand; nav lives in left rail (Open WebUI–style shell) */}
       <header className="relative z-20 flex-none px-4 py-3 sm:px-6 sm:py-4">
-        <div className="flex items-center justify-center gap-3">
-          <button
-            type="button"
-            className="rounded-full border border-white/15 bg-white/10 p-2.5 text-white shadow-sm backdrop-blur-md md:hidden"
-            onClick={() => setMobileRailOpen(true)}
-            aria-label="Open menu"
-          >
-            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-            </svg>
-          </button>
-          <div className="glass-panel flex min-w-0 max-w-full flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-full px-4 py-2.5 text-center">
+        <div className="flex w-full items-center gap-2">
+          <div className="flex min-w-0 flex-1 justify-start">
+            <button
+              type="button"
+              className="rounded-full border border-white/15 bg-white/10 p-2.5 text-white shadow-sm backdrop-blur-md md:hidden"
+              onClick={() => setMobileRailOpen(true)}
+              aria-label="Open menu"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+          </div>
+          <div className="glass-panel flex min-w-0 max-w-full shrink-0 flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-full px-4 py-2.5 text-center">
             <h1 className="shrink-0 text-xs font-medium uppercase tracking-[0.2em] text-white sm:text-sm md:text-base">
               Selfmeridian
             </h1>
           </div>
+          <div className="min-w-0 flex-1" />
         </div>
       </header>
 
@@ -767,17 +773,13 @@ export const Personaplex = () => {
       <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
         <div
           className={`flex-1 flex flex-col min-h-0 transition-opacity duration-300 ${
-            view === "brain" || view === "voice_memo" || view === "journal" ? "overflow-hidden" : "overflow-y-auto"
+            view === "brain" || view === "voice_memo" || view === "recommendations"
+              ? "overflow-hidden"
+              : "overflow-y-auto"
           } opacity-100`}
         >
-          {(view === "voice_memo" || view === "journal") && (
-            <VoiceMemoTab
-              onToast={chatToast}
-              saveEntry={saveEntry}
-              syncUnsyncedEntries={syncUnsyncedEntries}
-              elevateComposerLayout={view === "journal"}
-              onOpenFullChat={view === "voice_memo" ? () => setView("journal") : undefined}
-            />
+          {view === "voice_memo" && (
+            <VoiceMemoTab onToast={chatToast} saveEntry={saveEntry} syncUnsyncedEntries={syncUnsyncedEntries} />
           )}
           {view === "brain" && (
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -786,20 +788,20 @@ export const Personaplex = () => {
                   <div className="min-w-0 flex-1">
                     <h2 className="text-sm font-medium text-white/90 md:text-base">
                       {brainSection === "knowledgeBase" ? "Knowledge base" : "Calendar"}
-                    </h2>
+                </h2>
                     <p className="mt-1 text-xs text-white/50 md:text-sm">
                       {brainSection === "knowledgeBase"
                         ? "Journal entries, conversation transcripts, and your books & media library."
                         : "Click a date for an AI summary of that day (journal entries + memory)."}
                     </p>
-                  </div>
+                        </div>
                   <div
                     className="flex shrink-0 gap-1 rounded-xl border border-white/10 bg-white/[0.06] p-1"
                     role="tablist"
                     aria-label="Brain section"
                   >
-                    <button
-                      type="button"
+                  <button
+                    type="button"
                       role="tab"
                       aria-selected={brainSection === "knowledgeBase"}
                       onClick={() => setBrainSection("knowledgeBase")}
@@ -811,11 +813,11 @@ export const Personaplex = () => {
                     >
                       <svg className="h-4 w-4 shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                      </svg>
+                        </svg>
                       <span className="whitespace-nowrap">Knowledge base</span>
-                    </button>
-                    <button
-                      type="button"
+                      </button>
+                      <button
+                        type="button"
                       role="tab"
                       aria-selected={brainSection === "calendar"}
                       onClick={() => setBrainSection("calendar")}
@@ -827,12 +829,12 @@ export const Personaplex = () => {
                     >
                       <svg className="h-4 w-4 shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                      </svg>
+                        </svg>
                       <span className="whitespace-nowrap">Calendar</span>
-                    </button>
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
               {brainSection === "knowledgeBase" ? (
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                 <BrainLayout
@@ -852,32 +854,32 @@ export const Personaplex = () => {
                   librarySubmitting={librarySubmitting}
                   onSubmitLibraryAdd={() => {
                     if (!libraryDraftText.trim() || librarySubmitting || !libraryAddCategory) return;
-                    setLibrarySubmitting(true);
-                    const payload = libraryDraftText.trim();
-                    backendFetch("/library-notes", {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
+                                    setLibrarySubmitting(true);
+                                    const payload = libraryDraftText.trim();
+                                    backendFetch("/library-notes", {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({ text: payload, type: libraryAddCategory }),
-                    })
-                      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Library update failed"))))
-                      .then((data: { ok?: boolean; items_added?: number }) => {
-                        const added = data?.items_added ?? 0;
-                        setLibraryDraftText("");
+                                    })
+                                      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Library update failed"))))
+                                      .then((data: { ok?: boolean; items_added?: number }) => {
+                                        const added = data?.items_added ?? 0;
+                                        setLibraryDraftText("");
                         setLibraryAddCategory(null);
-                        if (added > 0) fetchLibrary();
+                                        if (added > 0) fetchLibrary();
                         setToastMessage(added > 0 ? `Added ${added} item(s).` : "No items recognized; try clearer titles.");
-                        setTimeout(() => setToastMessage(null), 4000);
-                      })
-                      .catch(() => {
-                        setToastMessage("Library update failed.");
-                        setTimeout(() => setToastMessage(null), 4000);
-                      })
-                      .finally(() => setLibrarySubmitting(false));
-                  }}
+                                        setTimeout(() => setToastMessage(null), 4000);
+                                      })
+                                      .catch(() => {
+                                        setToastMessage("Library update failed.");
+                                        setTimeout(() => setToastMessage(null), 4000);
+                                      })
+                                      .finally(() => setLibrarySubmitting(false));
+                                  }}
                   onCancelLibraryAdd={() => {
                     setLibraryAddCategory(null);
-                    setLibraryDraftText("");
-                  }}
+                                    setLibraryDraftText("");
+                                  }}
                   onClickAddLibrary={(cat: BrainLibraryCategory) => {
                     setLibraryAddCategory((prev) => (prev === cat ? null : cat));
                     setLibraryDraftText("");
@@ -890,17 +892,17 @@ export const Personaplex = () => {
                   }}
                   onDeleteLibraryItem={(_cat, id) => {
                     backendFetch(`/library/${encodeURIComponent(id)}`, { method: "DELETE" })
-                      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Delete failed"))))
-                      .then((data: { ok?: boolean }) => {
-                        if (data?.ok !== false) {
-                          fetchLibrary();
+                                  .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Delete failed"))))
+                                  .then((data: { ok?: boolean }) => {
+                                    if (data?.ok !== false) {
+                                      fetchLibrary();
                           setToastMessage("Removed from library.");
-                          setTimeout(() => setToastMessage(null), 2000);
-                        }
-                      })
-                      .catch(() => {
-                        setToastMessage("Failed to remove.");
-                        setTimeout(() => setToastMessage(null), 3000);
+                                      setTimeout(() => setToastMessage(null), 2000);
+                                    }
+                                  })
+                                  .catch(() => {
+                                    setToastMessage("Failed to remove.");
+                                    setTimeout(() => setToastMessage(null), 3000);
                       });
                   }}
                   onDownloadKnowledgeBase={handleDownloadKnowledgeBase}
@@ -926,8 +928,8 @@ export const Personaplex = () => {
             </div>
           )}
           {view === "recommendations" && (
-            <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-24 pt-4 md:px-6 md:pt-6 md:pb-28">
-              <div className="flex-shrink-0 flex flex-wrap items-center justify-between gap-3 mb-4">
+            <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden px-3 pb-3 pt-2 sm:px-4 sm:pb-4 sm:pt-3 md:px-6">
+              <div className="mb-3 flex flex-shrink-0 flex-wrap items-center justify-between gap-3">
                 <div>
                   <h2 className="text-lg font-medium text-gray-800 dark:text-gray-200 uppercase tracking-wider">
                     Recommendations
@@ -939,40 +941,44 @@ export const Personaplex = () => {
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
+                              <button
+                                type="button"
                     onClick={() => refreshRecommendationsFromApi()}
                     disabled={recommendationsLoading}
                     className="px-3 py-2 rounded-lg bg-gray-100 text-gray-600 text-sm font-medium hover:bg-gray-200 dark:bg-[#404040] dark:text-gray-400 dark:hover:bg-[#505050] disabled:opacity-50 transition-colors"
                   >
                     {recommendationsLoading ? "Updating…" : "Refresh recommendations"}
-                  </button>
-                </div>
-              </div>
-              <div className="flex-1 min-h-0 overflow-auto">
+                              </button>
+                            </div>
+                          </div>
+              <div className="min-h-0 flex-1 overflow-hidden">
               {recommendationsLoading &&
               !recommendations.books.length &&
               !recommendations.podcasts.length &&
               !recommendations.articles.length &&
               !recommendations.research.length &&
               !recommendations.news.length ? (
+                <div className="h-full min-h-0 overflow-y-auto pr-1">
                 <p className="text-gray-500 dark:text-gray-400 text-sm">
                   Loading recommendations… This can take up to ~90 seconds.
                 </p>
+                        </div>
               ) : !recommendationsLoading &&
                 !recommendations.books.length &&
                 !recommendations.podcasts.length &&
                 !recommendations.articles.length &&
                 !recommendations.research.length &&
                 !recommendations.news.length ? (
+                <div className="h-full min-h-0 overflow-y-auto pr-1">
                 <p className="text-gray-500 dark:text-gray-400 text-sm">
                   No cached suggestions yet. Click <strong className="font-medium text-gray-700 dark:text-gray-300">Refresh recommendations</strong> to
                   generate a new set (heavy; runs only when you ask).
                 </p>
+                      </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-6 pb-0">
+                <div className="grid h-full min-h-0 auto-rows-[minmax(0,1fr)] grid-cols-1 gap-4 md:grid-cols-2 md:gap-5 xl:grid-cols-5 xl:gap-4">
                   {/* Books */}
-                  <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
+                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                       <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Books</h3>
                       <button
@@ -1028,18 +1034,18 @@ export const Personaplex = () => {
                     </div>
                   </section>
                   {/* Podcasts */}
-                  <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
+                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                       <div className="flex flex-wrap items-baseline gap-2 min-w-0">
                         <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Podcasts</h3>
-                        <a
-                          href="https://www.listennotes.com/"
-                          target="_blank"
-                          rel="noopener noreferrer"
+                      <a
+                        href="https://www.listennotes.com/"
+                        target="_blank"
+                        rel="noopener noreferrer"
                           className="text-[10px] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition-colors flex items-baseline gap-0.5"
-                          title="Podcast data by Listen Notes"
-                        >
-                          <span className="lowercase font-normal">powered by</span>
+                        title="Podcast data by Listen Notes"
+                      >
+                        <span className="lowercase font-normal">powered by</span>
                           <span className="uppercase font-semibold text-gray-500 dark:text-gray-400">LISTEN NOTES</span>
                         </a>
                       </div>
@@ -1118,7 +1124,7 @@ export const Personaplex = () => {
                     </div>
                   </section>
                   {/* Articles */}
-                  <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
+                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                       <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Articles</h3>
                       <button
@@ -1170,7 +1176,7 @@ export const Personaplex = () => {
                     </div>
                   </section>
                   {/* Research papers */}
-                  <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
+                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                       <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Research papers</h3>
                       <button
@@ -1222,7 +1228,7 @@ export const Personaplex = () => {
                     </div>
                   </section>
                   {/* News */}
-                  <section className="rounded-2xl bg-white border border-gray-100 shadow-sm dark:rounded-xl dark:bg-[#2f2f2f] dark:border-gray-700 p-4 flex flex-col">
+                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                       <div className="flex flex-wrap items-baseline gap-2 min-w-0">
                         <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">News</h3>
@@ -1376,10 +1382,10 @@ export const Personaplex = () => {
         </div>
       </main>
 
-      {/* Footer — on md+ the composer lives in the left rail; mobile keeps a fixed dock */}
+      {/* Footer — mobile Home uses a fixed dock when the conversation is active; Chat uses the inline composer */}
       <footer className="pointer-events-none relative z-10 flex-shrink-0 px-4 pb-[calc(4.5rem+env(safe-area-inset-bottom))] pt-1 text-center md:pb-5">
         <p className="pointer-events-auto text-xs text-white/60">
-          Chat from the bottom of the sidebar. On Home, record or attach audio to add journal entries. On phones, the composer stays at the bottom.
+          On Home (desktop), open or resize the chat column on the right for history—the same width rules as Open WebUI. Record or attach audio for journal entries.
         </p>
         <p className="pointer-events-auto mx-auto mt-1 max-w-xl text-[10px] leading-relaxed text-white/40">
           This is a prototype. Please avoid sharing highly sensitive personal information until our data pipeline is more secure. For private or stress testing, run the app locally and use local LLMs.
@@ -1402,7 +1408,10 @@ export const Personaplex = () => {
         </div>
       </footer>
 
-      <MobileAskComposerDock hidden={mobileRailOpen} />
+      <MobileAskComposerDockGate railOpen={mobileRailOpen} activeView={view} />
+      </div>
+
+      <HomeChatSidebar active={view === "voice_memo"} />
       </div>
 
       {libraryEditingId ? (() => {
@@ -1528,7 +1537,7 @@ export const Personaplex = () => {
                 </div>
               </div>
             </div>
-          </div>
+    </div>
         );
       })() : null}
 

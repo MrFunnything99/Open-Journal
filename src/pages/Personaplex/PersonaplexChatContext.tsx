@@ -39,6 +39,8 @@ function parseNavigateActions(raw: unknown): PersonaplexNavigateAction[] {
   return out;
 }
 import { backendFetch } from "../../backendApi";
+import type { ChatInteractionMode } from "./chatInteractionModes";
+import { blobToWavBase64 } from "./utils/audioToWav";
 
 const CHAT_TIMEOUT_MS = 90_000;
 
@@ -68,18 +70,6 @@ export type ChatRecentEntry = {
 const RECENTS_STORAGE_KEY = "personaplex-chat-recents";
 const MAX_RECENTS = 14;
 const MAX_ACTIVITY = 60;
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onloadend = () => {
-      const d = r.result as string;
-      resolve(d.split(",")[1] ?? "");
-    };
-    r.onerror = () => reject(new Error("read failed"));
-    r.readAsDataURL(blob);
-  });
-}
 
 export function defaultFilenameForMicBlob(mimeType: string): string {
   const mt = (mimeType || "").toLowerCase();
@@ -176,12 +166,19 @@ type PersonaplexChatContextValue = {
   stopRecording: () => void;
   fileInputRef: React.MutableRefObject<HTMLInputElement | null>;
   onPickFile: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  pendingAudioFile: File | null;
+  clearPendingAudioFile: () => void;
+  /** Set by sendChat when journal mode + pending file; VoiceMemoTab watches and processes via journal pipeline. */
+  journalFileToProcess: File | null;
+  clearJournalFileToProcess: () => void;
   composerDisabled: boolean;
   activityLog: AgentActivityEntry[];
   clearActivityLog: () => void;
   chatRecents: ChatRecentEntry[];
   loadRecentSession: (sessionId: string) => void;
   newChat: () => void;
+  chatInteractionMode: ChatInteractionMode;
+  setChatInteractionMode: (m: ChatInteractionMode) => void;
 };
 
 const PersonaplexChatContext = createContext<PersonaplexChatContextValue | null>(null);
@@ -215,11 +212,14 @@ export function PersonaplexChatProvider({
   const [liveDictationText, setLiveDictationText] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
   const [isChatActive, setIsChatActive] = useState(false);
+  const [chatInteractionMode, setChatInteractionMode] = useState<ChatInteractionMode>("conversation");
   const [activityLog, setActivityLog] = useState<AgentActivityEntry[]>([]);
   const [chatRecents, setChatRecents] = useState<ChatRecentEntry[]>(() =>
     typeof window !== "undefined" ? readRecentsFromStorage() : []
   );
 
+  const [pendingAudioFile, setPendingAudioFile] = useState<File | null>(null);
+  const [journalFileToProcess, setJournalFileToProcess] = useState<File | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -312,19 +312,16 @@ export function PersonaplexChatProvider({
   }, []);
 
   const transcribeBlob = useCallback(
-    async (blob: Blob, mimeType: string) => {
+    async (blob: Blob) => {
       setMicPhase("processing");
       setChatError(null);
       try {
-        const b64 = await blobToBase64(blob);
-        const filename =
-          blob instanceof File && blob.name?.trim()
-            ? blob.name.trim()
-            : defaultFilenameForMicBlob(mimeType);
+        const b64 = await blobToWavBase64(blob);
+        const filename = "dictation.wav";
         const res = await backendFetch("/voice-memo", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ audio: b64, filename, mime_type: mimeType }),
+          body: JSON.stringify({ audio: b64, filename, mime_type: "audio/wav" }),
         });
         const data = (await res.json().catch(() => ({}))) as {
           detail?: string;
@@ -356,14 +353,43 @@ export function PersonaplexChatProvider({
   );
 
   const sendChat = useCallback(async () => {
-    const text = draft.trim();
-    if (!text || sending) return;
+    let text = draft.trim();
+    const audioFile = pendingAudioFile;
+
+    if (!text && !audioFile) return;
+    if (sending) return;
+
+    // Journal mode + pending audio → hand off to VoiceMemoTab's journal pipeline
+    if (chatInteractionMode === "journal" && audioFile) {
+      setPendingAudioFile(null);
+      setDraft("");
+      setJournalFileToProcess(audioFile);
+      return;
+    }
+
     setIsChatActive(true);
     setChatError(null);
     setDraft("");
+    if (audioFile) setPendingAudioFile(null);
+
+    if (audioFile) {
+      pushActivity({ kind: "system", summary: `Transcribing attached audio: ${audioFile.name}` });
+      setSending(true);
+      const t = await transcribeBlob(audioFile);
+      if (t) {
+        text = text ? `${text}\n\n${t.polished}` : t.polished;
+        pushActivity({ kind: "system", summary: "Transcribed audio file." });
+      } else {
+        setSending(false);
+        return;
+      }
+    }
+
+    if (!text) { setSending(false); return; }
+
     setMessages((m) => [...m, { id: `u_${Date.now()}`, role: "user", content: text }]);
     pushActivity({ kind: "user", summary: `You: ${text.length > 120 ? `${text.slice(0, 120)}…` : text}` });
-    setSending(true);
+    if (!audioFile) setSending(true);
 
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), CHAT_TIMEOUT_MS);
@@ -476,7 +502,7 @@ export function PersonaplexChatProvider({
     } finally {
       setSending(false);
     }
-  }, [draft, sending, chatSessionId, onToast, pushActivity, bumpRecents]);
+  }, [draft, sending, chatSessionId, onToast, pushActivity, bumpRecents, pendingAudioFile, transcribeBlob, chatInteractionMode]);
 
   const startRecording = useCallback(async () => {
     if (micPhase !== "idle" || sending) return;
@@ -499,7 +525,7 @@ export function PersonaplexChatProvider({
         const blob = new Blob(chunksRef.current, { type: mimeDone });
         mediaRecorderRef.current = null;
         void (async () => {
-          const t = await transcribeBlob(blob, mimeDone);
+          const t = await transcribeBlob(blob);
           if (t) {
             setIsChatActive(true);
             setDraft((d) => (d.trim() ? `${d.trim()}\n\n${t.polished}` : t.polished));
@@ -532,18 +558,14 @@ export function PersonaplexChatProvider({
       const f = e.target.files?.[0];
       if (!f) return;
       setChatError(null);
-      void (async () => {
-        const t = await transcribeBlob(f, f.type || "application/octet-stream");
-        if (t) {
-          setIsChatActive(true);
-          setDraft((d) => (d.trim() ? `${d.trim()}\n\n${t.polished}` : t.polished));
-          pushActivity({ kind: "system", summary: "Transcribed audio file into your message." });
-        }
-      })();
+      setPendingAudioFile(f);
       e.target.value = "";
     },
-    [transcribeBlob, pushActivity]
+    []
   );
+
+  const clearPendingAudioFile = useCallback(() => setPendingAudioFile(null), []);
+  const clearJournalFileToProcess = useCallback(() => setJournalFileToProcess(null), []);
 
   const composerDisabled = sending || micPhase !== "idle";
 
@@ -591,12 +613,18 @@ export function PersonaplexChatProvider({
       stopRecording,
       fileInputRef,
       onPickFile,
+      pendingAudioFile,
+      clearPendingAudioFile,
+      journalFileToProcess,
+      clearJournalFileToProcess,
       composerDisabled,
       activityLog,
       clearActivityLog,
       chatRecents,
       loadRecentSession,
       newChat,
+      chatInteractionMode,
+      setChatInteractionMode,
     }),
     [
       idPrefix,
@@ -613,11 +641,14 @@ export function PersonaplexChatProvider({
       startRecording,
       stopRecording,
       composerDisabled,
+      pendingAudioFile,
+      journalFileToProcess,
       activityLog,
       chatRecents,
       loadRecentSession,
       newChat,
       clearActivityLog,
+      chatInteractionMode,
     ]
   );
 

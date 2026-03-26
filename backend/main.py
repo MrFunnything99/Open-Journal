@@ -62,13 +62,14 @@ from library import (
     record_rec_feedback_for_recs,
     refresh_pattern_memory,
     save_session_data,
-    gemini_extraction_backend,
+    extraction_llm_backend,
+    library_recommendations_llm_label,
+    _openrouter_chat_completion,
     update_consumed,
     update_memory_fact,
     update_memory_summary,
     wipe_memory,
 )
-from google import genai
 
 def _instance_id(request: Request) -> str:
     """Per-browser instance id for scoping memory (sent as X-Instance-ID)."""
@@ -94,7 +95,7 @@ def get_or_create_session(session_id: Optional[str]) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Avoid proxy 403s: send API calls (Gemini, Listen Notes) direct, not via system proxy
+    # Avoid proxy 403s: send API calls (OpenRouter, Listen Notes) direct, not via system proxy
     for v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ.pop(v, None)
     os.environ["NO_PROXY"] = "*"
@@ -105,16 +106,26 @@ async def lifespan(app: FastAPI):
     if not pplx_key:
         print("[backend] WARNING: PERPLEXITY_API_KEY missing — vector ingest and retrieval will fail until set.")
 
-    print(f"[backend] Extraction / library LLM: {gemini_extraction_backend()}")
+    print(f"[backend] Extraction / library LLM: {extraction_llm_backend()}")
+    print(f"[backend] Library recommendations (books, articles, research): {library_recommendations_llm_label()}")
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     chat_model = (os.getenv("OPENROUTER_CHAT_MODEL") or "openai/gpt-4.1-mini").strip()
     chat_fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or "openai/gpt-5.4").strip()
     if or_key:
         print(
             f"[backend] OPENROUTER_API_KEY is set — /chat ({chat_model}; fallback {chat_fallback}), journal validation, "
-            "and extraction when GEMINI_VIA_OPENROUTER is not off"
+            "voice-memo polish, date inference, and library extraction helpers"
         )
+        print(
+            f"[backend] Speech-to-text: OpenRouter ({(os.getenv('OPENROUTER_TRANSCRIPTION_MODEL') or 'openai/gpt-audio-mini').strip()})"
+        )
+    elif (os.getenv("OPENAI_API_KEY") or "").strip():
+        print("[backend] Speech-to-text: OpenAI direct (OPENAI_TRANSCRIPTION_MODEL / gpt-4o-mini-transcribe)")
+    elif (os.getenv("ELEVENLABS_API_KEY") or "").strip():
+        print("[backend] Speech-to-text: ElevenLabs scribe_v2")
     else:
+        print("[backend] WARNING: Set OPENROUTER_API_KEY (recommended for STT), or OPENAI_API_KEY, or ELEVENLABS_API_KEY — transcription routes need one of these.")
+    if not or_key:
         print(
             "[backend] WARNING: OPENROUTER_API_KEY missing — /chat interviewer and journal validation will not work until set."
         )
@@ -455,10 +466,11 @@ class TranscribeRequest(BaseModel):
 
 
 class VoiceMemoRequest(BaseModel):
-    """Voice Memo tab: base64 audio → OpenAI transcription (or ElevenLabs) → Gemini polish."""
+    """Voice Memo tab: base64 audio → OpenRouter gpt-audio-mini (preferred) or OpenAI / ElevenLabs → optional OpenRouter text polish."""
     audio: str
     filename: Optional[str] = None
     mime_type: Optional[str] = None
+    journal_mode: bool = False
 
 
 class JournalValidateRequest(BaseModel):
@@ -514,6 +526,159 @@ def _guess_audio_filename(filename: Optional[str], mime_type: Optional[str]) -> 
     if "flac" in mt:
         return "audio.flac"
     return "recording.webm"
+
+
+def _openrouter_transcription_model() -> str:
+    return (os.getenv("OPENROUTER_TRANSCRIPTION_MODEL") or "openai/gpt-audio-mini").strip() or "openai/gpt-audio-mini"
+
+
+def _openrouter_audio_format(filename: str, mime_type: Optional[str], format_hint: Optional[str] = None) -> str:
+    """Format string for OpenRouter input_audio (see https://openrouter.ai/docs/guides/overview/multimodal/audio)."""
+    h = (format_hint or "").strip().lower().lstrip(".")
+    allowed = {"wav", "mp3", "aac", "ogg", "flac", "m4a", "aiff", "pcm16", "pcm24"}
+    if h in allowed:
+        return h
+    fn = (filename or "").lower()
+    ext = fn.rsplit(".", 1)[-1] if "." in fn else ""
+    if ext in allowed:
+        return ext
+    if ext in ("mp4", "mpeg"):
+        return "m4a"
+    if ext == "webm":
+        return "webm"
+    if ext == "wav":
+        return "wav"
+    mt = (mime_type or "").lower()
+    if "webm" in mt:
+        return "webm"
+    if "mp4" in mt or "m4a" in mt or "aac" in mt:
+        return "m4a"
+    if "mpeg" in mt or "mp3" in mt:
+        return "mp3"
+    if "wav" in mt:
+        return "wav"
+    if "ogg" in mt or "opus" in mt:
+        return "ogg"
+    if "flac" in mt:
+        return "flac"
+    return "wav"
+
+
+def _openrouter_completion_assistant_text(data: dict) -> str:
+    choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+    if not choices:
+        return ""
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "".join(parts).strip()
+    return ""
+
+
+def _openrouter_speech_to_text(
+    audio_bytes: bytes,
+    filename: str,
+    mime_type: Optional[str] = None,
+    format_hint: Optional[str] = None,
+) -> str:
+    import base64 as b64
+    import urllib.error
+    import urllib.request
+
+    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        raise ValueError("OPENROUTER_API_KEY is not configured")
+    model = _openrouter_transcription_model()
+    fmt = _openrouter_audio_format(filename, mime_type, format_hint)
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Transcribe this audio verbatim. Reply with the transcript only — no preamble or quotes.",
+                    },
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": b64.b64encode(audio_bytes).decode("ascii"),
+                            "format": fmt,
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://selfmeridian.local"),
+            "X-Title": os.getenv("OPENROUTER_TITLE", "SelfMeridian"),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            raw_text = resp.read().decode("utf-8")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            raw_text = e.read().decode("utf-8")
+        except Exception:
+            raw_text = ""
+    except Exception as e:
+        raise ValueError(f"OpenRouter transcription request failed: {e}") from e
+    if status < 200 or status >= 300:
+        try:
+            err_j = json.loads(raw_text)
+            err_obj = err_j.get("error")
+            if isinstance(err_obj, dict):
+                detail = err_obj.get("message") or str(err_obj)
+            else:
+                detail = err_obj or err_j.get("message")
+        except Exception:
+            detail = raw_text[:500] if raw_text else None
+        raise ValueError(detail or f"OpenRouter transcription error ({status})")
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return (raw_text or "").strip()
+    return _openrouter_completion_assistant_text(data)
+
+
+def _transcribe_audio_bytes(
+    audio_bytes: bytes,
+    filename: str = "audio.webm",
+    mime_type: Optional[str] = None,
+    format_hint: Optional[str] = None,
+) -> tuple[str, str]:
+    """Speech-to-text: OpenRouter (gpt-audio-mini) first, then OpenAI transcriptions, then ElevenLabs."""
+    if (os.getenv("OPENROUTER_API_KEY") or "").strip():
+        return (_openrouter_speech_to_text(audio_bytes, filename, mime_type, format_hint), "openrouter")
+    if (os.getenv("OPENAI_API_KEY") or "").strip():
+        return (_openai_speech_to_text(audio_bytes, filename), "openai")
+    if (os.getenv("ELEVENLABS_API_KEY") or "").strip():
+        return (_elevenlabs_transcribe_bytes(audio_bytes), "elevenlabs")
+    raise ValueError(
+        "Configure OPENROUTER_API_KEY for transcription (default model openai/gpt-audio-mini), "
+        "or OPENAI_API_KEY, or ELEVENLABS_API_KEY."
+    )
 
 
 def _openai_transcription_model() -> str:
@@ -639,27 +804,51 @@ def _elevenlabs_transcribe_bytes(audio_bytes: bytes) -> str:
     return str(text).strip() if text is not None else ""
 
 
-async def _polish_voice_memo_gemini(raw: str) -> str:
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not key or not (raw or "").strip():
-        return (raw or "").strip()
-    try:
-        client = genai.Client(api_key=key)
-        model = os.getenv("GEMINI_VOICE_MEMO_MODEL", "gemini-2.0-flash")
-        prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + (raw or "").strip()[:48000]
+async def _polish_voice_memo_openrouter(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text or not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+        return text
+    model = (os.getenv("OPENROUTER_VOICE_MEMO_POLISH_MODEL") or "openai/gpt-4.1-mini").strip()
+    prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
 
-        def _call():
-            return client.models.generate_content(model=model, contents=prompt)
+    def _call():
+        try:
+            return _openrouter_chat_completion(prompt, model=model, temperature=0.3, timeout_sec=90.0)
+        except Exception as e:
+            print("[backend] voice-memo polish error:", e)
+            return ""
 
-        result = await asyncio.to_thread(_call)
-        out = getattr(result, "text", "")
-        if isinstance(out, list):
-            out = " ".join(str(c) for c in out)
-        out = (out or "").strip()
-        return out if out else (raw or "").strip()
-    except Exception as e:
-        print("[backend] voice-memo polish error:", e)
-        return (raw or "").strip()
+    out = (await asyncio.to_thread(_call) or "").strip()
+    return out if out else text
+
+
+JOURNAL_CLEANUP_INSTRUCTION = """You are lightly cleaning a voice-to-text transcript for the author to review in a text editor.
+
+Rules:
+- Fix punctuation, capitalization, and obvious speech-to-text errors.
+- Remove filler words (um, uh, like, you know) and false starts.
+- Do NOT rewrite the text as a journal entry, diary entry, or narrative.
+- Do NOT add new content, headings, sign-offs, or commentary.
+- Keep the author's exact wording and sentence structure as much as possible.
+- Output ONLY the cleaned transcript text, nothing else."""
+
+
+async def _cleanup_transcript_openrouter(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text or not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+        return text
+    model = (os.getenv("OPENROUTER_JOURNAL_CLEANUP_MODEL") or "openai/gpt-5.4-mini").strip()
+    prompt = JOURNAL_CLEANUP_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
+
+    def _call():
+        try:
+            return _openrouter_chat_completion(prompt, model=model, temperature=0.2, timeout_sec=90.0)
+        except Exception as e:
+            print("[backend] journal cleanup error:", e)
+            return ""
+
+    out = (await asyncio.to_thread(_call) or "").strip()
+    return out if out else text
 
 
 async def _validate_journal_openrouter(raw: str, model_override: Optional[str] = None) -> tuple[str, str, list[str], Optional[str]]:
@@ -1359,12 +1548,11 @@ async def infer_entry_date(req: InferEntryDateRequest):
     Use an LLM to infer the best-guess date/time when a journal entry was written.
     Returns ISO 8601 string or null if unclear.
     """
-    key = os.getenv("GEMINI_API_KEY")
-    if not key or not key.strip():
+    or_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not or_key:
         return InferEntryDateResponse(date=None)
     try:
-        client = genai.Client(api_key=key)
-        model = os.getenv("GEMINI_INFER_ENTRY_DATE_MODEL", "gemini-3.1-flash-lite-preview")
+        model = (os.getenv("OPENROUTER_INFER_ENTRY_DATE_MODEL") or "openai/gpt-4.1-mini").strip()
         # Truncate very long text to avoid token limits
         text = (req.text or "")[:8000].strip()
         if not text:
@@ -1379,13 +1567,11 @@ async def infer_entry_date(req: InferEntryDateRequest):
             prompt += f'\n\nOnly if the entry above has no date: file name is "{filename}". Otherwise ignore the filename.'
 
         def _call():
-            return client.models.generate_content(model=model, contents=prompt)
+            return _openrouter_chat_completion(
+                prompt, model=model, temperature=0.0, timeout_sec=60.0, max_tokens=256
+            )
 
-        result = await asyncio.to_thread(_call)
-        raw = getattr(result, "text", "")
-        if isinstance(raw, list):
-            raw = " ".join(c.get("text", str(c)) for c in raw if isinstance(c, dict))
-        raw = (raw or "").strip()
+        raw = (await asyncio.to_thread(_call) or "").strip()
         if not raw or raw.upper() == "NONE":
             # Fallback: try to parse date from filename when text gave no date
             if filename:
@@ -2025,21 +2211,19 @@ def serve_decision_logs_html():
 @app.post("/api/transcribe", include_in_schema=False)
 async def api_transcribe(req: TranscribeRequest):
     """
-    Batch speech-to-text: OpenAI (gpt-4o-mini-transcribe by default) when OPENAI_API_KEY is set, else ElevenLabs scribe_v2.
+    Speech-to-text: OpenRouter `openai/gpt-audio-mini` when OPENROUTER_API_KEY is set, else OpenAI, else ElevenLabs.
     Registered on the main app (not only APIRouter) so POST is never shadowed by the SPA
     catch-all GET /{full_path} (which would otherwise yield 405 Method Not Allowed).
     """
     import base64 as b64
-    import urllib.error
-    import urllib.request
-    import uuid
 
+    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not openai_key and not api_key:
+    el_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not or_key and not openai_key and not el_key:
         raise HTTPException(
             status_code=500,
-            detail="Configure OPENAI_API_KEY (recommended) or ELEVENLABS_API_KEY for transcription.",
+            detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini), or OPENAI_API_KEY, or ELEVENLABS_API_KEY.",
         )
     audio_b64 = (req.audio or "").strip()
     if not audio_b64:
@@ -2051,77 +2235,21 @@ async def api_transcribe(req: TranscribeRequest):
     if len(raw) < 100:
         raise HTTPException(status_code=400, detail="Audio too short to transcribe")
 
-    if openai_key:
-        try:
-            transcript = await asyncio.to_thread(_openai_speech_to_text, raw, "audio.wav")
-        except ValueError as e:
-            raise HTTPException(status_code=500, detail=str(e))
-        return {"text": transcript or ""}
-
-    model_id = "scribe_v2"
-    boundary = f"----SelfmeridianBoundary{uuid.uuid4().hex[:24]}"
-    body = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="model_id"\r\n\r\n'
-        f"{model_id}\r\n"
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
-        "Content-Type: audio/wav\r\n\r\n"
-    ).encode("utf-8") + raw + f"\r\n--{boundary}--\r\n".encode("utf-8")
-    content_type = f"multipart/form-data; boundary={boundary}"
-
-    request = urllib.request.Request(
-        ELEVENLABS_STT_URL,
-        data=body,
-        method="POST",
-        headers={
-            "xi-api-key": api_key,
-            "Content-Type": content_type,
-        },
-    )
+    fmt_hint = (req.format or "").strip() or None
+    ext = fmt_hint.lstrip(".").lower() if fmt_hint else "wav"
+    fname = f"audio.{ext}" if ext else "audio.wav"
     try:
-        with urllib.request.urlopen(request, timeout=60) as resp:
-            raw_text = resp.read().decode("utf-8")
-            status_code = resp.status
-    except urllib.error.HTTPError as e:
-        status_code = e.code
-        try:
-            raw_text = e.read().decode("utf-8")
-        except Exception:
-            raw_text = ""
-    except Exception as e:
-        print("[backend] /api/transcribe error:", e)
+        transcript, _engine = await asyncio.to_thread(_transcribe_audio_bytes, raw, fname, None, fmt_hint)
+    except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    data: dict = {}
-    if raw_text.strip():
-        try:
-            data = json.loads(raw_text)
-        except json.JSONDecodeError:
-            print("[backend] /api/transcribe non-JSON:", raw_text[:300])
-    if status_code < 200 or status_code >= 300:
-        err_detail = data.get("detail")
-        if isinstance(err_detail, dict):
-            msg = err_detail.get("message") or str(err_detail)
-        elif isinstance(err_detail, str):
-            msg = err_detail
-        else:
-            msg = (
-                data.get("message")
-                or (raw_text.strip()[:300] if raw_text.strip() else None)
-                or f"ElevenLabs STT failed ({status_code})"
-            )
-        raise HTTPException(status_code=500, detail=str(msg))
-    text = data.get("text")
-    transcript = str(text).strip() if text is not None else ""
-    return {"text": transcript}
+    return {"text": transcript or ""}
 
 
 @app.post("/api/voice-memo", include_in_schema=False)
 async def api_voice_memo(req: VoiceMemoRequest):
     """
-    Voice Memo tab: transcribe with OpenAI (gpt-4o-mini-transcribe by default) when OPENAI_API_KEY is set, else ElevenLabs STT.
-    Optionally polish with Gemini (GEMINI_API_KEY). Returns raw + polished text for saving to The Brain.
+    Voice Memo tab: transcribe via OpenRouter openai/gpt-audio-mini when OPENROUTER_API_KEY is set, else OpenAI, else ElevenLabs.
+    Optionally polish transcript via OpenRouter (OPENROUTER_VOICE_MEMO_POLISH_MODEL, default openai/gpt-4.1-mini).
     """
     import base64 as b64
 
@@ -2136,33 +2264,43 @@ async def api_voice_memo(req: VoiceMemoRequest):
         raise HTTPException(status_code=400, detail="Audio too short to transcribe")
 
     fname = _guess_audio_filename(req.filename, req.mime_type)
+    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     el_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not openai_key and not el_key:
+    if not or_key and not openai_key and not el_key:
         raise HTTPException(
             status_code=500,
-            detail="Configure OPENAI_API_KEY (speech-to-text) or ELEVENLABS_API_KEY for transcription.",
+            detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini), or OPENAI_API_KEY, or ELEVENLABS_API_KEY.",
         )
-    transcribe_engine = "openai"
     try:
-        if openai_key:
-            raw_transcript = await asyncio.to_thread(_openai_speech_to_text, raw_audio, fname)
-        else:
-            transcribe_engine = "elevenlabs"
-            raw_transcript = await asyncio.to_thread(_elevenlabs_transcribe_bytes, raw_audio)
+        raw_transcript, transcribe_engine = await asyncio.to_thread(
+            _transcribe_audio_bytes,
+            raw_audio,
+            fname,
+            req.mime_type,
+            None,
+        )
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         print("[backend] /api/voice-memo transcribe error:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    polished = await _polish_voice_memo_gemini(raw_transcript)
-    has_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
+    polished = await _polish_voice_memo_openrouter(raw_transcript)
+    did_polish = bool(
+        or_key and (raw_transcript or "").strip() and (polished or "").strip() and (polished or "").strip() != (raw_transcript or "").strip()
+    )
+
+    cleaned = ""
+    if req.journal_mode and (raw_transcript or "").strip():
+        cleaned = await _cleanup_transcript_openrouter(raw_transcript)
+
     return {
         "raw_transcript": raw_transcript or "",
         "polished_text": polished or raw_transcript or "",
+        "cleaned_transcript": cleaned,
         "transcribe_engine": transcribe_engine,
-        "polished_by_gemini": has_gemini and bool((raw_transcript or "").strip()),
+        "polished_by_llm": did_polish,
     }
 
 

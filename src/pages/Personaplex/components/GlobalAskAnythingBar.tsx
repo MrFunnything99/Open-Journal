@@ -1,4 +1,87 @@
+import { useEffect, useRef, useState, type MutableRefObject } from "react";
+import {
+  CHAT_INTERACTION_MODE_META,
+  CHAT_INTERACTION_MODES,
+  type ChatInteractionMode,
+} from "../chatInteractionModes";
 import { usePersonaplexChat } from "../PersonaplexChatContext";
+
+function ModeChipIcon({ mode }: { mode: ChatInteractionMode }) {
+  const cls = "h-3.5 w-3.5 shrink-0 opacity-95";
+  switch (mode) {
+    case "conversation":
+      return (
+        <svg className={cls} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75} aria-hidden>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+          />
+        </svg>
+      );
+    case "journal":
+      return (
+        <svg className={cls} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75} aria-hidden>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+          />
+        </svg>
+      );
+    default:
+      return (
+        <svg className={cls} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75} aria-hidden>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"
+          />
+        </svg>
+      );
+  }
+}
+
+function composerModeChipClass(mode: ChatInteractionMode, compact: boolean): string {
+  const pad = compact ? "px-2 py-0.5" : "px-2.5 py-1";
+  const text = compact ? "text-[0.65rem] sm:text-[0.7rem]" : "text-[0.7rem] sm:text-xs";
+  const base = `inline-flex max-w-[10rem] shrink-0 items-center gap-1 truncate rounded-full border font-semibold tracking-tight transition-colors hover:brightness-110 sm:max-w-[12rem] ${pad} ${text}`;
+  if (mode === "conversation") {
+    return `${base} border-white/25 bg-white/[0.09] text-white/90`;
+  }
+  if (mode === "journal") {
+    return `${base} border-sky-400/50 bg-sky-500/[0.22] text-sky-100 shadow-[0_0_12px_-4px_rgba(56,189,248,0.45)]`;
+  }
+  return `${base} border-violet-400/50 bg-violet-600/[0.22] text-violet-100 shadow-[0_0_12px_-4px_rgba(167,139,250,0.4)]`;
+}
+
+/** ChatGPT-style mode tag beside +; opens the same menu as + when clicked. */
+function ComposerModeChip({
+  mode,
+  compact = false,
+  onOpen,
+  disabled,
+}: {
+  mode: ChatInteractionMode;
+  compact?: boolean;
+  onOpen: () => void;
+  disabled?: boolean;
+}) {
+  const label = CHAT_INTERACTION_MODE_META[mode].composerChipLabel;
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      disabled={disabled}
+      title="Change mode"
+      aria-label={`Mode: ${label}. Open mode menu`}
+      className={`${composerModeChipClass(mode, compact)} disabled:opacity-40`}
+    >
+      <ModeChipIcon mode={mode} />
+      <span className="truncate">{label}</span>
+    </button>
+  );
+}
 
 function SendIcon({ className }: { className?: string }) {
   return (
@@ -32,7 +115,7 @@ export function LiveDictationBubble({ className = "" }: { className?: string }) 
   );
 }
 
-export type AskAnythingLayout = "dock" | "rail";
+export type AskAnythingLayout = "dock" | "rail" | "center";
 
 type AskAnythingComposerProps = {
   layout: AskAnythingLayout;
@@ -40,6 +123,92 @@ type AskAnythingComposerProps = {
   railNarrow?: boolean;
   onExpandRail?: () => void;
 };
+
+type PlusPlacement = "above" | "below" | "right";
+
+function PlusOptionsMenu({
+  open,
+  onClose,
+  placement,
+  fileInputRef,
+  composerDisabled,
+  mode,
+  setMode,
+}: {
+  open: boolean;
+  onClose: () => void;
+  placement: PlusPlacement;
+  fileInputRef: MutableRefObject<HTMLInputElement | null>;
+  composerDisabled: boolean;
+  mode: ChatInteractionMode;
+  setMode: (m: ChatInteractionMode) => void;
+}) {
+  if (!open) return null;
+  const pos =
+    placement === "above"
+      ? "bottom-full left-0 mb-2"
+      : placement === "below"
+        ? "top-full left-0 mt-1"
+        : "left-full top-0 ml-2";
+  return (
+    <div
+      className={`absolute z-[100] min-w-[min(100vw-2rem,17rem)] max-w-[min(100vw-2rem,20rem)] rounded-xl border border-white/15 bg-[#14141f]/95 p-1 shadow-2xl backdrop-blur-xl ${pos}`}
+      role="menu"
+      aria-label="Composer options"
+    >
+      <p className="px-2.5 pb-1 pt-1.5 text-[0.6rem] font-semibold uppercase tracking-[0.14em] text-white/45">Mode</p>
+      {CHAT_INTERACTION_MODES.map((m) => {
+        const meta = CHAT_INTERACTION_MODE_META[m];
+        const sel = mode === m;
+        return (
+          <button
+            key={m}
+            type="button"
+            role="menuitemradio"
+            aria-checked={sel}
+            onClick={() => {
+              setMode(m);
+              onClose();
+            }}
+            className={`flex w-full flex-col items-stretch rounded-lg px-3 py-2 text-left transition-colors ${
+              sel ? "bg-white/[0.12] text-white" : "text-white/85 hover:bg-white/[0.08]"
+            }`}
+          >
+            <span className="flex items-center gap-2 text-sm font-medium">
+              {sel ? (
+                <span className="text-emerald-400" aria-hidden>
+                  ✓
+                </span>
+              ) : (
+                <span className="w-4 shrink-0" aria-hidden />
+              )}
+              {meta.label}
+            </span>
+            <span className={`mt-0.5 pl-6 text-[0.7rem] leading-snug ${sel ? "text-white/65" : "text-white/45"}`}>
+              {meta.sublabel}
+            </span>
+          </button>
+        );
+      })}
+      <div className="my-1 border-t border-white/10" role="separator" />
+      <button
+        type="button"
+        role="menuitem"
+        disabled={composerDisabled}
+        onClick={() => {
+          fileInputRef.current?.click();
+          onClose();
+        }}
+        className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-sm font-medium text-white/90 transition-colors hover:bg-white/[0.08] disabled:opacity-40"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+        </svg>
+        Attach audio
+      </button>
+    </div>
+  );
+}
 
 export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }: AskAnythingComposerProps) {
   const {
@@ -53,13 +222,31 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
     stopRecording,
     fileInputRef,
     onPickFile,
+    pendingAudioFile,
+    clearPendingAudioFile,
     composerDisabled,
+    chatInteractionMode,
+    setChatInteractionMode,
   } = usePersonaplexChat();
+  const [plusOpen, setPlusOpen] = useState(false);
+  const plusWrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!plusOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (plusWrapRef.current?.contains(e.target as Node)) return;
+      setPlusOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [plusOpen]);
 
   const shellClass =
     layout === "dock"
       ? "glass-panel flex items-center gap-1 rounded-full pl-3 pr-2 shadow-[0_-4px_32px_rgba(0,0,0,0.35)] transition-shadow md:gap-2 md:pl-4"
-      : "glass-panel flex w-full items-center gap-1 rounded-2xl px-2 py-1.5 shadow-[0_4px_24px_rgba(0,0,0,0.25)] transition-shadow";
+      : layout === "center"
+        ? "glass-panel mx-auto flex w-full max-w-2xl items-center gap-1 rounded-2xl border border-white/12 px-3 py-2 shadow-[0_8px_32px_rgba(0,0,0,0.28)] transition-shadow md:gap-2 md:px-4 md:py-2.5"
+        : "glass-panel flex w-full items-center gap-1 rounded-2xl px-2 py-1.5 shadow-[0_4px_24px_rgba(0,0,0,0.25)] transition-shadow";
 
   if (layout === "rail" && railNarrow) {
     return (
@@ -79,19 +266,37 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
           onChange={onPickFile}
         />
         <div className="flex flex-col items-stretch gap-1">
-          <div className="flex justify-center gap-1">
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
+          <div className="relative flex flex-wrap justify-center gap-1">
+            <div className="relative shrink-0" ref={plusWrapRef}>
+              <button
+                type="button"
+                onClick={() => setPlusOpen((o) => !o)}
+                disabled={composerDisabled}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-white/90 outline-none hover:bg-white/10 disabled:opacity-40"
+                aria-label="More options and modes"
+                aria-expanded={plusOpen}
+                title="Modes and attachments"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                </svg>
+              </button>
+              <PlusOptionsMenu
+                open={plusOpen}
+                onClose={() => setPlusOpen(false)}
+                placement="right"
+                fileInputRef={fileInputRef}
+                composerDisabled={composerDisabled}
+                mode={chatInteractionMode}
+                setMode={setChatInteractionMode}
+              />
+            </div>
+            <ComposerModeChip
+              mode={chatInteractionMode}
+              compact
+              onOpen={() => setPlusOpen(true)}
               disabled={composerDisabled}
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-white/90 hover:bg-white/10 disabled:opacity-40"
-              aria-label="Attach audio"
-              title="Attach audio"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-              </svg>
-            </button>
+            />
             {micPhase === "recording" ? (
               <button
                 type="button"
@@ -122,7 +327,7 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
             <button
               type="button"
               onClick={() => void sendChat()}
-              disabled={sending || micPhase !== "idle" || !draft.trim()}
+              disabled={sending || micPhase !== "idle" || (!draft.trim() && !pendingAudioFile)}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-40"
               aria-label="Send message"
               title="Send"
@@ -135,8 +340,30 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
     );
   }
 
+  const plusPlacement: PlusPlacement = layout === "dock" ? "above" : "below";
+
   return (
-    <div className={shellClass + (micPhase === "recording" ? " ring-2 ring-red-400/50" : "")}>
+    <div className="flex flex-col">
+      {pendingAudioFile && (
+        <div className="flex items-center gap-2 rounded-t-2xl border border-b-0 border-white/10 bg-white/[0.04] px-3 py-2">
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0 text-white/60" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+          </svg>
+          <span className="min-w-0 flex-1 truncate text-xs text-white/80">{pendingAudioFile.name}</span>
+          <button
+            type="button"
+            onClick={clearPendingAudioFile}
+            className="shrink-0 rounded p-0.5 text-white/50 hover:bg-white/10 hover:text-white/90"
+            aria-label="Remove audio file"
+            title="Remove"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      )}
+      <div className={shellClass + (micPhase === "recording" ? " ring-2 ring-red-400/50" : "") + (pendingAudioFile ? " rounded-t-none border-t-0" : "")}>
       <input
         ref={fileInputRef as React.LegacyRef<HTMLInputElement>}
         type="file"
@@ -144,20 +371,40 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
         className="hidden"
         onChange={onPickFile}
       />
-      <button
-        type="button"
-        onClick={() => fileInputRef.current?.click()}
-        disabled={composerDisabled}
-        className={`flex shrink-0 items-center justify-center rounded-full text-white/90 hover:bg-white/10 disabled:opacity-40 ${
-          layout === "rail" ? "h-9 w-9" : "h-11 w-11"
-        }`}
-        aria-label="Attach audio"
-        title="Attach audio"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" className={layout === "rail" ? "h-5 w-5" : "h-6 w-6"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-        </svg>
-      </button>
+      <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
+        <div className="relative shrink-0" ref={plusWrapRef}>
+          <button
+            type="button"
+            onClick={() => setPlusOpen((o) => !o)}
+            disabled={composerDisabled}
+            className={`flex shrink-0 items-center justify-center rounded-full text-white/90 outline-none hover:bg-white/10 disabled:opacity-40 ${
+              layout === "rail" ? "h-9 w-9" : "h-11 w-11"
+            }`}
+            aria-label="Modes and attachments"
+            aria-expanded={plusOpen}
+            title="Modes and attachments"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className={layout === "rail" ? "h-5 w-5" : "h-6 w-6"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+            </svg>
+          </button>
+          <PlusOptionsMenu
+            open={plusOpen}
+            onClose={() => setPlusOpen(false)}
+            placement={plusPlacement}
+            fileInputRef={fileInputRef}
+            composerDisabled={composerDisabled}
+            mode={chatInteractionMode}
+            setMode={setChatInteractionMode}
+          />
+        </div>
+        <ComposerModeChip
+          mode={chatInteractionMode}
+          compact={layout === "rail"}
+          onOpen={() => setPlusOpen(true)}
+          disabled={composerDisabled}
+        />
+      </div>
 
       <textarea
         id={`${idPrefix}-global-composer`}
@@ -171,7 +418,7 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
         }}
         disabled={composerDisabled}
         rows={layout === "rail" ? 2 : 1}
-        placeholder="Ask anything"
+        placeholder={pendingAudioFile ? "Add a message or press send to transcribe" : "Ask anything"}
         className={`max-h-36 min-w-0 flex-1 resize-none border-0 bg-transparent text-[0.95rem] text-white placeholder:text-white/45 focus:outline-none focus:ring-0 disabled:opacity-50 ${
           layout === "rail" ? "min-h-[44px] py-2 text-[0.9rem] leading-snug" : "min-h-[48px] py-3"
         }`}
@@ -210,7 +457,7 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
       <button
         type="button"
         onClick={() => void sendChat()}
-        disabled={sending || micPhase !== "idle" || !draft.trim()}
+        disabled={sending || micPhase !== "idle" || (!draft.trim() && !pendingAudioFile)}
         className={`flex shrink-0 items-center justify-center rounded-full bg-white text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-40 ${
           layout === "rail" ? "h-9 w-9" : "h-11 w-11"
         }`}
@@ -219,6 +466,7 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
       >
         <SendIcon className={layout === "rail" ? "h-4 w-4" : "h-5 w-5"} />
       </button>
+      </div>
     </div>
   );
 }
@@ -238,4 +486,21 @@ export function MobileAskComposerDock({ hidden }: { hidden: boolean }) {
       </div>
     </div>
   );
+}
+
+/**
+ * Hides the fixed mobile dock on Home idle so the centered composer + hero are the single entry point.
+ */
+export function MobileAskComposerDockGate({
+  railOpen,
+  activeView,
+}: {
+  railOpen: boolean;
+  activeView: string;
+}) {
+  const { isChatActive, messages, sending } = usePersonaplexChat();
+  const homeIdle =
+    activeView === "voice_memo" && !isChatActive && messages.length === 0 && !sending;
+  /** Home uses only the in-column composers (see VoiceMemoTab). Other tabs may use this dock on mobile. */
+  return <MobileAskComposerDock hidden={railOpen || homeIdle || activeView === "voice_memo"} />;
 }

@@ -1,10 +1,8 @@
 import type { Dispatch, ReactNode, SetStateAction } from "react";
-import { usePersonaplexChat, type AgentActivityEntry } from "../PersonaplexChatContext";
 import { ThemeToggle } from "../../../components/ThemeToggle";
 import { useTheme } from "../../../hooks/useTheme";
-import { AskAnythingComposer, LiveDictationBubble } from "./GlobalAskAnythingBar";
 
-export type PersonaplexView = "voice_memo" | "brain" | "recommendations" | "journal";
+export type PersonaplexView = "voice_memo" | "brain" | "recommendations";
 
 type Props = {
   /** Expanded width on desktop (Open WebUI–style rail). */
@@ -44,21 +42,6 @@ function navRow(
   );
 }
 
-function activityIcon(kind: AgentActivityEntry["kind"]) {
-  switch (kind) {
-    case "user":
-      return "→";
-    case "assistant":
-      return "◆";
-    case "retrieval":
-      return "⌕";
-    case "tool":
-      return "⚙";
-    default:
-      return "·";
-  }
-}
-
 export function PersonaplexLeftRail({
   expanded,
   setExpanded,
@@ -68,12 +51,11 @@ export function PersonaplexLeftRail({
   setView,
 }: Props) {
   const { mode, toggle } = useTheme();
-  const { activityLog, chatRecents, loadRecentSession, newChat, clearActivityLog } = usePersonaplexChat();
   const narrow = !expanded;
 
   const closeMobile = () => setMobileOpen(false);
 
-  const railColumn = (showComposer: boolean) => (
+  const railColumn = (
     <div className="flex h-full min-h-0 flex-col border-r border-white/10 bg-[#0c0c12]/92 text-white backdrop-blur-xl">
       <div className="flex flex-none items-center gap-1 border-b border-white/10 px-2 py-2.5">
         <button
@@ -93,20 +75,6 @@ export function PersonaplexLeftRail({
             Selfmeridian
           </span>
         )}
-        <button
-          type="button"
-          onClick={() => {
-            newChat();
-            closeMobile();
-          }}
-          className="rounded-lg p-2 text-emerald-300/90 transition hover:bg-white/10"
-          title="New chat"
-          aria-label="New chat"
-        >
-          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-          </svg>
-        </button>
       </div>
 
       <nav className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-1.5 pb-3" aria-label="Primary">
@@ -120,18 +88,6 @@ export function PersonaplexLeftRail({
           "Home",
           <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
-          </svg>,
-          narrow
-        )}
-        {navRow(
-          view === "journal",
-          () => {
-            setView("journal");
-            closeMobile();
-          },
-          "Chat",
-          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
           </svg>,
           narrow
         )}
@@ -159,62 +115,7 @@ export function PersonaplexLeftRail({
           </svg>,
           narrow
         )}
-
-        {!narrow && chatRecents.length > 0 && (
-          <>
-            {sectionLabel("Recents")}
-            <ul className="space-y-0.5">
-              {chatRecents.map((r) => (
-                <li key={r.sessionId}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      loadRecentSession(r.sessionId);
-                      closeMobile();
-                    }}
-                    className="w-full truncate rounded-lg px-2.5 py-2 text-left text-xs text-white/75 transition hover:bg-white/10 hover:text-white"
-                  >
-                    {r.title}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
-
-        {!narrow && (
-          <>
-            {sectionLabel("Activity")}
-            <div className="flex items-center justify-between gap-2 px-2 pb-1">
-              <span className="text-[10px] text-white/35">Agent steps</span>
-              {activityLog.length > 0 && (
-                <button type="button" className="text-[10px] text-emerald-400/90 hover:underline" onClick={clearActivityLog}>
-                  Clear
-                </button>
-              )}
-            </div>
-            <ul className="max-h-48 space-y-1 overflow-y-auto px-1 text-[11px] leading-snug text-white/60">
-              {activityLog.length === 0 ? (
-                <li className="px-2 py-2 italic text-white/35">No activity yet — use the composer at the bottom of the sidebar.</li>
-              ) : (
-                [...activityLog].reverse().map((e) => (
-                  <li key={e.id} className="rounded-lg bg-white/[0.04] px-2 py-1.5">
-                    <span className="mr-1 opacity-60">{activityIcon(e.kind)}</span>
-                    {e.summary}
-                  </li>
-                ))
-              )}
-            </ul>
-          </>
-        )}
       </nav>
-
-      {showComposer && (
-        <div className="flex flex-none flex-col gap-1.5 border-t border-white/10 bg-[#080810]/95 px-1.5 pb-1.5 pt-2">
-          <LiveDictationBubble />
-          <AskAnythingComposer layout="rail" railNarrow={narrow} onExpandRail={() => setExpanded(true)} />
-        </div>
-      )}
 
       <div className="flex flex-none items-center justify-center gap-1 border-t border-white/10 p-2">
         <ThemeToggle mode={mode} onToggle={toggle} className="border-white/15 bg-white/10 text-white hover:bg-white/15" />
@@ -224,17 +125,15 @@ export function PersonaplexLeftRail({
 
   return (
     <>
-      {/* Desktop rail */}
       <aside
         className={`hidden h-full shrink-0 transition-[width] duration-200 ease-out md:flex md:flex-col ${
           expanded ? "w-[260px]" : "w-[72px]"
         }`}
         aria-label="App sidebar"
       >
-        {railColumn(true)}
+        {railColumn}
       </aside>
 
-      {/* Mobile drawer */}
       <div className="md:hidden">
         {mobileOpen && (
           <button
@@ -250,7 +149,7 @@ export function PersonaplexLeftRail({
           }`}
           aria-hidden={!mobileOpen}
         >
-          {railColumn(false)}
+          {railColumn}
         </aside>
       </div>
     </>

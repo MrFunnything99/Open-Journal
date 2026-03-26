@@ -37,8 +37,8 @@ def _embed_texts_sync(texts: list[str]) -> list[list[float]]:
     return _embed_texts(texts)
 
 
-def _call_gemini_sync(prompt: str, system_prompt: str | None = None, history_messages: list | None = None, **kwargs) -> str:
-    """Call library Gemini `generate_content` (extraction/chat helpers). Not used for embeddings."""
+def _call_extraction_llm_sync(prompt: str, system_prompt: str | None = None, history_messages: list | None = None, **kwargs) -> str:
+    """Call library OpenRouter-backed extraction LLM. Not used for embeddings."""
     from library import _call_gemini
     return _call_gemini(prompt)
 
@@ -79,7 +79,10 @@ async def _get_rag():
         working_dir=str(WORKING_DIR),
         embedding_func=embedding_func,
         llm_model_func=_llm_async,
-        llm_model_name=os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash"),
+        llm_model_name=(
+            (os.getenv("OPENROUTER_EXTRACTION_MODEL") or os.getenv("OPENROUTER_GEMINI_MODEL") or "google/gemini-3-pro-preview")
+            .strip()
+        ),
     )
     try:
         await rag.initialize_storages()

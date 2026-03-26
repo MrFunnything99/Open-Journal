@@ -1,46 +1,17 @@
 import { FC, useCallback, useEffect, useId, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
+import { CHAT_INTERACTION_MODE_META } from "../chatInteractionModes";
 import type { ChatMessage } from "../hooks/useJournalHistory";
 import { usePersonaplexChat } from "../PersonaplexChatContext";
+import { blobToWavBase64 } from "../utils/audioToWav";
+import { AskAnythingComposer, LiveDictationBubble } from "./GlobalAskAnythingBar";
 
 type Props = {
   onToast: (msg: string) => void;
   /** Persist to The Brain → Knowledge base → Journals (uses date for folder layout + memory ingest). */
   saveEntry?: (transcript: ChatMessage[], dateIso: string) => string;
   syncUnsyncedEntries?: () => Promise<number>;
-  /**
-   * Chat tab: keep the composer higher (not flush to the bottom) and reserve space beneath it for extra UI.
-   */
-  elevateComposerLayout?: boolean;
-  /** Home: jump to the dedicated Chat screen for a wider conversation layout. */
-  onOpenFullChat?: () => void;
 };
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onloadend = () => {
-      const d = r.result as string;
-      resolve(d.split(",")[1] ?? "");
-    };
-    r.onerror = () => reject(new Error("read failed"));
-    r.readAsDataURL(blob);
-  });
-}
-
-/** Transcription APIs use the filename extension to detect container format. */
-function defaultFilenameForMicBlob(mimeType: string): string {
-  const mt = (mimeType || "").toLowerCase();
-  if (mt.includes("mp4") || mt.includes("m4a") || mt.includes("aac") || mt === "audio/mp4") {
-    return "dictation.m4a";
-  }
-  if (mt.includes("webm")) return "dictation.webm";
-  if (mt.includes("wav")) return "dictation.wav";
-  if (mt.includes("mpeg") || mt.includes("mp3")) return "dictation.mp3";
-  if (mt.includes("ogg") || mt.includes("opus")) return "dictation.ogg";
-  if (mt.includes("flac")) return "dictation.flac";
-  return "dictation.webm";
-}
 
 function effectiveRecorderMime(recorder: MediaRecorder): string {
   const t = recorder.mimeType?.trim();
@@ -51,34 +22,6 @@ function effectiveRecorderMime(recorder: MediaRecorder): string {
   }
   return "audio/webm";
 }
-
-type HomeInteractionMode = "conversation" | "journal" | "autobiography";
-
-const HOME_MODES: HomeInteractionMode[] = ["conversation", "journal", "autobiography"];
-
-const HOME_MODE_META: Record<
-  HomeInteractionMode,
-  { label: string; sublabel: string; description: string }
-> = {
-  conversation: {
-    label: "Conversation",
-    sublabel: "Chat freely",
-    description:
-      "Your default AI assistant. Chat freely, ask questions, and explore ideas—enhanced with your personal context.",
-  },
-  journal: {
-    label: "Journal",
-    sublabel: "Reflect",
-    description:
-      "A space for free-flow reflection. Write naturally, process your thoughts, and receive optional AI feedback or gentle structure.",
-  },
-  autobiography: {
-    label: "Autobiography",
-    sublabel: "Track your life",
-    description:
-      "A structured way to track and understand your life. Reflect on your day, habits, goals, and past experiences through guided conversation.",
-  },
-};
 
 function toDateInputValue(date: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -105,19 +48,16 @@ function dateAndTimeToIso(dateStr: string, timeStr: string): string {
   return new Date(y, mo - 1, day, h, mi, 0, 0).toISOString();
 }
 
-export const VoiceMemoTab: FC<Props> = ({
-  onToast,
-  saveEntry,
-  syncUnsyncedEntries,
-  elevateComposerLayout = false,
-  onOpenFullChat,
-}) => {
+export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntries }) => {
   const {
     messages,
     sending,
     isChatActive,
     chatError,
     setDraft: setGlobalDraft,
+    chatInteractionMode,
+    journalFileToProcess,
+    clearJournalFileToProcess,
   } = usePersonaplexChat();
   const idPrefix = useId();
   const [journalMicPhase, setJournalMicPhase] = useState<"idle" | "recording" | "processing">("idle");
@@ -134,7 +74,7 @@ export const VoiceMemoTab: FC<Props> = ({
   const [journalEntryDate, setJournalEntryDate] = useState("");
   const [journalEntryTime, setJournalEntryTime] = useState("");
   const [savingJournal, setSavingJournal] = useState(false);
-  const [homeInteractionMode, setHomeInteractionMode] = useState<HomeInteractionMode>("conversation");
+  const [journalEditorOpen, setJournalEditorOpen] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -145,6 +85,10 @@ export const VoiceMemoTab: FC<Props> = ({
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [messages, sending, isChatActive]);
+
+  useEffect(() => {
+    if (chatInteractionMode !== "journal") setJournalEditorOpen(false);
+  }, [chatInteractionMode]);
 
   const readAloud = useCallback((text: string) => {
     if (typeof window === "undefined" || !window.speechSynthesis) {
@@ -169,26 +113,30 @@ export const VoiceMemoTab: FC<Props> = ({
     [onToast]
   );
 
-  const processMicAudio = useCallback(async (blob: Blob, mimeType: string) => {
+  const processMicAudio = useCallback(async (blob: Blob) => {
     setJournalMicPhase("processing");
     setError(null);
     try {
-      const b64 = await blobToBase64(blob);
-      // Transcription uses the filename extension to detect format; MediaRecorder blobs have no name.
-      const filename =
-        blob instanceof File && blob.name?.trim()
-          ? blob.name.trim()
-          : defaultFilenameForMicBlob(mimeType);
+      // OpenRouter `input_audio` is most reliable with WAV.
+      const b64 = await blobToWavBase64(blob);
+      const filename = "dictation.wav";
+      const isJournal = chatInteractionMode === "journal";
       const res = await backendFetch("/voice-memo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: b64, filename, mime_type: mimeType }),
+        body: JSON.stringify({
+          audio: b64,
+          filename,
+          mime_type: "audio/wav",
+          journal_mode: isJournal,
+        }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         detail?: string;
         error?: string;
         polished_text?: string;
         raw_transcript?: string;
+        cleaned_transcript?: string;
       };
       if (!res.ok) {
         const d = data.detail;
@@ -200,9 +148,12 @@ export const VoiceMemoTab: FC<Props> = ({
       if (line) {
         const capturedAt = new Date();
         const rawBody = ((data.raw_transcript ?? "").trim() || line).trim();
-        const reviewBody = (data.raw_transcript ?? line).trim();
         setRawTranscript(rawBody);
+        const reviewBody = isJournal && data.cleaned_transcript?.trim()
+          ? data.cleaned_transcript.trim()
+          : rawBody;
         setReviewText(reviewBody);
+        if (isJournal) setJournalEditorOpen(true);
         setValidatedJournal("");
         setValidationFeedback("");
         setValidationNotes([]);
@@ -215,7 +166,15 @@ export const VoiceMemoTab: FC<Props> = ({
     } finally {
       setJournalMicPhase("idle");
     }
-  }, []);
+  }, [chatInteractionMode]);
+
+  useEffect(() => {
+    if (journalFileToProcess && chatInteractionMode === "journal") {
+      const file = journalFileToProcess;
+      clearJournalFileToProcess();
+      void processMicAudio(file);
+    }
+  }, [journalFileToProcess, chatInteractionMode, clearJournalFileToProcess, processMicAudio]);
 
   const runJournalValidation = useCallback(async () => {
     const text = reviewText.trim();
@@ -321,7 +280,7 @@ export const VoiceMemoTab: FC<Props> = ({
         const mime = effectiveRecorderMime(mr);
         const blob = new Blob(chunksRef.current, { type: mime });
         mediaRecorderRef.current = null;
-        void processMicAudio(blob, mime);
+        void processMicAudio(blob);
       };
       mr.start();
       mediaRecorderRef.current = mr;
@@ -343,7 +302,7 @@ export const VoiceMemoTab: FC<Props> = ({
       const f = e.target.files?.[0];
       if (!f) return;
       setError(null);
-      void processMicAudio(f, f.type || "application/octet-stream");
+      void processMicAudio(f);
       e.target.value = "";
     },
     [processMicAudio]
@@ -352,63 +311,47 @@ export const VoiceMemoTab: FC<Props> = ({
   const journalRecorderBusy = journalMicPhase !== "idle" || validating;
 
   const hasConversation = messages.length > 0 || sending;
-  const showFullChatCta = Boolean(onOpenFullChat && !elevateComposerLayout && hasConversation);
+  /** ChatGPT-style: idle = centered prompt + composer; active = transcript + pinned composer. */
+  const showHomeHeroStack =
+    !isChatActive && !hasConversation && !rawTranscript && !reviewText;
+  const showBottomComposer = !showHomeHeroStack;
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col bg-transparent">
       <div className="flex min-h-0 flex-1 flex-row">
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div
-            ref={listRef}
-            className={`relative min-h-0 flex-1 overflow-y-auto ${
-              elevateComposerLayout && !isChatActive ? "max-h-[min(52vh,520px)] md:max-h-[min(48vh,560px)]" : ""
-            }`}
-            role="log"
-            aria-live="polite"
-          >
-            <div
-              className={`absolute inset-0 z-0 flex flex-col items-center justify-center px-4 pb-8 pt-4 text-center transition-opacity duration-500 ease-out ${
-                isChatActive ? "pointer-events-none opacity-0" : "opacity-100"
-              }`}
-              aria-hidden={isChatActive}
-            >
-              <div className="glass-panel max-w-xl rounded-3xl border border-white/10 bg-white/[0.05] px-8 py-10 shadow-[0_8px_40px_rgba(0,0,0,0.25)] backdrop-blur-md">
-                <h1 className="max-w-lg text-3xl font-light leading-tight tracking-tight text-white md:text-4xl">
-                  The space to be heard.
+          <div ref={listRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto" role="log" aria-live="polite">
+            {showHomeHeroStack && (
+              <div className="flex min-h-[min(55vh,560px)] flex-1 flex-col items-center justify-center gap-6 px-4 py-8 text-center sm:min-h-[50vh]">
+                <h1 className="max-w-lg text-[1.65rem] font-normal leading-snug tracking-tight text-white sm:text-3xl md:text-[1.75rem]">
+                  What can I help with?
                 </h1>
                 <p
-                  key={homeInteractionMode}
-                  className="mt-10 max-w-md animate-hero-mode-desc text-sm leading-relaxed text-white/70 md:text-[0.95rem]"
+                  key={chatInteractionMode}
+                  className="max-w-md animate-hero-mode-desc text-sm leading-relaxed text-white/55 md:text-[0.95rem]"
                 >
-                  {HOME_MODE_META[homeInteractionMode].description}
+                  {CHAT_INTERACTION_MODE_META[chatInteractionMode].description}
                 </p>
+                <div className="w-full max-w-2xl space-y-2 text-left">
+                  <LiveDictationBubble />
+                  <AskAnythingComposer layout="center" />
+                </div>
               </div>
-            </div>
+            )}
 
             {(hasConversation || rawTranscript || reviewText) && (
               <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-8 md:px-6">
-                {showFullChatCta && (
-                  <div className="mb-6 flex justify-end">
-                    <button
-                      type="button"
-                      onClick={onOpenFullChat}
-                      className="rounded-full border border-white/20 bg-white/[0.08] px-4 py-2 text-xs font-medium text-white/90 shadow-sm backdrop-blur-md transition hover:bg-white/[0.12] hover:text-white"
-                    >
-                      Open Chat for full view
-                    </button>
-                  </div>
-                )}
                 {(error || chatError) && (
                   <div className="glass-panel mb-6 rounded-2xl px-4 py-3 text-sm text-red-200">
                     {error || chatError}
                   </div>
                 )}
 
-                {(rawTranscript || reviewText) && (
+                {chatInteractionMode === "journal" && (rawTranscript || reviewText) && (
                   <div className="glass-panel mb-8 rounded-2xl border border-white/10 px-4 py-4 md:px-5">
                     <p className="text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/50">Journal audio pipeline</p>
                     <p className="mt-2 text-sm text-white/70">
-                      {"Transcribe -> human review/edit -> AI reformat + validation. You can loop this as many times as you want."}
+                      {"Transcribe → auto-cleanup → review/edit → AI feedback. Click the editor button to open."}
                     </p>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                       <input
@@ -445,55 +388,11 @@ export const VoiceMemoTab: FC<Props> = ({
                         </button>
                       )}
                     </div>
-                    {saveEntry && (
-                      <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
-                        <div className="flex flex-col gap-1">
-                          <label className="text-xs text-white/60" htmlFor={`${idPrefix}-journal-date`}>
-                            Entry date
-                          </label>
-                          <input
-                            id={`${idPrefix}-journal-date`}
-                            type="date"
-                            value={journalEntryDate}
-                            onChange={(e) => setJournalEntryDate(e.target.value)}
-                            className="rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
-                          />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="text-xs text-white/60" htmlFor={`${idPrefix}-journal-time`}>
-                            Entry time
-                          </label>
-                          <input
-                            id={`${idPrefix}-journal-time`}
-                            type="time"
-                            value={journalEntryTime}
-                            onChange={(e) => setJournalEntryTime(e.target.value)}
-                            className="rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
-                          />
-                        </div>
-                      </div>
-                    )}
-                    <textarea
-                      value={reviewText}
-                      onChange={(e) => setReviewText(e.target.value)}
-                      rows={8}
-                      placeholder="Transcript will appear here..."
-                      className="mt-3 w-full resize-y rounded-xl border border-white/15 bg-black/25 px-3 py-3 text-sm text-white placeholder:text-white/40 focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
-                    />
-                    <div className="mt-3 flex flex-wrap items-center gap-2">
-                      <label className="text-xs text-white/60" htmlFor={`${idPrefix}-validation-model`}>
-                        Cleanup/feedback model
-                      </label>
-                      <select
-                        id={`${idPrefix}-validation-model`}
-                        value={validationModel}
-                        onChange={(e) => setValidationModel(e.target.value)}
-                        className="rounded-full border border-white/20 bg-black/30 px-3 py-1.5 text-xs text-white focus:border-white/30 focus:outline-none"
-                      >
-                        <option value="openai/gpt-5.4">openai/gpt-5.4</option>
-                        <option value="anthropic/claude-sonnet-4.6">anthropic/claude-sonnet-4.6</option>
-                        <option value="anthropic/claude-opus-4.6">anthropic/claude-opus-4.6</option>
-                      </select>
+                    <div className="mt-3 rounded-xl border border-white/10 bg-black/20 p-3">
+                      <p className="text-xs text-white/60">Cleaned transcript preview</p>
+                      <p className="mt-1 line-clamp-3 whitespace-pre-wrap break-words text-sm text-white/85">
+                        {(reviewText || rawTranscript).trim() || "Transcript will appear here..."}
+                      </p>
                     </div>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                       {saveEntry && (
@@ -513,11 +412,11 @@ export const VoiceMemoTab: FC<Props> = ({
                       )}
                       <button
                         type="button"
-                        onClick={() => void runJournalValidation()}
-                        disabled={!reviewText.trim() || validating}
+                        onClick={() => setJournalEditorOpen(true)}
+                        disabled={!(reviewText || rawTranscript).trim()}
                         className="rounded-full bg-white px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-50"
                       >
-                        {validating ? "Validating..." : "Run AI validation"}
+                        Open editor
                       </button>
                       {validatedJournal && (
                         <>
@@ -538,36 +437,6 @@ export const VoiceMemoTab: FC<Props> = ({
                         </>
                       )}
                     </div>
-                    {validatedJournal && (
-                      <div className="mt-4 space-y-3 rounded-xl border border-white/10 bg-white/[0.04] p-3">
-                        <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">AI reformatted journal</p>
-                        <textarea
-                          value={validatedJournal}
-                          onChange={(e) => setValidatedJournal(e.target.value)}
-                          rows={8}
-                          className="w-full resize-y rounded-xl border border-white/15 bg-black/25 px-3 py-3 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
-                        />
-                        {validationFeedback && (
-                          <div>
-                            <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">Feedback</p>
-                            <p className="mt-1 whitespace-pre-wrap text-sm text-white/80">{validationFeedback}</p>
-                          </div>
-                        )}
-                        {modelUsed && (
-                          <p className="text-xs text-white/50">Model used: {modelUsed}</p>
-                        )}
-                        {validationNotes.length > 0 && (
-                          <div>
-                            <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">Validation notes</p>
-                            <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-white/75">
-                              {validationNotes.map((note, i) => (
-                                <li key={`${i}-${note.slice(0, 18)}`}>{note}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-                      </div>
-                    )}
                   </div>
                 )}
 
@@ -693,51 +562,191 @@ export const VoiceMemoTab: FC<Props> = ({
             )}
           </div>
 
-          <div
-            className={`flex flex-none flex-col bg-transparent px-3 pt-2 pb-[calc(5.5rem+env(safe-area-inset-bottom))] transition-[padding] duration-500 ease-out md:px-4 md:pb-8 ${
-              isChatActive ? "border-t border-white/[0.07]" : ""
-            }`}
-          >
-            <div className="mx-auto w-full max-w-[48rem]">
-              <div
-                className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-3"
-                role="radiogroup"
-                aria-label="How you want to use the assistant"
-              >
-                {HOME_MODES.map((mode) => {
-                  const selected = homeInteractionMode === mode;
-                  const meta = HOME_MODE_META[mode];
-                  return (
-                    <button
-                      key={mode}
-                      type="button"
-                      role="radio"
-                      aria-checked={selected}
-                      onClick={() => setHomeInteractionMode(mode)}
-                      className={`group flex flex-col items-stretch rounded-2xl border px-4 py-3.5 text-left transition-all duration-300 ease-out focus:outline-none focus-visible:ring-2 focus-visible:ring-white/25 focus-visible:ring-offset-2 focus-visible:ring-offset-transparent ${
-                        selected
-                          ? "border-white/30 bg-white/[0.14] text-white shadow-[0_0_24px_-4px_rgba(255,255,255,0.12)] ring-1 ring-white/15"
-                          : "border-white/10 bg-white/[0.04] text-white/45 hover:border-white/20 hover:bg-white/[0.08] hover:text-white/75 hover:shadow-[0_0_20px_-6px_rgba(255,255,255,0.08)]"
-                      }`}
-                    >
-                      <span className={`text-sm font-semibold tracking-tight ${selected ? "text-white" : "text-white/80"}`}>
-                        {meta.label}
-                      </span>
-                      <span
-                        className={`mt-1 text-xs font-medium leading-snug transition-colors duration-300 ${
-                          selected ? "text-white/75" : "text-white/50 group-hover:text-white/65"
-                        }`}
-                      >
-                        {meta.sublabel}
-                      </span>
-                    </button>
-                  );
-                })}
+          {showBottomComposer && (
+            <div className="flex-none border-t border-white/10 bg-[#0a0a12]/90 px-3 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur-md">
+              <div className="mx-auto w-full max-w-[48rem] space-y-2">
+                <LiveDictationBubble />
+                <AskAnythingComposer layout="center" />
               </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {chatInteractionMode === "journal" && journalEditorOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="mx-4 flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/15 bg-[#121218] shadow-2xl">
+            <div className="flex items-center justify-between border-b border-white/10 px-5 py-3">
+              <div>
+                <h2 className="text-sm font-semibold text-white">Journal editor</h2>
+                <p className="text-xs text-white/50">Review and clean your transcript</p>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => void copyText(reviewText)}
+                  className="rounded-lg p-2 text-white/60 hover:bg-white/10 hover:text-white"
+                  title="Copy"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => readAloud(reviewText)}
+                  className="rounded-lg p-2 text-white/60 hover:bg-white/10 hover:text-white"
+                  title="Read aloud"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setJournalEditorOpen(false)}
+                  className="rounded-lg p-2 text-white/60 hover:bg-white/10 hover:text-white"
+                  title="Close"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+              {saveEntry && (
+                <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs text-white/60" htmlFor={`${idPrefix}-modal-journal-date`}>
+                      Entry date
+                    </label>
+                    <input
+                      id={`${idPrefix}-modal-journal-date`}
+                      type="date"
+                      value={journalEntryDate}
+                      onChange={(e) => setJournalEntryDate(e.target.value)}
+                      className="rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs text-white/60" htmlFor={`${idPrefix}-modal-journal-time`}>
+                      Entry time
+                    </label>
+                    <input
+                      id={`${idPrefix}-modal-journal-time`}
+                      type="time"
+                      value={journalEntryTime}
+                      onChange={(e) => setJournalEntryTime(e.target.value)}
+                      className="rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                    />
+                  </div>
+                </div>
+              )}
+
+              <textarea
+                value={reviewText}
+                onChange={(e) => setReviewText(e.target.value)}
+                rows={10}
+                placeholder="Transcript will appear here..."
+                className="w-full resize-y rounded-xl border border-white/15 bg-black/25 px-3 py-3 text-sm text-white placeholder:text-white/40 focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+              />
+
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="text-xs text-white/60" htmlFor={`${idPrefix}-modal-validation-model`}>
+                  Cleanup/feedback model
+                </label>
+                <select
+                  id={`${idPrefix}-modal-validation-model`}
+                  value={validationModel}
+                  onChange={(e) => setValidationModel(e.target.value)}
+                  className="rounded-full border border-white/20 bg-black/30 px-3 py-1.5 text-xs text-white focus:border-white/30 focus:outline-none"
+                >
+                  <option value="openai/gpt-5.4">openai/gpt-5.4</option>
+                  <option value="anthropic/claude-sonnet-4.6">anthropic/claude-sonnet-4.6</option>
+                  <option value="anthropic/claude-opus-4.6">anthropic/claude-opus-4.6</option>
+                </select>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void runJournalValidation()}
+                  disabled={!reviewText.trim() || validating}
+                  className="rounded-full bg-white px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-50"
+                >
+                  {validating ? "Validating..." : "Run AI validation"}
+                </button>
+                {saveEntry && (
+                  <button
+                    type="button"
+                    onClick={() => void saveToJournal()}
+                    disabled={
+                      savingJournal ||
+                      !journalEntryDate.trim() ||
+                      !journalEntryTime.trim() ||
+                      !(validatedJournal.trim() || reviewText.trim())
+                    }
+                    className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
+                  >
+                    {savingJournal ? "Saving…" : "Save to journal"}
+                  </button>
+                )}
+                {validatedJournal && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => { setGlobalDraft(validatedJournal); setJournalEditorOpen(false); }}
+                      className="rounded-full border border-white/20 px-4 py-1.5 text-xs font-medium text-white/90 transition hover:bg-white/10"
+                    >
+                      Use as draft
+                    </button>
+                    <button
+                      type="button"
+                      onClick={startAnotherEntry}
+                      className="rounded-full border border-white/20 px-4 py-1.5 text-xs font-medium text-white/90 transition hover:bg-white/10"
+                    >
+                      Start another entry
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {validatedJournal && (
+                <div className="space-y-3 rounded-xl border border-white/10 bg-white/[0.04] p-3">
+                  <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">AI reformatted journal</p>
+                  <textarea
+                    value={validatedJournal}
+                    onChange={(e) => setValidatedJournal(e.target.value)}
+                    rows={8}
+                    className="w-full resize-y rounded-xl border border-white/15 bg-black/25 px-3 py-3 text-sm text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                  />
+                  {validationFeedback && (
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">Feedback</p>
+                      <p className="mt-1 whitespace-pre-wrap text-sm text-white/80">{validationFeedback}</p>
+                    </div>
+                  )}
+                  {modelUsed && (
+                    <p className="text-xs text-white/50">Model used: {modelUsed}</p>
+                  )}
+                  {validationNotes.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.15em] text-white/55">Validation notes</p>
+                      <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-white/75">
+                        {validationNotes.map((note, i) => (
+                          <li key={`${i}-${note.slice(0, 18)}`}>{note}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

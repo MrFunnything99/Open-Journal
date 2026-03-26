@@ -1,6 +1,6 @@
 # Selfmeridian Python Backend
 
-Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** as the primary vector memory. **LightRAG** is optional and **off by default** (see `lightrag_bridge.py`). The main app uses **Perplexity** (vector embeddings), **Gemini or OpenRouter** (memory extraction and helpers), and **OpenRouter** (journal `/chat` interviewer, default `openai/gpt-4.1-mini` with fallback `openai/gpt-5.4`).
+Minimal FastAPI + LangGraph backend for stateful multi-agent journaling with **SQLite + sqlite-vec** as the primary vector memory. **LightRAG** is optional and **off by default** (see `lightrag_bridge.py`). The main app uses **Perplexity** (vector embeddings) and **OpenRouter** (journal `/chat`, validation, STT, memory extraction/helpers, voice memo polish, and date inference—model overrides via `OPENROUTER_*` env vars).
 
 ## Setup (1-time)
 
@@ -23,15 +23,13 @@ cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install 
 Copy `.env.example` to `.env` in the project root and set:
 
 - `PERPLEXITY_API_KEY` – for vector embeddings (gist / episodic / library search); required for memory retrieval indexing
-- `GEMINI_API_KEY` – for Gemini `generate_content` only: extraction, recommendations helpers, date inference (not embeddings)
-- `OPENROUTER_API_KEY` – required for `/chat` (journal interviewer) and journal validation; optional model via `OPENROUTER_CHAT_MODEL` (default `openai/gpt-4.1-mini`) and `OPENROUTER_CHAT_FALLBACK_MODEL` (default `openai/gpt-5.4`)
-- `GEMINI_CHAT_MODEL` – e.g. `gemini-3-flash-preview` when using direct Google SDK for extraction (not used by `/chat`)
+- `OPENROUTER_API_KEY` – required for `/chat`, journal validation, library extraction, voice memo polish, and date inference; chat models via `OPENROUTER_CHAT_MODEL` (default `openai/gpt-4.1-mini`) and `OPENROUTER_CHAT_FALLBACK_MODEL` (default `openai/gpt-5.4`); extraction model via `OPENROUTER_EXTRACTION_MODEL` (see `.env.example`)
 - `PERPLEXITY_EMBEDDING_MODEL` – default `pplx-embed-context-v1-4b` (contextualized API; use `pplx-embed-v1-4b` for standard `/v1/embeddings` if you switch)
 - `EMBEDDING_DIM` – must match model output (default `2560` for full-size 4B Perplexity embeddings; use Matryoshka `dimensions` in API only if you align this env)
 - `LIGHTRAG_ENABLED` – default `false`; set to `true` to enable optional LightRAG indexing (`lightrag_bridge.py`)
 - `VECTOR_DB_PATH` – full path to SQLite DB file (optional; for production so the vector DB persists)
 - `TAVILY_API_KEY` – optional; when set, News & article recommendations use [Tavily Search](https://docs.tavily.com/welcome) (topic=news) for real article URLs
-- `SEMANTIC_SCHOLAR_API_KEY` – **currently unused**; Semantic Scholar + PubMed are commented out. Research (and all recommendation categories) use Gemini with Google Search grounding for now.
+- `SEMANTIC_SCHOLAR_API_KEY` – **currently unused**; Semantic Scholar + PubMed are commented out. Research and article agents use OpenRouter (`OPENROUTER_LIBRARY_WEB_MODEL` with `:online` for web when configured).
 - `JWT_SECRET` – optional; when set, simple login (username + password, no email) is enabled. Logged-in users get persistent data; anonymous users can still use the app but their data is forgotten after 1 hour (client-side ephemeral instance). Use a long random string.
 
 On macOS, the system Python SQLite may not support extensions; install `pysqlite3` so sqlite-vec works (`pip install pysqlite3`).
