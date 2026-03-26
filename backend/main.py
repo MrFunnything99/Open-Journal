@@ -486,10 +486,13 @@ class JournalValidateResponse(BaseModel):
 
 
 VOICE_MEMO_POLISH_INSTRUCTION = """You are editing a voice memo transcript. Clean it into clear, readable prose suitable for a personal journal.
-- Preserve meaning and factual content; do not invent events.
-- Remove filler words, false starts, and obvious speech-to-text errors.
+- Fix punctuation, capitalization, and obvious speech-to-text errors.
+- Remove filler words (um, uh, like, you know), false starts, and repeated words.
+- Preserve meaning, factual content, and the author's wording as much as possible; do not invent events.
 - Use first person when the speaker is reflecting on themselves.
-Output only the cleaned text with no title or preamble."""
+- Do NOT rewrite the text as a diary entry or narrative; keep the author's sentence structure.
+- Do NOT add new content, headings, sign-offs, or commentary.
+Output ONLY the cleaned text with no title or preamble."""
 
 JOURNAL_VALIDATE_INSTRUCTION = """You are a supportive assistant helping someone turn a voice transcript into readable journal text.
 
@@ -588,6 +591,7 @@ def _openrouter_speech_to_text(
     filename: str,
     mime_type: Optional[str] = None,
     format_hint: Optional[str] = None,
+    model_override: Optional[str] = None,
 ) -> str:
     import base64 as b64
     import urllib.error
@@ -596,7 +600,7 @@ def _openrouter_speech_to_text(
     key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not key:
         raise ValueError("OPENROUTER_API_KEY is not configured")
-    model = _openrouter_transcription_model()
+    model = model_override or _openrouter_transcription_model()
     fmt = _openrouter_audio_format(filename, mime_type, format_hint)
     payload = {
         "model": model,
@@ -668,17 +672,19 @@ def _transcribe_audio_bytes(
     mime_type: Optional[str] = None,
     format_hint: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Speech-to-text: OpenRouter (gpt-audio-mini) first, then OpenAI transcriptions, then ElevenLabs."""
-    if (os.getenv("OPENROUTER_API_KEY") or "").strip():
-        return (_openrouter_speech_to_text(audio_bytes, filename, mime_type, format_hint), "openrouter")
-    if (os.getenv("OPENAI_API_KEY") or "").strip():
-        return (_openai_speech_to_text(audio_bytes, filename), "openai")
-    if (os.getenv("ELEVENLABS_API_KEY") or "").strip():
-        return (_elevenlabs_transcribe_bytes(audio_bytes), "elevenlabs")
-    raise ValueError(
-        "Configure OPENROUTER_API_KEY for transcription (default model openai/gpt-audio-mini), "
-        "or OPENAI_API_KEY, or ELEVENLABS_API_KEY."
-    )
+    """Speech-to-text via OpenRouter with model fallback: primary → xiaomi/mimo-v2-omni."""
+    key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not key:
+        raise ValueError("Configure OPENROUTER_API_KEY for transcription.")
+    primary = _openrouter_transcription_model()
+    fallback = (os.getenv("OPENROUTER_TRANSCRIPTION_FALLBACK_MODEL") or "xiaomi/mimo-v2-omni").strip()
+    for model in (primary, fallback):
+        try:
+            text = _openrouter_speech_to_text(audio_bytes, filename, mime_type, format_hint, model_override=model)
+            return (text, f"openrouter/{model}")
+        except Exception as e:
+            print(f"[backend] STT {model} failed, trying next: {e}")
+    raise ValueError(f"All OpenRouter transcription models failed ({primary}, {fallback})")
 
 
 def _openai_transcription_model() -> str:
@@ -805,46 +811,18 @@ def _elevenlabs_transcribe_bytes(audio_bytes: bytes) -> str:
 
 
 async def _polish_voice_memo_openrouter(raw: str) -> str:
+    """Single LLM call: clean up filler words, fix STT errors, polish into readable prose."""
     text = (raw or "").strip()
     if not text or not (os.getenv("OPENROUTER_API_KEY") or "").strip():
         return text
-    model = (os.getenv("OPENROUTER_VOICE_MEMO_POLISH_MODEL") or "openai/gpt-4.1-mini").strip()
+    model = (os.getenv("OPENROUTER_VOICE_MEMO_POLISH_MODEL") or "openai/gpt-5.4").strip()
     prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
-
-    def _call():
-        try:
-            return _openrouter_chat_completion(prompt, model=model, temperature=0.3, timeout_sec=90.0)
-        except Exception as e:
-            print("[backend] voice-memo polish error:", e)
-            return ""
-
-    out = (await asyncio.to_thread(_call) or "").strip()
-    return out if out else text
-
-
-JOURNAL_CLEANUP_INSTRUCTION = """You are lightly cleaning a voice-to-text transcript for the author to review in a text editor.
-
-Rules:
-- Fix punctuation, capitalization, and obvious speech-to-text errors.
-- Remove filler words (um, uh, like, you know) and false starts.
-- Do NOT rewrite the text as a journal entry, diary entry, or narrative.
-- Do NOT add new content, headings, sign-offs, or commentary.
-- Keep the author's exact wording and sentence structure as much as possible.
-- Output ONLY the cleaned transcript text, nothing else."""
-
-
-async def _cleanup_transcript_openrouter(raw: str) -> str:
-    text = (raw or "").strip()
-    if not text or not (os.getenv("OPENROUTER_API_KEY") or "").strip():
-        return text
-    model = (os.getenv("OPENROUTER_JOURNAL_CLEANUP_MODEL") or "openai/gpt-5.4-mini").strip()
-    prompt = JOURNAL_CLEANUP_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
 
     def _call():
         try:
             return _openrouter_chat_completion(prompt, model=model, temperature=0.2, timeout_sec=90.0)
         except Exception as e:
-            print("[backend] journal cleanup error:", e)
+            print("[backend] voice-memo polish error:", e)
             return ""
 
     out = (await asyncio.to_thread(_call) or "").strip()
@@ -2263,6 +2241,9 @@ async def api_voice_memo(req: VoiceMemoRequest):
     if len(raw_audio) < 100:
         raise HTTPException(status_code=400, detail="Audio too short to transcribe")
 
+    import time as _time
+    _t0 = _time.monotonic()
+
     fname = _guess_audio_filename(req.filename, req.mime_type)
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -2272,6 +2253,8 @@ async def api_voice_memo(req: VoiceMemoRequest):
             status_code=500,
             detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini), or OPENAI_API_KEY, or ELEVENLABS_API_KEY.",
         )
+    audio_kb = len(raw_audio) / 1024
+    print(f"[backend] voice-memo: transcribing {audio_kb:.0f} KB audio ({fname})")
     try:
         raw_transcript, transcribe_engine = await asyncio.to_thread(
             _transcribe_audio_bytes,
@@ -2280,20 +2263,19 @@ async def api_voice_memo(req: VoiceMemoRequest):
             req.mime_type,
             None,
         )
-    except ValueError as e:
+    except (ValueError, Exception) as e:
+        print(f"[backend] /api/voice-memo transcribe error ({type(e).__name__}): {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        print("[backend] /api/voice-memo transcribe error:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+    _t1 = _time.monotonic()
+    print(f"[backend] voice-memo: transcribe done in {_t1 - _t0:.1f}s ({transcribe_engine})")
 
     polished = await _polish_voice_memo_openrouter(raw_transcript)
+    _t2 = _time.monotonic()
+    print(f"[backend] voice-memo: polish done in {_t2 - _t1:.1f}s (total {_t2 - _t0:.1f}s)")
     did_polish = bool(
         or_key and (raw_transcript or "").strip() and (polished or "").strip() and (polished or "").strip() != (raw_transcript or "").strip()
     )
-
-    cleaned = ""
-    if req.journal_mode and (raw_transcript or "").strip():
-        cleaned = await _cleanup_transcript_openrouter(raw_transcript)
+    cleaned = polished if did_polish else ""
 
     return {
         "raw_transcript": raw_transcript or "",

@@ -40,7 +40,7 @@ function parseNavigateActions(raw: unknown): PersonaplexNavigateAction[] {
 }
 import { backendFetch } from "../../backendApi";
 import type { ChatInteractionMode } from "./chatInteractionModes";
-import { blobToWavBase64 } from "./utils/audioToWav";
+import { blobToBase64, blobToWavBase64 } from "./utils/audioToWav";
 
 const CHAT_TIMEOUT_MS = 90_000;
 
@@ -316,12 +316,23 @@ export function PersonaplexChatProvider({
       setMicPhase("processing");
       setChatError(null);
       try {
-        const b64 = await blobToWavBase64(blob);
-        const filename = "dictation.wav";
+        const isUploadedFile = blob instanceof File && blob.name?.trim();
+        let b64: string;
+        let filename: string;
+        let mimeType: string;
+        if (isUploadedFile) {
+          b64 = await blobToBase64(blob);
+          filename = (blob as File).name;
+          mimeType = blob.type || "audio/mpeg";
+        } else {
+          b64 = await blobToWavBase64(blob);
+          filename = "dictation.wav";
+          mimeType = "audio/wav";
+        }
         const res = await backendFetch("/voice-memo", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ audio: b64, filename, mime_type: "audio/wav" }),
+          body: JSON.stringify({ audio: b64, filename, mime_type: mimeType }),
         });
         const data = (await res.json().catch(() => ({}))) as {
           detail?: string;
