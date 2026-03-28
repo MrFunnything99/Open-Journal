@@ -230,12 +230,18 @@ def _init_db(conn: sqlite3.Connection) -> None:
         )
     """)
 
-    try:
-        conn.execute(
-            "ALTER TABLE consumed_meta ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''"
-        )
-    except sqlite3.OperationalError:
-        pass
+    for col_def in [
+        "instance_id TEXT NOT NULL DEFAULT ''",
+        "isbn TEXT DEFAULT ''",
+        "publish_year TEXT DEFAULT ''",
+        "openlibrary_key TEXT DEFAULT ''",
+        "cover_url TEXT DEFAULT ''",
+        "subjects TEXT DEFAULT ''",
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE consumed_meta ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
 
     # Simple login (no email): username + password_hash for persistent data (legacy)
     conn.execute("""
@@ -367,6 +373,23 @@ def _ensure_extraction_and_ingest_schema(conn: sqlite3.Connection) -> None:
             connected_journal_themes TEXT
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS daily_articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL DEFAULT '',
+            entry_date TEXT NOT NULL,
+            article_title TEXT,
+            article_url TEXT,
+            article_snippet TEXT,
+            hook TEXT,
+            candidates_json TEXT,
+            themes_json TEXT,
+            search_queries_json TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(instance_id, entry_date)
+        )
+        """,
     ):
         conn.execute(tbl)
     try:
@@ -382,6 +405,12 @@ def _ensure_extraction_and_ingest_schema(conn: sqlite3.Connection) -> None:
     try:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_content_feedback_instance ON content_feedback(instance_id, timestamp)"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_daily_articles_lookup ON daily_articles(instance_id, entry_date)"
         )
     except sqlite3.OperationalError:
         pass
@@ -784,6 +813,60 @@ def journal_entries_for_date_range(
         }
         for r in rows
     ]
+
+
+@_sqlite_serialized
+def journal_learning_bookends(instance_id: str) -> tuple[dict | None, list[dict]]:
+    """Oldest journal entry and up to three most recent (for learning theme synthesis).
+
+    Returns (first_entry, last_three_entries). Each dict has id, document, session_id,
+    timestamp (entry_date), created_at. If the scoped instance has no rows but instance_id
+    is set, falls back to the same queries across all instances (single-DB pattern).
+    """
+    conn = _get_conn()
+
+    def _row_dict(r: tuple) -> dict:
+        return {
+            "id": r[0],
+            "document": r[1] or "",
+            "session_id": r[2] or "",
+            "timestamp": r[3] or "",
+            "created_at": r[4] if len(r) > 4 else None,
+        }
+
+    def _first(where_sql: str, params: list) -> dict | None:
+        row = conn.execute(
+            f"""
+            SELECT id, raw_text, session_id, entry_date, created_at
+            FROM journal_entries
+            WHERE {where_sql}
+            ORDER BY entry_date ASC, id ASC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        return _row_dict(row) if row else None
+
+    def _last_three(where_sql: str, params: list) -> list[dict]:
+        rows = conn.execute(
+            f"""
+            SELECT id, raw_text, session_id, entry_date, created_at
+            FROM journal_entries
+            WHERE {where_sql}
+            ORDER BY entry_date DESC, id DESC
+            LIMIT 3
+            """,
+            params,
+        ).fetchall()
+        return [_row_dict(r) for r in rows]
+
+    where, params = _instance_where(instance_id)
+    first = _first(where, params)
+    last3 = _last_three(where, params)
+    if first is None and not last3 and instance_id:
+        first = _first("1=1", [])
+        last3 = _last_three("1=1", [])
+    return first, last3
 
 
 @_sqlite_serialized
@@ -1607,6 +1690,11 @@ def add_consumed(
     note: str = "",
     date_completed: str = "",
     instance_id: str = "",
+    isbn: str = "",
+    publish_year: str = "",
+    openlibrary_key: str = "",
+    cover_url: str = "",
+    subjects: str = "",
 ) -> None:
     conn = _get_conn()
     blob = _blob_from_floats(embedding)
@@ -1627,11 +1715,14 @@ def add_consumed(
     try:
         conn.execute(
             """INSERT OR REPLACE INTO consumed_meta (
-                id_original, type, title, author, url, liked, timestamp, date_completed, note, instance_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                id_original, type, title, author, url, liked, timestamp, date_completed, note,
+                instance_id, isbn, publish_year, openlibrary_key, cover_url, subjects
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 item_id, type_, title[:500], author[:300], url[:500],
-                1 if liked else 0, timestamp, date_completed[:50], note[:2000], instance_id or "",
+                1 if liked else 0, timestamp, date_completed[:50], note[:2000],
+                instance_id or "", isbn[:20], publish_year[:10],
+                openlibrary_key[:100], cover_url[:300], subjects[:1000],
             ),
         )
     except sqlite3.OperationalError:
@@ -1648,6 +1739,41 @@ def add_consumed(
 
 
 @_sqlite_serialized
+def consumed_book_exists(isbn: str = "", title: str = "", author: str = "", instance_id: str = "") -> bool:
+    """Check if a book already exists in consumed_meta by ISBN (preferred) or normalized title+author."""
+    conn = _get_conn()
+    where_base, params_base = _instance_where(instance_id, "consumed_meta")
+    if isbn:
+        try:
+            row = conn.execute(
+                f"SELECT 1 FROM consumed_meta WHERE {where_base} AND type='book' AND isbn=? LIMIT 1",
+                params_base + [isbn],
+            ).fetchone()
+            if row:
+                return True
+        except sqlite3.OperationalError:
+            pass
+    if title:
+        title_norm = title.strip().lower()
+        try:
+            rows = conn.execute(
+                f"SELECT title, author FROM consumed_meta WHERE {where_base} AND type='book'",
+                params_base,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                "SELECT title, author FROM consumed_meta WHERE type='book'",
+            ).fetchall()
+        for r in rows:
+            existing_title = (r[0] or "").strip().lower()
+            existing_author = (r[1] or "").strip().lower()
+            if existing_title == title_norm:
+                if not author or existing_author == author.strip().lower():
+                    return True
+    return False
+
+
+@_sqlite_serialized
 def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict]:
     """Return all consumed rows from consumed_meta (source of truth for listing)."""
     conn = _get_conn()
@@ -1655,7 +1781,8 @@ def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict
     try:
         rows = conn.execute(
             f"""
-            SELECT id_original, type, title, author, date_completed, note
+            SELECT id_original, type, title, author, date_completed, note,
+                   isbn, publish_year, openlibrary_key, cover_url, subjects
             FROM consumed_meta
             WHERE {where}
             ORDER BY timestamp DESC
@@ -1663,6 +1790,7 @@ def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict
             """,
             params + [max_items],
         ).fetchall()
+        has_extra = True
     except sqlite3.OperationalError:
         rows = conn.execute(
             """
@@ -1673,8 +1801,10 @@ def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict
             """,
             (max_items,),
         ).fetchall()
-    return [
-        {
+        has_extra = False
+    result = []
+    for r in rows:
+        item = {
             "id": r[0] or "",
             "type": (r[1] or "article").lower(),
             "title": (r[2] or "?").strip(),
@@ -1682,8 +1812,14 @@ def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict
             "date_completed": (r[4] or "").strip(),
             "note": (r[5] or "").strip(),
         }
-        for r in rows
-    ]
+        if has_extra:
+            item["isbn"] = (r[6] or "").strip()
+            item["publish_year"] = (r[7] or "").strip()
+            item["openlibrary_key"] = (r[8] or "").strip()
+            item["cover_url"] = (r[9] or "").strip()
+            item["subjects"] = (r[10] or "").strip()
+        result.append(item)
+    return result
 
 
 @_sqlite_serialized
@@ -2010,3 +2146,83 @@ def merge_instance_memory(from_instance_id: str, to_instance_id: str) -> None:
                 (id_orig, type_, title, author, url, liked, ts, date_completed, note),
             )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+#  daily_articles helpers
+# ---------------------------------------------------------------------------
+
+@_sqlite_serialized
+def daily_article_upsert(
+    instance_id: str,
+    entry_date: str,
+    article_title: str,
+    article_url: str,
+    article_snippet: str,
+    hook: str,
+    candidates_json: str,
+    themes_json: str,
+    search_queries_json: str,
+    status: str = "pending",
+) -> int:
+    """Insert or replace the daily article for a given date. Returns the row id."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT OR REPLACE INTO daily_articles
+           (instance_id, entry_date, article_title, article_url, article_snippet,
+            hook, candidates_json, themes_json, search_queries_json, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+        (
+            instance_id, entry_date[:10], article_title, article_url,
+            article_snippet, hook, candidates_json, themes_json,
+            search_queries_json, status,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM daily_articles WHERE instance_id=? AND entry_date=?",
+        (instance_id, entry_date[:10]),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+@_sqlite_serialized
+def daily_article_get(instance_id: str, entry_date: str) -> dict | None:
+    """Return the daily article row as a dict, or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        """SELECT id, instance_id, entry_date, article_title, article_url,
+                  article_snippet, hook, candidates_json, themes_json,
+                  search_queries_json, status, created_at
+           FROM daily_articles
+           WHERE instance_id=? AND entry_date=?""",
+        (instance_id, entry_date[:10]),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "instance_id": row[1],
+        "entry_date": row[2],
+        "article_title": row[3],
+        "article_url": row[4],
+        "article_snippet": row[5],
+        "hook": row[6],
+        "candidates_json": row[7],
+        "themes_json": row[8],
+        "search_queries_json": row[9],
+        "status": row[10],
+        "created_at": row[11],
+    }
+
+
+@_sqlite_serialized
+def daily_article_update_status(instance_id: str, entry_date: str, status: str) -> bool:
+    """Update the status of a daily article. Returns True if a row was updated."""
+    conn = _get_conn()
+    cur = conn.execute(
+        "UPDATE daily_articles SET status=? WHERE instance_id=? AND entry_date=?",
+        (status, instance_id, entry_date[:10]),
+    )
+    conn.commit()
+    return cur.rowcount > 0

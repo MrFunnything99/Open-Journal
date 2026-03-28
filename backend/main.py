@@ -80,8 +80,8 @@ def _instance_id(request: Request) -> str:
 sessions: dict[str, list] = {}
 library_interview_sessions: dict[str, list] = {}  # session_id -> list of {role, content}
 
-# Journal chat may run OpenRouter + tool round-trips (e.g. add_library_items); keep headroom.
-CHAT_INVOKE_TIMEOUT_SEC = 90
+# Chat may run OpenRouter + tool round-trips + external API lookups (e.g. Open Library); keep headroom.
+CHAT_INVOKE_TIMEOUT_SEC = 180
 LIBRARY_INTERVIEW_TIMEOUT_SEC = 45
 
 
@@ -111,9 +111,11 @@ async def lifespan(app: FastAPI):
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     chat_model = (os.getenv("OPENROUTER_CHAT_MODEL") or "openai/gpt-4.1-mini").strip()
     chat_fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or "openai/gpt-5.4").strip()
+    convo_model = (os.getenv("OPENROUTER_CONVERSATION_MODEL") or "x-ai/grok-4.1-fast").strip()
     if or_key:
         print(
-            f"[backend] OPENROUTER_API_KEY is set — /chat ({chat_model}; fallback {chat_fallback}), journal validation, "
+            f"[backend] OPENROUTER_API_KEY is set — /chat journal ({chat_model}; fallback {chat_fallback}), "
+            f"conversation ({convo_model} + reasoning), journal validation, "
             "voice-memo polish, date inference, and library extraction helpers"
         )
         print(
@@ -169,7 +171,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     personalization: Optional[float] = None
     intrusiveness: Optional[float] = None
-    mode: Optional[str] = None  # "journal" (default) | "recommendations"
+    mode: Optional[str] = None  # "journal" (default) | "conversation" | "autobiography" | "recommendations" | "learning"
 
 
 class ChatResponse(BaseModel):
@@ -1058,7 +1060,7 @@ async def chat(req: ChatRequest, request: Request):
     instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     mode = (req.mode or "journal").strip().lower()
-    if mode not in ("journal", "recommendations"):
+    if mode not in ("journal", "conversation", "autobiography", "recommendations", "learning"):
         mode = "journal"
 
     if mode == "recommendations":
@@ -2300,6 +2302,58 @@ async def api_journal_validate(req: JournalValidateRequest):
         validation_notes=notes,
         model_used=model_used,
     )
+
+
+# ---------------------------------------------------------------------------
+#  Learning Tab endpoints
+# ---------------------------------------------------------------------------
+
+from learning import generate_daily_article
+
+
+class LearningStatusRequest(BaseModel):
+    status: str  # "read" | "skipped"
+
+
+@app.get("/api/learning/today", include_in_schema=False)
+async def api_learning_today(request: Request):
+    instance_id = _instance_id(request)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(generate_daily_article, instance_id, False),
+            timeout=CHAT_INVOKE_TIMEOUT_SEC,
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Article generation timed out")
+    except Exception as e:
+        print(f"[backend] Learning today error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/learning/regenerate", include_in_schema=False)
+async def api_learning_regenerate(request: Request):
+    instance_id = _instance_id(request)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(generate_daily_article, instance_id, True),
+            timeout=CHAT_INVOKE_TIMEOUT_SEC,
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Article regeneration timed out")
+    except Exception as e:
+        print(f"[backend] Learning regenerate error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/learning/status", include_in_schema=False)
+async def api_learning_status(request: Request, req: LearningStatusRequest):
+    instance_id = _instance_id(request)
+    from datetime import date
+    today = date.today().isoformat()
+    updated = vec_store.daily_article_update_status(instance_id, today, req.status)
+    return {"ok": updated}
 
 
 # Serve built frontend (monolith: when built assets exist, e.g. Docker build).

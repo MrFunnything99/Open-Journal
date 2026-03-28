@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextvars
 import hashlib
+import re
 import time
 import json
 import math
@@ -509,6 +510,11 @@ def add_consumed(
     date_completed: str | None = None,
     instance_id: str = "",
     id_override: str | None = None,
+    isbn: str = "",
+    publish_year: str = "",
+    openlibrary_key: str = "",
+    cover_url: str = "",
+    subjects: str = "",
 ) -> None:
     """
     Record that the user has read/listened to a recommendation (book, podcast, article, research).
@@ -522,7 +528,13 @@ def add_consumed(
     doc = f"User consumed {content_type}: {title}"
     if author:
         doc += f" by {author}"
+    if publish_year:
+        doc += f" ({publish_year})"
+    if isbn:
+        doc += f" [ISBN {isbn}]"
     doc += f". Liked: {'yes' if liked else 'no'}."
+    if subjects:
+        doc += f" Genres/topics: {subjects}."
     if date_completed:
         doc += f" Completed: {date_completed}."
     if note:
@@ -544,6 +556,11 @@ def add_consumed(
         note=(note or "")[:2000],
         date_completed=(date_completed or "")[:50],
         instance_id=instance_id or "",
+        isbn=(isbn or "")[:20],
+        publish_year=(publish_year or "")[:10],
+        openlibrary_key=(openlibrary_key or "")[:100],
+        cover_url=(cover_url or "")[:300],
+        subjects=(subjects or "")[:1000],
     )
 
 
@@ -589,6 +606,397 @@ def apply_library_tool_items(items: object, instance_id: str = "") -> tuple[int,
             print("[backend] apply_library_tool_items add_consumed error:", e)
             continue
     return added, labels
+
+
+OPENLIBRARY_SEARCH_URL = "https://openlibrary.org/search.json"
+OPENLIBRARY_USER_AGENT = os.getenv(
+    "OPENLIBRARY_USER_AGENT",
+    "SelfMeridian/1.0 (https://github.com/MrFunnything99/Open-Journal)",
+)
+OPENLIBRARY_THROTTLE_SEC = 0.2
+
+
+_DERIVATIVE_TITLE_PATTERNS = [
+    "summary of", "summary:", "study guide", "workbook", "sparknotes",
+    "cliffsnotes", "cliff's notes", "coles notes", "masterclass",
+    "analysis of", "review of", "companion to", "[adaptation]",
+    "adapted for", "abridged", "illustrated edition",
+]
+_DERIVATIVE_AUTHOR_PATTERNS = [
+    "short summary", "speedreader", "quickread", "instaread",
+    "book summary", "readtrepreneur",
+]
+
+
+def _smart_title_case(s: str) -> str:
+    """Title-case that handles apostrophes correctly (Man's not Man'S)."""
+    return re.sub(
+        r"[A-Za-z]+('[A-Za-z]+)?",
+        lambda m: m.group(0).capitalize(),
+        s,
+    )
+
+
+def _clean_title(title: str, raw_title: str = "") -> str:
+    """Clean Open Library title quirks: strip ' / Author' suffixes, fix lowercase casing,
+    and trim long subtitles when the user's raw title clearly matches the main part."""
+    if " / " in title:
+        title = title.split(" / ")[0].strip()
+    raw_norm = re.sub(r"[^a-z0-9 ]", "", raw_title.lower()).strip()
+    title_norm = re.sub(r"[^a-z0-9 ]", "", title.lower()).strip()
+    if raw_norm and title_norm.startswith(raw_norm) and len(title_norm) > len(raw_norm) + 5:
+        alnum_count = 0
+        end_pos = 0
+        for i, ch in enumerate(title.lower()):
+            if re.match(r"[a-z0-9 ]", ch):
+                alnum_count += 1
+                if alnum_count >= len(raw_norm):
+                    end_pos = i + 1
+                    break
+        if 0 < end_pos < len(title) - 2:
+            title = title[:end_pos].strip().rstrip(":;,")
+    if title == title.lower() and len(title) > 1:
+        title = _smart_title_case(title)
+    return title
+
+
+def _isbn10_to_13(isbn10: str) -> str:
+    """Convert an ISBN-10 to ISBN-13 by prepending 978 and recalculating the check digit."""
+    base = "978" + isbn10[:9]
+    total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(base))
+    check = (10 - total % 10) % 10
+    return base + str(check)
+
+
+_BAD_AUTHOR_PATTERNS = [
+    "publishing", "press", "books llc", "books ltd", "publications",
+    "editions", "publishers", "verlag", "editora", "éditions",
+    "house", "media", "group", "corporation", "company",
+]
+
+
+_OL_FIELDS = "title,author_name,language,isbn,first_publish_year,subject,cover_i,key"
+
+
+def _query_openlibrary_structured(raw_title: str, raw_author: str | None = None) -> list[dict]:
+    """Search Open Library with structured title/author params."""
+    params: dict[str, str] = {
+        "title": raw_title,
+        "limit": "8",
+        "fields": _OL_FIELDS,
+        "language": "eng",
+    }
+    if raw_author:
+        params["author"] = raw_author
+    url = f"{OPENLIBRARY_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": OPENLIBRARY_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[backend] Open Library structured query failed for '{raw_title}': {e}")
+        return []
+    return data.get("docs") or []
+
+
+def _query_openlibrary_freetext(raw_title: str, raw_author: str | None = None) -> list[dict]:
+    """Search Open Library with the q= freetext param (fuzzy, handles misspellings)."""
+    q_parts = [raw_title]
+    if raw_author:
+        q_parts.append(raw_author)
+    params: dict[str, str] = {
+        "q": " ".join(q_parts),
+        "limit": "8",
+        "fields": _OL_FIELDS,
+        "language": "eng",
+    }
+    url = f"{OPENLIBRARY_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": OPENLIBRARY_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[backend] Open Library freetext query failed for '{raw_title}': {e}")
+        return []
+    return data.get("docs") or []
+
+
+def _author_prefix_match(raw_author: str, candidate_authors: list[str], min_prefix: int = 4) -> bool:
+    """Check if any word in raw_author shares a prefix (4+ chars) with any word in candidate authors."""
+    raw_words = re.sub(r"[^a-z ]", "", raw_author.lower()).split()
+    cand_words = re.sub(r"[^a-z ]", "", " ".join(candidate_authors).lower()).split()
+    for rw in raw_words:
+        if len(rw) < min_prefix:
+            continue
+        prefix = rw[:min_prefix]
+        for cw in cand_words:
+            if cw.startswith(prefix):
+                return True
+    return False
+
+
+def _pick_clean_author(authors: list[str], raw_author: str | None = None) -> str:
+    """Return the first author that isn't a publisher/corporate name."""
+    for a in authors:
+        a_lower = a.strip().lower()
+        if any(p in a_lower for p in _BAD_AUTHOR_PATTERNS):
+            continue
+        return a.strip()
+    return (raw_author or "")
+
+
+def _score_docs(docs: list[dict], raw_title: str, raw_author: str | None = None) -> list[tuple[int, dict]]:
+    """Score and filter Open Library search results, including author similarity."""
+    raw_norm = re.sub(r"[^a-z0-9 ]", "", raw_title.lower()).strip()
+    scored: list[tuple[int, dict]] = []
+    for doc in docs:
+        title = (doc.get("title") or "").strip()
+        title_lower = title.lower()
+        authors = doc.get("author_name") or []
+        author_str_lower = " ".join(authors).lower()
+
+        if any(p in title_lower for p in _DERIVATIVE_TITLE_PATTERNS):
+            continue
+        if any(p in author_str_lower for p in _DERIVATIVE_AUTHOR_PATTERNS):
+            continue
+
+        score = 0
+        langs = doc.get("language") or []
+        if "eng" in langs:
+            score += 10
+        if " / " not in title:
+            score += 5
+        title_norm = re.sub(r"[^a-z0-9 ]", "", title_lower).strip()
+        if raw_norm in title_norm or title_norm in raw_norm:
+            score += 8
+        if title_norm.startswith(raw_norm):
+            score += 5
+        len_diff = abs(len(title_norm) - len(raw_norm))
+        score -= min(len_diff, 20)
+
+        if raw_author and authors:
+            if _author_prefix_match(raw_author, authors):
+                score += 20
+            else:
+                score -= 5
+                if any(p in author_str_lower for p in _BAD_AUTHOR_PATTERNS):
+                    score -= 15
+
+        scored.append((score, doc))
+    return scored
+
+
+def _resolve_book_openlibrary(raw_title: str, raw_author: str | None = None) -> dict:
+    """
+    Query Open Library for the canonical title and author.
+    Retry chain: title+author (strict) → q=title+author (fuzzy) → title-only (last resort).
+    Scores results by title proximity, English preference, and author-word-prefix similarity.
+    Filters publishers masquerading as authors.
+    """
+    fallback = {"title": raw_title or "", "author": raw_author or "",
+                 "isbn": "", "publish_year": "", "openlibrary_key": "",
+                 "cover_url": "", "subjects": ""}
+    if not raw_title:
+        return fallback
+
+    docs = _query_openlibrary_structured(raw_title, raw_author)
+
+    if not docs and raw_author:
+        title_docs = _query_openlibrary_structured(raw_title, None)
+        q_docs = _query_openlibrary_freetext(raw_title, raw_author)
+        seen_titles = set()
+        docs = []
+        for d in title_docs + q_docs:
+            key = (d.get("title", ""), str(d.get("author_name", [])))
+            if key not in seen_titles:
+                seen_titles.add(key)
+                docs.append(d)
+
+    if not docs:
+        return fallback
+
+    scored = _score_docs(docs, raw_title, raw_author)
+
+    if scored:
+        scored.sort(key=lambda x: -x[0])
+        top = scored[0][1]
+    else:
+        top = docs[0]
+
+    canonical_title = _clean_title((top.get("title") or raw_title or "").strip(), raw_title)
+    authors = top.get("author_name") or []
+    canonical_author = _pick_clean_author(authors, raw_author)
+
+    isbns = top.get("isbn") or []
+    isbn13 = next((i for i in isbns if len(i) == 13 and i.isdigit()), "")
+    if not isbn13:
+        isbn10 = next((i for i in isbns if len(i) == 10), "")
+        if isbn10:
+            isbn13 = _isbn10_to_13(isbn10)
+
+    publish_year = str(top.get("first_publish_year") or "")
+    ol_key = (top.get("key") or "").strip()
+    cover_id = top.get("cover_i")
+    cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else ""
+    subjects_raw = top.get("subject") or []
+    subjects = ", ".join(s.strip() for s in subjects_raw[:5] if s.strip())
+
+    return {
+        "title": canonical_title,
+        "author": canonical_author,
+        "isbn": isbn13,
+        "publish_year": publish_year,
+        "openlibrary_key": ol_key,
+        "cover_url": cover_url,
+        "subjects": subjects,
+    }
+
+
+def resolve_books_via_openlibrary(
+    books: list[dict],
+) -> list[dict]:
+    """
+    Takes the raw array from the extract_books_read tool call and resolves
+    each book against Open Library with a 1-second throttle between requests.
+    Returns enriched dicts with canonical title/author plus original liked/note.
+    """
+    resolved: list[dict] = []
+    for i, raw in enumerate(books):
+        if not isinstance(raw, dict):
+            continue
+        raw_title = (raw.get("raw_title") or "").strip()
+        raw_author = (raw.get("raw_author") or "").strip() or None
+        if not raw_title:
+            continue
+
+        if i > 0:
+            time.sleep(OPENLIBRARY_THROTTLE_SEC)
+
+        match = _resolve_book_openlibrary(raw_title, raw_author)
+        resolved.append({
+            "type": "book",
+            "title": match["title"],
+            "author": match["author"] or None,
+            "raw_title": raw_title,
+            "raw_author": raw_author,
+            "liked": raw.get("liked", True),
+            "note": (raw.get("note") or "").strip() or None,
+            "isbn": match.get("isbn", ""),
+            "publish_year": match.get("publish_year", ""),
+            "openlibrary_key": match.get("openlibrary_key", ""),
+            "cover_url": match.get("cover_url", ""),
+            "subjects": match.get("subjects", ""),
+        })
+    return resolved
+
+
+_BOOK_VALIDATION_MODEL = os.getenv("OPENROUTER_BOOK_VALIDATION_MODEL", "openai/gpt-4.1-mini")
+
+_BOOK_VALIDATION_PROMPT = """You validate book metadata from a catalog search. Some entries have wrong authors (publisher, adapter, or summary writer instead of the real author) or wrong titles (non-English, adaptation, or subtitle appended).
+
+For each entry, output the correct canonical English title and the original author's full name.
+Return ONLY a JSON array — same length, same order. Each element: {"title":"...","author":"..."}.
+If already correct, return unchanged. No markdown, no explanation.
+
+"""
+
+
+def _validate_books_via_llm(resolved: list[dict]) -> list[dict]:
+    """
+    LLM verification pass to catch author/title mismatches the catalog search missed.
+    Processes in batches of 10 to stay within token limits.
+    """
+    if not resolved or not openrouter_api_configured():
+        return resolved
+
+    batch_size = 10
+    for start in range(0, len(resolved), batch_size):
+        batch = resolved[start : start + batch_size]
+        validation_input = [
+            {"title": b.get("title", ""), "author": b.get("author", ""),
+             "raw_title": b.get("raw_title", ""), "raw_author": b.get("raw_author", "")}
+            for b in batch
+        ]
+        prompt = _BOOK_VALIDATION_PROMPT + json.dumps(validation_input)
+        try:
+            raw = _openrouter_chat_completion(
+                prompt,
+                model=_BOOK_VALIDATION_MODEL,
+                temperature=0.0,
+                timeout_sec=20,
+                max_tokens=2048,
+            )
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            corrections = json.loads(raw)
+            if not isinstance(corrections, list) or len(corrections) != len(batch):
+                print(f"[backend] Book validation batch returned {len(corrections) if isinstance(corrections, list) else 'non-list'}, expected {len(batch)} — skipping batch")
+                continue
+            for i, correction in enumerate(corrections):
+                if not isinstance(correction, dict):
+                    continue
+                idx = start + i
+                new_title = (correction.get("title") or "").strip()
+                new_author = (correction.get("author") or "").strip()
+                if new_title and new_title != resolved[idx].get("title"):
+                    print(f"[backend] LLM corrected title: '{resolved[idx]['title']}' -> '{new_title}'")
+                    resolved[idx]["title"] = new_title
+                if new_author and new_author != resolved[idx].get("author"):
+                    print(f"[backend] LLM corrected author: '{resolved[idx].get('author')}' -> '{new_author}'")
+                    resolved[idx]["author"] = new_author
+        except Exception as e:
+            print(f"[backend] Book validation LLM error batch {start}-{start+len(batch)} (non-fatal): {e}")
+    return resolved
+
+
+def save_resolved_books(resolved: list[dict], instance_id: str = "") -> tuple[int, list[str]]:
+    """
+    Save Open-Library-resolved books to the knowledge base, skipping duplicates.
+    Dedup by ISBN first, then by normalized title+author.
+    Returns (count_saved, labels).
+    """
+    import vec_store
+
+    saved = 0
+    skipped = 0
+    labels: list[str] = []
+    for book in resolved:
+        title = book.get("title", "")
+        author = book.get("author")
+        isbn = book.get("isbn", "")
+        if not title:
+            continue
+        if vec_store.consumed_book_exists(
+            isbn=isbn, title=title, author=author or "", instance_id=instance_id,
+        ):
+            skipped += 1
+            print(f"[backend] Skipping duplicate book: {title} (ISBN {isbn or 'n/a'})")
+            continue
+        try:
+            add_consumed(
+                "book",
+                title,
+                author=author or None,
+                liked=bool(book.get("liked", True)),
+                note=book.get("note"),
+                instance_id=instance_id,
+                isbn=isbn,
+                publish_year=book.get("publish_year", ""),
+                openlibrary_key=book.get("openlibrary_key", ""),
+                cover_url=book.get("cover_url", ""),
+                subjects=book.get("subjects", ""),
+            )
+            saved += 1
+            label = f"book: {title[:80]}"
+            if author:
+                label += f" ({author[:60]})"
+            labels.append(label)
+        except Exception as e:
+            print(f"[backend] save_resolved_books error for '{title}': {e}")
+    if skipped:
+        labels.append(f"({skipped} already in library)")
+    return saved, labels
 
 
 def process_library_note(text: str, type_filter: str | None = None, instance_id: str = "") -> int:
@@ -744,13 +1152,24 @@ def list_consumed(max_items: int = 200, instance_id: str = "") -> dict[str, list
                 continue
             if not (r.get("title") or "").strip():
                 continue
-            out[key].append({
+            item = {
                 "id": r.get("id", ""),
                 "title": r.get("title", "?"),
                 "author": r.get("author", ""),
                 "date_completed": r.get("date_completed", ""),
                 "note": r.get("note", ""),
-            })
+            }
+            if r.get("isbn"):
+                item["isbn"] = r["isbn"]
+            if r.get("publish_year"):
+                item["publish_year"] = r["publish_year"]
+            if r.get("openlibrary_key"):
+                item["openlibrary_key"] = r["openlibrary_key"]
+            if r.get("cover_url"):
+                item["cover_url"] = r["cover_url"]
+            if r.get("subjects"):
+                item["subjects"] = r["subjects"]
+            out[key].append(item)
         for key in out:
             out[key].sort(key=lambda x: _parse_date_completed(x.get("date_completed") or ""), reverse=True)
         return out

@@ -42,7 +42,7 @@ import { backendFetch } from "../../backendApi";
 import type { ChatInteractionMode } from "./chatInteractionModes";
 import { blobToBase64, blobToWavBase64 } from "./utils/audioToWav";
 
-const CHAT_TIMEOUT_MS = 90_000;
+const CHAT_TIMEOUT_MS = 190_000;
 
 export type PersonaplexChatMessage = {
   id: string;
@@ -414,7 +414,7 @@ export function PersonaplexChatProvider({
           session_id: chatSessionId,
           personalization: 1,
           intrusiveness: 0.5,
-          mode: "journal",
+          mode: chatInteractionMode,
         }),
         signal: controller.signal,
       });

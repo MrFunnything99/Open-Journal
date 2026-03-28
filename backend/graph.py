@@ -21,7 +21,15 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-from library import apply_library_tool_items, get_relevant_context_dual, ingest_journal_entry
+from learning import get_learning_system_prompt
+from library import (
+    apply_library_tool_items,
+    get_relevant_context_dual,
+    ingest_journal_entry,
+    resolve_books_via_openlibrary,
+    save_resolved_books,
+    _validate_books_via_llm,
+)
 from agent_site_tools import (
     log_tool_invocation,
     tool_mark_recommendation_consumed,
@@ -38,7 +46,7 @@ class JournalState(TypedDict):
     session_id: str
     personalization: float
     intrusiveness: NotRequired[float]
-    mode: NotRequired[str]  # "journal" (recommendations handled in main)
+    mode: NotRequired[str]  # "journal" | "conversation" | "autobiography" (recommendations handled in main)
     retrieval_log: NotRequired[str]
     last_transcript: NotRequired[str]
     last_summary: NotRequired[str]
@@ -51,6 +59,7 @@ class JournalState(TypedDict):
 
 DEFAULT_OPENROUTER_CHAT_MODEL = "openai/gpt-4.1-mini"
 DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL = "openai/gpt-5.4"
+DEFAULT_OPENROUTER_CONVERSATION_MODEL = "x-ai/grok-4.1-fast"
 
 
 def _openrouter_chat_client_and_model():
@@ -94,10 +103,11 @@ LIBRARY_ITEMS_TOOL = {
     "function": {
         "name": "add_library_items",
         "description": (
-            "Save books, podcasts, articles, or research papers the user has finished (or wants logged) into their "
-            "Library for recommendations. Use when they paste a list, enumerate several titles, or ask to add/track "
-            "what they read or listened to. Use correct type per item. Normalize book titles and author names when "
-            "obvious (e.g. 'dune' → Dune, Frank Herbert). Leave url empty unless they gave a real link. "
+            "Save podcasts, articles, or research papers the user has finished (or wants logged) into their "
+            "Library for recommendations. For BOOKS, always use extract_books_read instead — it verifies "
+            "spelling via Open Library. Use this tool when they paste a list, enumerate several titles, or ask to "
+            "add/track what they listened to or read (non-book). Use correct type per item. "
+            "Leave url empty unless they gave a real link. "
             "Do NOT use for hypothetical picks, things they might read later, or casual single mentions unless "
             "they clearly want them saved."
         ),
@@ -320,10 +330,57 @@ REQUEST_FOCUSED_REC_TOOL = {
     },
 }
 
+EXTRACT_BOOKS_READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "extract_books_read",
+        "description": (
+            "Extract books the user mentions having read, finished, or consumed during conversation. "
+            "Use this when the user says they read a book, finished a book, loved a book, etc. — even if "
+            "mentioned casually or indirectly (e.g. 'I just finished Dune' or 'that Brené Brown book was great'). "
+            "Extract the raw title and author as the user said them; the backend will verify spelling and metadata. "
+            "Include any opinion or short comment the user expressed as a note (e.g. 'it was good', 'didn't love the ending'). "
+            "Do NOT use add_library_items for books — always use this tool instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "books": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "raw_title": {
+                                "type": "string",
+                                "description": "Book title as the user said it (may have typos or be informal)",
+                            },
+                            "raw_author": {
+                                "type": "string",
+                                "description": "Author name as the user said it; null or empty if not mentioned",
+                            },
+                            "liked": {
+                                "type": "boolean",
+                                "description": "True if the user enjoyed or was neutral; false if they disliked",
+                            },
+                            "note": {
+                                "type": "string",
+                                "description": "Any short opinion or comment the user expressed about the book",
+                            },
+                        },
+                        "required": ["raw_title"],
+                    },
+                },
+            },
+            "required": ["books"],
+        },
+    },
+}
+
 _CHAT_TOOLS = [
     LIBRARY_ITEMS_TOOL,
     UPDATE_LIBRARY_ITEM_TOOL,
     MARK_RECOMMENDATION_CONSUMED_TOOL,
+    EXTRACT_BOOKS_READ_TOOL,
     NAVIGATE_UI_TOOL,
     UPDATE_CONTENT_PREFERENCES_TOOL,
     SUBMIT_CONTENT_FEEDBACK_TOOL,
@@ -380,6 +437,7 @@ def _interviewer_run_with_tools(
     instance_id: str,
     *,
     max_tool_rounds: int = 5,
+    extra_body: dict | None = None,
 ) -> tuple[AIMessage, int, list[dict], list[dict]]:
     """
     Multi-turn chat completion (OpenRouter) with allowlisted site tools.
@@ -397,13 +455,16 @@ def _interviewer_run_with_tools(
     while rounds < max_tool_rounds:
         rounds += 1
         try:
-            resp = client.chat.completions.create(
+            create_kwargs: dict = dict(
                 model=active_model,
                 messages=oai_messages,
                 tools=_CHAT_TOOLS,
                 tool_choice="auto",
                 max_tokens=4096,
             )
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+            resp = client.chat.completions.create(**create_kwargs)
         except Exception as e:
             # If the cheap model fails (timeouts, provider errors, tool-call glitches), retry once on fallback.
             if (not escalated) and fallback_model and active_model != fallback_model:
@@ -458,6 +519,29 @@ def _interviewer_run_with_tools(
             elif name == "mark_recommendation_consumed":
                 result, summ = tool_mark_recommendation_consumed(args, instance_id)
                 agent_steps.append({"kind": "tool", "name": name, "summary": summ})
+            elif name == "extract_books_read":
+                try:
+                    raw_books = args.get("books", [])
+                    resolved = resolve_books_via_openlibrary(raw_books)
+                    resolved = _validate_books_via_llm(resolved)
+                    n, labels = save_resolved_books(resolved, instance_id)
+                    total_saved += n
+                    result = {"ok": True, "books_saved": n, "saved": labels[:24]}
+                    preview = ", ".join(labels[:4]) if labels else ""
+                    if n > 0:
+                        summ = f"Verified & saved {n} book(s) to Library"
+                        if preview:
+                            summ += f": {preview}{'…' if len(labels) > 4 else ''}"
+                    else:
+                        summ = "Book extraction ran (no new items)"
+                    agent_steps.append({"kind": "tool", "name": name, "summary": summ})
+                except Exception as e:
+                    result = {"ok": False, "error": str(e)[:240]}
+                    agent_steps.append({
+                        "kind": "tool",
+                        "name": name,
+                        "summary": f"Book extraction error: {str(e)[:80]}",
+                    })
             elif name == "navigate_ui":
                 result, summ, action = tool_navigate_ui(args)
                 agent_steps.append({"kind": "tool", "name": name, "summary": summ})
@@ -554,7 +638,9 @@ def interviewer_node(state: JournalState) -> JournalState:
             "At low levels, ask sparingly and avoid probing. "
             "At high levels, you may ask more direct questions when it feels supportive, while still respecting boundaries. ",
             "When the user asks 'what should we talk about?' or 'what should we explore?', you may offer 1–2 broad areas if the memory context clearly suggests them; otherwise keep it open: 'Whatever feels most present—we can go wherever you'd like.' ",
-            "You can save things to the user's **Library** by calling **add_library_items** when they paste a list or clearly want new items recorded. "
+            "When the user mentions a **book** they read, finished, or enjoyed (even casually), call **extract_books_read** — "
+            "the backend will verify the title/author spelling via Open Library and save clean data automatically. "
+            "Use **add_library_items** only for non-book media (podcasts, articles, research). "
             "Use **update_library_item** to change an existing library item's **note** or **date_completed** when they ask to edit, rename phrasing in a note, or fix metadata (prefer **title_query** if you don't have an id). "
             "Use **mark_recommendation_consumed** when they say they finished or consumed a recommendation. "
             "Use **navigate_ui** when they explicitly ask to open another main screen (Recommendations, Brain, Chat, Home). "
@@ -595,7 +681,15 @@ def interviewer_node(state: JournalState) -> JournalState:
         except Exception:
             system_parts.append("\n\n(Memory retrieval unavailable; respond without prior context.)")
 
-    system = SystemMessage(content="\n".join(system_parts))
+    if mode_raw == "learning":
+        import vec_store as _vs
+        _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _article = _vs.daily_article_get(instance_id, _today) or {}
+        learning_sys = get_learning_system_prompt(instance_id, _article)
+        system = SystemMessage(content=learning_sys)
+    else:
+        system = SystemMessage(content="\n".join(system_parts))
+
     lc_messages = [system] + state["messages"]
     oai_messages = _messages_to_openai_dicts(lc_messages)
     instance_id = state.get("instance_id") or ""
@@ -605,8 +699,19 @@ def interviewer_node(state: JournalState) -> JournalState:
     response: AIMessage
     try:
         client, model, _fallback = _openrouter_chat_client_models()
+        extra_body: dict | None = None
+        if mode_raw == "conversation":
+            model = (os.getenv("OPENROUTER_CONVERSATION_MODEL") or DEFAULT_OPENROUTER_CONVERSATION_MODEL).strip()
+            extra_body = {"reasoning": {"enabled": True}}
+        elif mode_raw == "learning":
+            model = (os.getenv("OPENROUTER_LEARNING_MODEL") or "anthropic/claude-opus-4.6").strip()
+            ml = model.lower()
+            if ml.startswith("x-ai/") or "/grok" in ml:
+                extra_body = {"reasoning": {"enabled": True}}
+            else:
+                extra_body = None
         response, library_added, tool_steps, nav_actions = _interviewer_run_with_tools(
-            client, model, oai_messages, instance_id
+            client, model, oai_messages, instance_id, extra_body=extra_body
         )
         agent_steps = list(tool_steps)
         client_actions = list(nav_actions)

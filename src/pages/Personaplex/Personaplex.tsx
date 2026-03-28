@@ -4,6 +4,7 @@ import { parseKnowledgeBaseFile, useJournalHistory } from "./hooks/useJournalHis
 import { buildKnowledgeBaseMarkdownZip, parseKnowledgeBaseMarkdownZip } from "./knowledgeBaseMarkdownZip";
 import { BrainLayout, type BrainLibraryCategory } from "./components/BrainLayout";
 import { VoiceMemoTab } from "./components/VoiceMemoTab";
+import { LearningTab } from "./components/LearningTab";
 import { BrainCalendarPanel } from "./components/BrainCalendarPanel";
 import { PersonaplexChatProvider, type PersonaplexNavigateAction } from "./PersonaplexChatContext";
 import { MobileAskComposerDockGate } from "./components/GlobalAskAnythingBar";
@@ -132,7 +133,7 @@ function librarySnapshotToBulkPayload(next: {
   return items;
 }
 
-type PersonaplexView = "voice_memo" | "brain" | "recommendations";
+type PersonaplexView = "voice_memo" | "brain" | "recommendations" | "learning";
 
 export const Personaplex = () => {
   const [view, setView] = useState<PersonaplexView>("voice_memo");
@@ -773,7 +774,7 @@ export const Personaplex = () => {
       <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
         <div
           className={`flex-1 flex flex-col min-h-0 transition-opacity duration-300 ${
-            view === "brain" || view === "voice_memo" || view === "recommendations"
+            view === "brain" || view === "voice_memo" || view === "recommendations" || view === "learning"
               ? "overflow-hidden"
               : "overflow-y-auto"
           } opacity-100`}
@@ -1379,6 +1380,7 @@ export const Personaplex = () => {
               )}
             </div>
           )}
+          {view === "learning" && <LearningTab onToast={chatToast} />}
         </div>
       </main>
 
