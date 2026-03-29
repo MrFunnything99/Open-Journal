@@ -84,6 +84,20 @@ type BrainLayoutProps = {
   onPrepareJournalDumpUpload?: () => boolean;
 };
 
+function countJournalText(entries: JournalEntry[], mode: "tokens" | "words"): number {
+  let total = 0;
+  for (const entry of entries) {
+    for (const msg of entry.fullTranscript) {
+      if (mode === "words") {
+        total += msg.text.trim() ? msg.text.trim().split(/\s+/).length : 0;
+      } else {
+        total += msg.text.length;
+      }
+    }
+  }
+  return mode === "tokens" ? Math.ceil(total / 4) : total;
+}
+
 function groupJournalMonthByCalendarDay(monthEntries: JournalEntry[]): { dayKey: string; entries: JournalEntry[] }[] {
   const m = new Map<string, JournalEntry[]>();
   for (const e of monthEntries) {
@@ -186,6 +200,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const [selection, setSelection] = useState<Selection | null>(null);
   const [journalExpandedYears, setJournalExpandedYears] = useState<Set<number>>(() => new Set());
   const [journalExpandedMonths, setJournalExpandedMonths] = useState<Set<string>>(() => new Set());
+  const [journalCountMode, setJournalCountMode] = useState<"tokens" | "words">("tokens");
   const [convExpandedYears, setConvExpandedYears] = useState<Set<number>>(() => new Set());
   const [convExpandedMonths, setConvExpandedMonths] = useState<Set<string>>(() => new Set());
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
@@ -606,11 +621,33 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
           )}
           {explorerTab === "journals" && (
             <div className="mb-2">
+              {journalTree.length > 0 && (
+                <div className="mb-1.5 flex items-center justify-end px-2">
+                  <div className="flex items-center rounded-full border border-gray-200 dark:border-gray-600 bg-gray-100 dark:bg-[#2a2a2a] p-0.5 text-[0.6rem] font-medium">
+                    <button
+                      type="button"
+                      onClick={() => setJournalCountMode("tokens")}
+                      className={`rounded-full px-2 py-0.5 transition-colors ${journalCountMode === "tokens" ? "bg-white dark:bg-[#404040] text-gray-900 dark:text-white shadow-sm" : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"}`}
+                    >
+                      tokens
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setJournalCountMode("words")}
+                      className={`rounded-full px-2 py-0.5 transition-colors ${journalCountMode === "words" ? "bg-white dark:bg-[#404040] text-gray-900 dark:text-white shadow-sm" : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"}`}
+                    >
+                      words
+                    </button>
+                  </div>
+                </div>
+              )}
               <div className="ml-1 border-l border-gray-100 dark:border-gray-600 pl-2">
                 {journalTree.length === 0 ? (
                   <p className="text-xs text-gray-400 py-1 px-1">No journal entries yet.</p>
                 ) : (
-                  journalTree.map(({ year, months }) => (
+                  journalTree.map(({ year, months }) => {
+                    const yearEntries = months.flatMap((m) => m.entries);
+                    return (
                     <div key={year} className="mb-1">
                       <button
                         type="button"
@@ -625,7 +662,10 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                         >
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                         </svg>
-                        {year}
+                        <span className="flex-1">{year}</span>
+                        <span className="ml-auto shrink-0 text-[0.6rem] font-normal text-gray-400 dark:text-gray-500">
+                          {countJournalText(yearEntries, journalCountMode).toLocaleString()} {journalCountMode === "tokens" ? "tok" : "w"}
+                        </span>
                       </button>
                       {journalExpandedYears.has(year) && (
                         <div className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-0.5">
@@ -646,7 +686,10 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                   >
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                                   </svg>
-                                  {monthLabel}
+                                  <span className="flex-1">{monthLabel}</span>
+                                  <span className="ml-auto shrink-0 text-[0.6rem] text-gray-400 dark:text-gray-500">
+                                    {countJournalText(monthEntries, journalCountMode).toLocaleString()} {journalCountMode === "tokens" ? "tok" : "w"}
+                                  </span>
                                 </button>
                                 {journalExpandedMonths.has(mKey) && (
                                   <div className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-2 pb-1">
@@ -665,6 +708,9 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
                                           </svg>
                                           <span className="min-w-0 flex-1 truncate font-medium">{formatCalendarDayHeading(dayGroup.dayKey)}</span>
+                                          <span className="ml-1 shrink-0 text-[0.6rem] text-gray-400 dark:text-gray-500">
+                                            {countJournalText(dayGroup.entries, journalCountMode).toLocaleString()} {journalCountMode === "tokens" ? "tok" : "w"}
+                                          </span>
                                         </button>
                                       </div>
                                     ))}
@@ -676,7 +722,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                         </div>
                       )}
                     </div>
-                  ))
+                  );
+                  })
                 )}
               </div>
             </div>

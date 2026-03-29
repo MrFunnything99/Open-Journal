@@ -816,12 +816,12 @@ def journal_entries_for_date_range(
 
 
 @_sqlite_serialized
-def journal_learning_bookends(instance_id: str) -> tuple[dict | None, list[dict]]:
-    """Oldest journal entry and up to three most recent (for learning theme synthesis).
+def journal_learning_bookends(instance_id: str) -> list[dict]:
+    """Three most recent journal entries for learning theme synthesis.
 
-    Returns (first_entry, last_three_entries). Each dict has id, document, session_id,
-    timestamp (entry_date), created_at. If the scoped instance has no rows but instance_id
-    is set, falls back to the same queries across all instances (single-DB pattern).
+    Returns a list of up to 3 dicts with id, document, session_id,
+    timestamp (entry_date), created_at, ordered newest-first.
+    Falls back across all instances if the scoped instance has no rows.
     """
     conn = _get_conn()
 
@@ -833,19 +833,6 @@ def journal_learning_bookends(instance_id: str) -> tuple[dict | None, list[dict]
             "timestamp": r[3] or "",
             "created_at": r[4] if len(r) > 4 else None,
         }
-
-    def _first(where_sql: str, params: list) -> dict | None:
-        row = conn.execute(
-            f"""
-            SELECT id, raw_text, session_id, entry_date, created_at
-            FROM journal_entries
-            WHERE {where_sql}
-            ORDER BY entry_date ASC, id ASC
-            LIMIT 1
-            """,
-            params,
-        ).fetchone()
-        return _row_dict(row) if row else None
 
     def _last_three(where_sql: str, params: list) -> list[dict]:
         rows = conn.execute(
@@ -861,12 +848,10 @@ def journal_learning_bookends(instance_id: str) -> tuple[dict | None, list[dict]
         return [_row_dict(r) for r in rows]
 
     where, params = _instance_where(instance_id)
-    first = _first(where, params)
-    last3 = _last_three(where, params)
-    if first is None and not last3 and instance_id:
-        first = _first("1=1", [])
-        last3 = _last_three("1=1", [])
-    return first, last3
+    recent = _last_three(where, params)
+    if not recent and instance_id:
+        recent = _last_three("1=1", [])
+    return recent
 
 
 @_sqlite_serialized

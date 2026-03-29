@@ -54,6 +54,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     chatInteractionMode,
     journalFileToProcess,
     clearJournalFileToProcess,
+    journalTextToProcess,
+    clearJournalTextToProcess,
   } = usePersonaplexChat();
   const idPrefix = useId();
   const [journalMicPhase, setJournalMicPhase] = useState<"idle" | "recording" | "processing">("idle");
@@ -175,6 +177,18 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       void processMicAudio(file);
     }
   }, [journalFileToProcess, chatInteractionMode, clearJournalFileToProcess, processMicAudio]);
+
+  useEffect(() => {
+    if (journalTextToProcess && chatInteractionMode === "journal") {
+      const text = journalTextToProcess;
+      clearJournalTextToProcess();
+      const now = new Date();
+      setReviewText(text);
+      setRawTranscript(text);
+      if (!journalEntryDate) setJournalEntryDate(toDateInputValue(now));
+      if (!journalEntryTime) setJournalEntryTime(toTimeInputValue(now));
+    }
+  }, [journalTextToProcess, chatInteractionMode, clearJournalTextToProcess, journalEntryDate, journalEntryTime]);
 
   const getJournalFeedback = useCallback(async () => {
     const text = reviewText.trim();

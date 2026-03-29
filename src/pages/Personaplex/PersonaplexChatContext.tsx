@@ -171,6 +171,9 @@ type PersonaplexChatContextValue = {
   /** Set by sendChat when journal mode + pending file; VoiceMemoTab watches and processes via journal pipeline. */
   journalFileToProcess: File | null;
   clearJournalFileToProcess: () => void;
+  /** Set by sendChat when journal mode + text only; VoiceMemoTab watches and populates the review editor. */
+  journalTextToProcess: string | null;
+  clearJournalTextToProcess: () => void;
   composerDisabled: boolean;
   activityLog: AgentActivityEntry[];
   clearActivityLog: () => void;
@@ -220,6 +223,7 @@ export function PersonaplexChatProvider({
 
   const [pendingAudioFile, setPendingAudioFile] = useState<File | null>(null);
   const [journalFileToProcess, setJournalFileToProcess] = useState<File | null>(null);
+  const [journalTextToProcess, setJournalTextToProcess] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -375,6 +379,13 @@ export function PersonaplexChatProvider({
       setPendingAudioFile(null);
       setDraft("");
       setJournalFileToProcess(audioFile);
+      return;
+    }
+
+    // Journal mode + text only → hand off to VoiceMemoTab's journal panel
+    if (chatInteractionMode === "journal" && text && !audioFile) {
+      setDraft("");
+      setJournalTextToProcess(text);
       return;
     }
 
@@ -577,6 +588,7 @@ export function PersonaplexChatProvider({
 
   const clearPendingAudioFile = useCallback(() => setPendingAudioFile(null), []);
   const clearJournalFileToProcess = useCallback(() => setJournalFileToProcess(null), []);
+  const clearJournalTextToProcess = useCallback(() => setJournalTextToProcess(null), []);
 
   const composerDisabled = sending || micPhase !== "idle";
 
@@ -628,6 +640,8 @@ export function PersonaplexChatProvider({
       clearPendingAudioFile,
       journalFileToProcess,
       clearJournalFileToProcess,
+      journalTextToProcess,
+      clearJournalTextToProcess,
       composerDisabled,
       activityLog,
       clearActivityLog,
@@ -654,6 +668,7 @@ export function PersonaplexChatProvider({
       composerDisabled,
       pendingAudioFile,
       journalFileToProcess,
+      journalTextToProcess,
       activityLog,
       chatRecents,
       loadRecentSession,

@@ -19,7 +19,7 @@ import vec_store
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 _DEFAULT_LEARNING_MODEL = "anthropic/claude-opus-4.6"
-_DEFAULT_GROK_THEME_MODEL = "x-ai/grok-4.1-fast"
+_DEFAULT_THEME_MODEL = "openai/gpt-5.4"
 
 _SYNTHESIS_LOGGER_NAME = "selfmeridian.learning_synthesis"
 
@@ -63,7 +63,7 @@ def _log_theme_synthesis(
             "instance_id": instance_id or "",
             "source": source,
             "parse_ok": parse_ok,
-            "grok_model": _grok_theme_model(),
+            "theme_model": _theme_model(),
             "raw_response": raw_response or "",
             "normalized_brief": brief,
         }
@@ -117,9 +117,9 @@ def _learning_model() -> str:
     return (os.getenv("OPENROUTER_LEARNING_MODEL") or _DEFAULT_LEARNING_MODEL).strip()
 
 
-def _grok_theme_model() -> str:
-    """Grok 4.1 + reasoning: bookends journals → per-theme notes for Claude."""
-    return (os.getenv("OPENROUTER_LEARNING_GROK_MODEL") or _DEFAULT_GROK_THEME_MODEL).strip()
+def _theme_model() -> str:
+    """GPT-5.4 via OpenRouter: bookends journals → per-theme notes for Claude."""
+    return (os.getenv("OPENROUTER_LEARNING_GROK_MODEL") or _DEFAULT_THEME_MODEL).strip()
 
 
 def _model_supports_openrouter_reasoning(model: str) -> bool:
@@ -379,36 +379,29 @@ def _brief_for_opus(brief: dict) -> str:
 
 
 def _grok_synthesize_journal_bookends(
-    instance_id: str, first: dict | None, last_three: list[dict]
+    instance_id: str, recent_entries: list[dict]
 ) -> dict | None:
-    """Grok reads earliest entry + three most recent; returns 3-4 themes with 2-3 sentences each."""
-    blocks: list[str] = []
-    if first and (first.get("document") or "").strip():
-        blocks.append(
-            "FIRST JOURNAL ENTRY (chronologically earliest we have — their starting point or early snapshot):\n"
-            + _format_learning_entry("", first)
-        )
-    recent = [e for e in last_three if (e.get("document") or "").strip()]
-    if recent:
-        parts = ["THREE MOST RECENT ENTRIES (what is on their mind now):"]
-        for i, e in enumerate(recent, 1):
-            ts = e.get("timestamp") or e.get("created_at") or ""
-            doc = (e.get("document") or "").strip()[:8000]
-            parts.append(f"\n--- Entry {i} (date: {ts}) ---\n{doc}")
-        blocks.append("\n".join(parts))
-    if not blocks:
+    """GPT-5.4 reads the 3 most recent journal entries; returns 3-4 themes with 2-3 sentences each."""
+    recent = [e for e in recent_entries if (e.get("document") or "").strip()]
+    if not recent:
         return None
+
+    parts = ["THREE MOST RECENT JOURNAL ENTRIES (what is on their mind now):"]
+    for i, e in enumerate(recent, 1):
+        ts = e.get("timestamp") or e.get("created_at") or ""
+        doc = (e.get("document") or "").strip()[:30000]
+        parts.append(f"\n--- Entry {i} (date: {ts}) ---\n{doc}")
+    blocks = ["\n".join(parts)]
 
     prompt = (
         "You are preparing a brief for another AI (Claude) that will find one high-quality article for this journaler.\n\n"
         + "\n\n".join(blocks)
         + "\n\n"
         "Instructions:\n"
-        "1. Read the first entry and the recent entries. Use careful reasoning: how has their focus shifted, "
-        "what threads connect then and now?\n"
+        "1. Read the recent entries carefully. Identify what is on their mind right now.\n"
         "2. Identify exactly 3 or 4 distinct themes (short labels, 2-6 words each). Be concrete — not generic "
         "like 'personal growth'.\n"
-        "3. For EACH theme, write 2-3 sentences grounded in what they actually wrote (earliest vs recent entries). "
+        "3. For EACH theme, write 2-3 sentences grounded in what they actually wrote. "
         "Do not write one overall essay — each theme gets its own mini write-up. No bullet points inside notes.\n\n"
         'Respond with ONLY valid JSON in this exact shape:\n'
         '{"theme_notes": [\n'
@@ -419,16 +412,15 @@ def _grok_synthesize_journal_bookends(
     )
     raw, _ = _openrouter_call(
         prompt,
-        model=_grok_theme_model(),
+        model=_theme_model(),
         temperature=0.35,
         max_tokens=2048,
         timeout_sec=90,
-        reasoning=True,
     )
     brief = _parse_grok_brief(raw)
     _log_theme_synthesis(instance_id, "journal_bookends", raw or "", brief, brief is not None)
     print(
-        f"[backend] Learning: Grok bookend synthesis — themes={brief.get('themes') if brief else None} "
+        f"[backend] Learning: theme synthesis — themes={brief.get('themes') if brief else None} "
         f"(full output: logs/learning_synthesis.log or LEARNING_SYNTHESIS_LOG)",
         flush=True,
     )
@@ -465,11 +457,10 @@ def _grok_synthesize_consumed_media(instance_id: str, consumed_rows: list[dict])
     )
     raw, _ = _openrouter_call(
         prompt,
-        model=_grok_theme_model(),
+        model=_theme_model(),
         temperature=0.35,
         max_tokens=1536,
         timeout_sec=60,
-        reasoning=True,
     )
     brief = _parse_grok_brief(raw)
     _log_theme_synthesis(instance_id, "consumed_media", raw or "", brief, brief is not None)
@@ -503,10 +494,10 @@ def _fallback_brief_no_signal() -> dict:
 
 
 def _build_learning_brief(instance_id: str, consumed_rows: list[dict]) -> dict:
-    """Grok bookends → per-theme notes, or consumed-media Grok, or static fallback."""
-    first, last3 = vec_store.journal_learning_bookends(instance_id)
-    if first or last3:
-        brief = _grok_synthesize_journal_bookends(instance_id, first, last3)
+    """GPT-5.4 recent journals → per-theme notes, or consumed-media synthesis, or static fallback."""
+    recent = vec_store.journal_learning_bookends(instance_id)
+    if recent:
+        brief = _grok_synthesize_journal_bookends(instance_id, recent)
         if brief:
             return brief
         brief2 = _grok_synthesize_consumed_media(instance_id, consumed_rows)
@@ -804,7 +795,7 @@ def generate_daily_article(instance_id: str, force: bool = False) -> dict:
     consumed_lower, consumed_rows = _consumed_context(instance_id)
     brief = _build_learning_brief(instance_id, consumed_rows)
     themes = brief.get("themes") or []
-    print(f"[backend] Learning: Grok→Claude brief themes: {themes}", flush=True)
+    print(f"[backend] Learning: {_theme_model()}→{_learning_model()} brief themes: {themes}", flush=True)
 
     candidates, queries = _search_articles_opus(brief, consumed_lower)
     print(f"[backend] Learning: search returned {len(candidates)} candidates", flush=True)
@@ -857,12 +848,12 @@ def generate_daily_article(instance_id: str, force: bool = False) -> dict:
     DecisionLogger._write(
         instance_id=instance_id,
         action_type="daily_article_selection",
-        input_summary=f"grok_brief_themes={json.dumps(themes)}, queries={json.dumps(queries)}",
-        retrieved_items=f"{len(candidates)} candidates from {_learning_model()} + web (brief via {_grok_theme_model()})",
+        input_summary=f"theme_brief_themes={json.dumps(themes)}, queries={json.dumps(queries)}",
+        retrieved_items=f"{len(candidates)} candidates from {_learning_model()} + web (brief via {_theme_model()})",
         final_output=json.dumps({"title": winner.get("title"), "url": winner.get("url"), "hook": winner.get("hook")}),
-        reasoning_notes=f"Grok bookends → Claude search; picked from {len(candidates)} web-grounded candidates",
+        reasoning_notes=f"Theme synthesis → Claude search; picked from {len(candidates)} web-grounded candidates",
         duration_ms=elapsed_ms,
-        model_used=f"{_grok_theme_model()} + {_learning_model()}",
+        model_used=f"{_theme_model()} + {_learning_model()}",
         search_api_calls=json.dumps(queries),
     )
 
@@ -871,6 +862,7 @@ def generate_daily_article(instance_id: str, force: bool = False) -> dict:
         flush=True,
     )
 
+    theme_notes = brief.get("theme_notes") or []
     return {
         "title": winner.get("title", ""),
         "url": winner.get("url", ""),
@@ -879,6 +871,10 @@ def generate_daily_article(instance_id: str, force: bool = False) -> dict:
         "date": today,
         "status": "pending",
         "has_article": True,
+        "themes": themes,
+        "theme_notes": theme_notes,
+        "theme_model": _theme_model(),
+        "article_model": _learning_model(),
     }
 
 

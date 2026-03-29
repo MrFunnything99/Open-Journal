@@ -15,6 +15,10 @@ type DailyArticle = {
   date: string;
   status: string;
   has_article: boolean;
+  themes?: string[];
+  theme_notes?: { theme: string; notes: string }[];
+  theme_model?: string;
+  article_model?: string;
 };
 
 type TabPhase = "loading" | "article" | "reflection";
@@ -212,7 +216,7 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
                           I've read it — reflect
                         </button>
                       </div>
-                      <div className="mt-6 border-t border-white/10 pt-4">
+                      <div className="mt-6 border-t border-white/10 pt-4 flex flex-wrap items-center justify-between gap-2">
                         <button
                           type="button"
                           onClick={handleNotInterested}
@@ -221,6 +225,40 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
                         >
                           {regenerating ? "Finding another..." : "Not interested — find another"}
                         </button>
+                        {(article.themes?.length || article.theme_model) && (
+                          <details className="text-right">
+                            <summary className="cursor-pointer list-none text-[0.6rem] text-white/25 hover:text-white/45">
+                              synthesis log
+                            </summary>
+                            <div className="mt-2 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-left text-[0.65rem] text-white/50">
+                              {article.theme_model && (
+                                <p className="mb-1">
+                                  <span className="text-white/35">theme model: </span>{article.theme_model}
+                                </p>
+                              )}
+                              {article.article_model && (
+                                <p className="mb-1">
+                                  <span className="text-white/35">article model: </span>{article.article_model}
+                                </p>
+                              )}
+                              {article.themes && article.themes.length > 0 && (
+                                <p className="mb-1">
+                                  <span className="text-white/35">themes: </span>{article.themes.join(", ")}
+                                </p>
+                              )}
+                              {article.theme_notes && article.theme_notes.length > 0 && (
+                                <div className="mt-2 space-y-2 border-t border-white/10 pt-2">
+                                  {article.theme_notes.map((n, i) => (
+                                    <div key={i}>
+                                      <p className="font-medium text-white/60">{n.theme}</p>
+                                      <p className="text-white/40">{n.notes}</p>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </details>
+                        )}
                       </div>
                     </div>
                   ) : null}
