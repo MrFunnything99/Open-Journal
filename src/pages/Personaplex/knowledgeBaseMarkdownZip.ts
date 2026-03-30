@@ -207,6 +207,82 @@ function parseSimpleFrontmatter(md: string): { front: SimpleFront; body: string 
   return { front, body };
 }
 
+/** YYYY-MM-DD (and common variants) anywhere in a relative path or file name. */
+function parseIsoLikeDateFromPath(rel: string): string | null {
+  const normalized = rel.replace(/\\/g, "/");
+  const patterns = [
+    /(20\d{2})-(\d{2})-(\d{2})/,
+    /(20\d{2})_(\d{2})_(\d{2})/,
+    /(20\d{2})\.(\d{2})\.(\d{2})/,
+  ];
+  for (const pat of patterns) {
+    const m = normalized.match(pat);
+    if (m) {
+      const iso = `${m[1]}-${m[2]}-${m[3]}T12:00:00.000Z`;
+      if (!Number.isNaN(Date.parse(iso))) return iso;
+    }
+  }
+  const compact = normalized.match(/(?:^|[^\d])(20\d{2})(\d{2})(\d{2})(?:[^\d]|$)/);
+  if (compact) {
+    const iso = `${compact[1]}-${compact[2]}-${compact[3]}T12:00:00.000Z`;
+    if (!Number.isNaN(Date.parse(iso))) return iso;
+  }
+  return null;
+}
+
+function parseRecordedLineDate(body: string): string | null {
+  const m = body.match(/\*\*Recorded:\*\*\s*([^\n]+)/);
+  if (!m) return null;
+  const parsed = Date.parse(m[1].trim());
+  if (Number.isNaN(parsed)) return null;
+  return new Date(parsed).toISOString();
+}
+
+/** When there is no ```json transcript block, use markdown body minus boilerplate. */
+function fallbackUserTranscriptFromBody(body: string): string {
+  let b = body.replace(/^\s*\*\*Recorded:\*\*[^\n]*\n*/i, "").trim();
+  b = b.replace(/^\s*##\s+Transcript\s*\n/i, "").trim();
+  b = b.replace(/```json\s*[\s\S]*?```/g, "").trim();
+  return b;
+}
+
+/**
+ * Parse one or more journal entries from a dumped .md file (folder upload).
+ * Uses YAML `date:`, then **Recorded:**, then path/filename — same precedence as ZIP import.
+ */
+export function extractJournalEntriesFromMarkdownDump(
+  relativePath: string,
+  rawText: string
+): Array<{ date: string | null; transcript: ChatMessage[] }> {
+  const text = rawText.trim();
+  if (!text) return [];
+  const pathDate = parseIsoLikeDateFromPath(relativePath);
+  const segments = text.includes(KNOWLEDGE_BASE_ENTRY_BOUNDARY)
+    ? text.split(KNOWLEDGE_BASE_ENTRY_BOUNDARY).map((s) => s.trim()).filter(Boolean)
+    : [text];
+  const out: Array<{ date: string | null; transcript: ChatMessage[] }> = [];
+
+  for (const seg of segments) {
+    const { front, body } = parseSimpleFrontmatter(seg);
+    let dateStr: string | null = null;
+    if (typeof front.date === "string" && !Number.isNaN(Date.parse(front.date))) {
+      dateStr = front.date;
+    } else {
+      const rec = parseRecordedLineDate(body);
+      if (rec) dateStr = rec;
+      else if (pathDate) dateStr = pathDate;
+    }
+    let transcript = parseTranscriptJson(body);
+    if (!transcript) {
+      const userText = fallbackUserTranscriptFromBody(body);
+      if (!userText.trim()) continue;
+      transcript = [{ role: "user", text: userText.trim() }];
+    }
+    out.push({ date: dateStr, transcript });
+  }
+  return out;
+}
+
 function parseTranscriptJson(body: string): ChatMessage[] | null {
   const m = body.match(/```json\s*([\s\S]*?)```/);
   if (!m) return null;

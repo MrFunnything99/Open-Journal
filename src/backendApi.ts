@@ -6,7 +6,8 @@ const API_BASE = ""; // same origin; paths get /api prefix below
 const TOKEN_KEY = "open_journal_access_token";
 const ANON_ID_KEY = "open_journal_anon_id";
 const ANON_TS_KEY = "open_journal_anon_ts";
-const ANON_TTL_MS = 60 * 60 * 1000; // 1 hour
+/** Keep stable across tabs and restarts so /ingest-history and /chat share the same vec-store namespace. */
+const ANON_TTL_MS = 10 * 365 * 24 * 60 * 60 * 1000; // 10 years (effectively permanent until user clears site data)
 
 function apiPath(path: string): string {
   const p = path.startsWith("/") ? path : `/${path}`;
@@ -48,13 +49,33 @@ export function decodeJwtPayload(token: string): { sub?: number; email?: string;
 
 export function getAnonymousInstanceId(): string {
   try {
-    const id = sessionStorage.getItem(ANON_ID_KEY);
-    const ts = sessionStorage.getItem(ANON_TS_KEY);
+    const read = (): { id: string | null; ts: string | null } => ({
+      id: localStorage.getItem(ANON_ID_KEY),
+      ts: localStorage.getItem(ANON_TS_KEY),
+    });
+    let { id, ts } = read();
+    // One-time migration from sessionStorage (older builds used per-tab ids + short TTL).
+    if (!id) {
+      const sid = sessionStorage.getItem(ANON_ID_KEY);
+      const sts = sessionStorage.getItem(ANON_TS_KEY);
+      if (sid) {
+        localStorage.setItem(ANON_ID_KEY, sid);
+        localStorage.setItem(ANON_TS_KEY, sts || String(Date.now()));
+        try {
+          sessionStorage.removeItem(ANON_ID_KEY);
+          sessionStorage.removeItem(ANON_TS_KEY);
+        } catch {
+          /* ignore */
+        }
+        id = sid;
+        ts = sts || String(Date.now());
+      }
+    }
     const t = ts ? parseInt(ts, 10) : 0;
     if (id && !isNaN(t) && Date.now() - t < ANON_TTL_MS) return id;
     const newId = crypto.randomUUID?.() ?? `anon_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
-    sessionStorage.setItem(ANON_ID_KEY, newId);
-    sessionStorage.setItem(ANON_TS_KEY, String(Date.now()));
+    localStorage.setItem(ANON_ID_KEY, newId);
+    localStorage.setItem(ANON_TS_KEY, String(Date.now()));
     return newId;
   } catch {
     return "";
@@ -83,10 +104,9 @@ export async function backendFetch(path: string, init?: RequestInit): Promise<Re
   const headers = new Headers(init?.headers);
   const token = getStoredToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  else {
-    const anonId = getAnonymousInstanceId();
-    if (anonId) headers.set("X-Instance-ID", anonId);
-  }
+  /** Memory (/chat retrieval, Brain, journals) is keyed by X-Instance-ID; send it whenever we have one, even when logged in. */
+  const anonId = getAnonymousInstanceId();
+  if (anonId) headers.set("X-Instance-ID", anonId);
 
   let res = await fetch(url, { ...init, headers, credentials: "include" } as RequestInit);
 

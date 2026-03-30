@@ -46,7 +46,9 @@ class JournalState(TypedDict):
     session_id: str
     personalization: float
     intrusiveness: NotRequired[float]
-    mode: NotRequired[str]  # "journal" | "conversation" | "autobiography" (recommendations handled in main)
+    mode: NotRequired[str]  # "journal" | "conversation" | "autobiography" (UI: Assisted Journal; recommendations in main)
+    # OpenRouter model id (allowlisted); used only for conversation + autobiography when set
+    openrouter_model: NotRequired[str]
     retrieval_log: NotRequired[str]
     last_transcript: NotRequired[str]
     last_summary: NotRequired[str]
@@ -60,6 +62,32 @@ class JournalState(TypedDict):
 DEFAULT_OPENROUTER_CHAT_MODEL = "openai/gpt-4.1-mini"
 DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL = "openai/gpt-5.4"
 DEFAULT_OPENROUTER_CONVERSATION_MODEL = "x-ai/grok-4.1-fast"
+DEFAULT_ASSISTED_JOURNAL_MODEL = "openai/gpt-5-mini"
+
+# UI allowlist for Conversation + Assisted Journal (must match frontend chatCompletionModels.ts)
+USER_SELECTABLE_CHAT_MODELS: frozenset[str] = frozenset(
+    {
+        "openai/gpt-5.4",
+        "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5-nano",
+    }
+)
+
+
+def _user_pick_openrouter_model(mode: str, requested: str | None) -> str | None:
+    if mode not in ("conversation", "autobiography"):
+        return None
+    rid = (requested or "").strip()
+    if not rid or rid not in USER_SELECTABLE_CHAT_MODELS:
+        return None
+    return rid
+
+
+def _reasoning_extra_body_for_model(model: str) -> dict | None:
+    ml = model.lower()
+    if ml.startswith("x-ai/") or "/grok" in ml:
+        return {"reasoning": {"enabled": True}}
+    return None
 
 
 def _openrouter_chat_client_and_model():
@@ -608,6 +636,54 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
+def _assisted_journal_inspiration_intent(text: str) -> bool:
+    """User wants the model to scan journals and suggest concrete memory threads."""
+    t = (text or "").lower()
+    needles = (
+        "inspiration",
+        "inspire me",
+        "look at my journal",
+        "look through my journal",
+        "check my journal",
+        "my journals",
+        "from my journal",
+        "scan my",
+        "pull from my",
+        "you pick",
+        "you choose",
+        "surprise me",
+        "pick a memory",
+        "suggest something",
+        "ideas from",
+        "what from my past",
+        "what stands out",
+        "see what's in",
+        "for some inspiration",
+        "journal inspiration",
+        "ideas from my life",
+        "past memories",
+        "my memories",
+        "our memories",
+        "you can look",
+        "go ahead and look",
+        "look them up",
+        "use my entries",
+        "knowledge base",
+        "knowledgebase",
+        "my brain",
+        "the brain",
+        "in my brain",
+        "brain hub",
+        "saved in the app",
+        "what i saved",
+        "what i've saved",
+        "look at everything",
+        "everything i wrote",
+        "selfmeridian",
+    )
+    return any(n in t for n in needles)
+
+
 def interviewer_node(state: JournalState) -> JournalState:
     """
     Respond with empathy. When personalization > 0, retrieve relevant context from
@@ -623,10 +699,26 @@ def interviewer_node(state: JournalState) -> JournalState:
     date_context = now.strftime("%A, %B %d, %Y")  # e.g. Wednesday, March 12, 2025
     mode_raw = (state.get("mode") or "").strip().lower()
     # Only journal mode uses this interviewer; recommendations uses library_interview in main.py
+    _kb_intro = ""
+    if mode_raw == "autobiography":
+        _kb_intro = (
+            "Assisted Journal — your view of their knowledge base: Anything below titled Who This Person Is or "
+            "Relevant Context is loaded from this user's SelfMeridian knowledge base (saved journal text and Brain memory excerpts). "
+            "If they say knowledge base, Brain, journals, or what I saved, they mean that injected content, not an external system you cannot read. "
+            "When Relevant Context lists real excerpts, bullets, or dated lines (not only the bare word \"None.\"), you already have that access—summarize or offer threads from it. "
+            "Do not say you lack access to their knowledge base in that case.\n\n"
+        )
+    _length_hint = (
+        "Keep replies concise (2-4 sentences). "
+        if mode_raw != "autobiography"
+        else "Keep replies concise (2-4 sentences) except when synthesizing journal inspiration from memory—then follow the Assisted Journal length and prose rules. "
+    )
     system_parts = [
             f"Today's date (use for time perspective): {date_context}. "
-            "You are a warm, empathetic journaling companion. Listen actively and respond with care. Keep replies concise (2-4 sentences). "
-            f"Personalization level: {personalization_percent}%. "
+            + _kb_intro
+            + "You are a warm, empathetic journaling companion. Listen actively and respond with care. "
+            + _length_hint
+            + f"Personalization level: {personalization_percent}%. "
             "At 0%, do not use memory; keep questions general and present-focused only. "
             "At higher levels, use the memory context only as loose inspiration. Ask BROAD, open-ended questions. "
             "Do NOT invent, assume, or assert details that are not clearly and explicitly stated in the memory context. "
@@ -652,34 +744,95 @@ def interviewer_node(state: JournalState) -> JournalState:
     ]
 
     retrieval_log: str | None = None
+    inspiration_journal_scan = False
     if personalization > 0:
         query = _last_user_text(state["messages"])
         if not query and state["messages"]:
             query = str(state["messages"][-1])[:500]
+        if mode_raw == "autobiography" and _assisted_journal_inspiration_intent(query):
+            inspiration_journal_scan = True
+            query = (
+                "Meaningful personal memories, relationships, trips, milestones, achievements, "
+                "warm or proud moments, formative experiences, people and places named in journal entries"
+            )
         instance_id = state.get("instance_id") or ""
         try:
+            tg, te = (12, 12) if inspiration_journal_scan else (10, 6)
             processed, raw = get_relevant_context_dual(
                 query,
-                top_k_gist=10,
-                top_k_episodic=6,
+                top_k_gist=tg,
+                top_k_episodic=te,
                 instance_id=instance_id,
                 session_id=state.get("session_id"),
                 log=True,
             )
+            raw_s = (raw or "").strip()
+            if (
+                mode_raw == "autobiography"
+                and personalization > 0
+                and raw_s in ("None.", "")
+            ):
+                processed2, raw2 = get_relevant_context_dual(
+                    "Journal entries life story memories people events relationships saved knowledge base",
+                    top_k_gist=14,
+                    top_k_episodic=10,
+                    instance_id=instance_id,
+                    session_id=state.get("session_id"),
+                    log=True,
+                )
+                if (raw2 or "").strip() not in ("None.", ""):
+                    processed, raw = processed2, raw2
             ctx = (
                 "## Who This Person Is (your understanding)\n"
                 + (processed or "(no profile signals yet)")
                 + "\n\n## Relevant Context (from their actual entries)\n"
                 + raw
             )
+            hint = ""
+            if inspiration_journal_scan:
+                hint = (
+                    "\n\n(This block was retrieved for a broad journal scan: synthesize distinct threads for the user in natural prose—"
+                    "not a stack of bold labels. Do not invent events not supported by excerpts.)"
+                )
             system_parts.append(
                 "\n\n"
                 + ctx
-                + "\n\n(use only as broad inspiration; do not assert or invent details not explicitly stated)"
+                + hint
+                + "\n\n(use only as broad inspiration; synthesize faithfully—do not assert or invent details not explicitly stated)"
             )
             retrieval_log = ctx
         except Exception:
             system_parts.append("\n\n(Memory retrieval unavailable; respond without prior context.)")
+
+    if mode_raw == "autobiography":
+        system_parts.append(
+            "\n\nAssisted Journal — you always use this mode's dedicated model\n"
+            "Steer the session from the user's latest message. Default to warm, concise replies; when offering journal inspiration "
+            "(scan below), write a richer synthesized passage—about 100–185 words total (stay compact: roughly fifteen percent tighter than "
+            "a roomy essay; drop filler, keep the threads distinct).\n\n"
+            "User-facing formatting (mandatory): The chat surface is plain text. Do not use Markdown in your reply: no asterisks for bold, "
+            "no hash headings, no fenced code blocks. Use normal sentences, commas, and em dashes. Prefer emphasis through wording, not formatting.\n\n"
+            "Voice: Digest and synthesize what you retrieve. Weave several threads into flowing prose (short paragraphs or soft line breaks), "
+            "not staccato labels or keyword stacks. You may be modestly more creative with tone and connective tissue—gentle metaphor, rhythm, "
+            "extra warmth; aim about one step more vivid than a dry summary—while keeping every concrete name, place, event, and factual beat "
+            "anchored in the excerpts. Clean up phrasing from the raw context; never paste fragmentary chunks.\n\n"
+            "A) Journaling about today — If they want today, this day, a daily recap, etc., ask specific questions about their day.\n\n"
+            "B) Autobiographical journaling (opening) — If they want life-story work or autobiographical mode, open warmly and ask one combined "
+            "question: whether they already have a memory or period in mind, or whether they'd like you to look at their journals for inspiration. "
+            "Do not dump memory guesses in this first reply unless they already asked for journal ideas.\n\n"
+            "C) Inspiration from their journals — When they choose inspiration (look at journals, surprise me, you pick, scan, etc.), treat "
+            "Relevant Context as the scan result. Pull several distinct memory threads clearly supported by the excerpts. Prefer threads that "
+            "feel meaningful to revisit without inventing a happy arc the text does not support. Present them as one synthesized piece: "
+            "e.g. a short opening line, then two or three lightly developed themes in prose—not a numbered list of titled bullets. End by inviting "
+            "them toward one person, place, or chapter, or whichever thread is pulling them.\n\n"
+            "D) Continuing after they pick — Stay with their thread; reflective questions only; still no fabricated details.\n\n"
+            "E) Generic let's journal — If they open without a topic, offer a compact menu (today; autobiography; feelings; relationships; freeform).\n\n"
+            "Critical (access): Relevant Context plus Who This Person Is is their in-app knowledge base. If there is substantive text there "
+            "(not only a bare None under Relevant Context), you must use it and must not claim you cannot see their knowledge base. Only if "
+            "you see Memory retrieval unavailable or Relevant Context is truly empty should you apologize and suggest they add a journal entry.\n\n"
+            "If Relevant Context is genuinely empty or retrieval failed, say so kindly and invite them to save a journal entry first or name "
+            "a memory to start from."
+        )
 
     if mode_raw == "learning":
         import vec_store as _vs
@@ -700,16 +853,19 @@ def interviewer_node(state: JournalState) -> JournalState:
     try:
         client, model, _fallback = _openrouter_chat_client_models()
         extra_body: dict | None = None
-        if mode_raw == "conversation":
+        picked = _user_pick_openrouter_model(mode_raw, state.get("openrouter_model"))
+        if picked:
+            model = picked
+            extra_body = _reasoning_extra_body_for_model(model)
+        elif mode_raw == "conversation":
             model = (os.getenv("OPENROUTER_CONVERSATION_MODEL") or DEFAULT_OPENROUTER_CONVERSATION_MODEL).strip()
             extra_body = {"reasoning": {"enabled": True}}
+        elif mode_raw == "autobiography":
+            model = (os.getenv("OPENROUTER_ASSISTED_JOURNAL_MODEL") or DEFAULT_ASSISTED_JOURNAL_MODEL).strip()
+            extra_body = _reasoning_extra_body_for_model(model)
         elif mode_raw == "learning":
             model = (os.getenv("OPENROUTER_LEARNING_MODEL") or "anthropic/claude-opus-4.6").strip()
-            ml = model.lower()
-            if ml.startswith("x-ai/") or "/grok" in ml:
-                extra_body = {"reasoning": {"enabled": True}}
-            else:
-                extra_body = None
+            extra_body = _reasoning_extra_body_for_model(model)
         response, library_added, tool_steps, nav_actions = _interviewer_run_with_tools(
             client, model, oai_messages, instance_id, extra_body=extra_body
         )
@@ -723,10 +879,12 @@ def interviewer_node(state: JournalState) -> JournalState:
         client_actions = []
 
     if retrieval_log is not None and personalization > 0:
-        agent_steps.insert(
-            0,
-            {"kind": "retrieval", "summary": "Retrieved relevant context from your journals"},
+        _retrieval_summary = (
+            "Broad scan of recent journals for memory inspiration"
+            if inspiration_journal_scan
+            else "Retrieved relevant context from your journals"
         )
+        agent_steps.insert(0, {"kind": "retrieval", "summary": _retrieval_summary})
 
     out: dict = {"messages": [response], "agent_steps": agent_steps}
     if retrieval_log is not None:

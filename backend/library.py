@@ -1253,7 +1253,7 @@ def _chunk_text(
         if piece:
             chunks.append(piece)
         if end >= n:
-            break
+                        break
         i = max(i + 1, end - overlap)
     return chunks
 
@@ -2021,6 +2021,7 @@ def get_relevant_context_dual(
     k = max(4, min(top_k_gist + top_k_episodic, 24))
     retrieved_log: list[dict] = []
     parts: list[str] = []
+    used_sql_fallback = False
     try:
         rows = vec_store.query_journal_chunks(
             query_emb, instance_id or "", k=k
@@ -2051,16 +2052,49 @@ def get_relevant_context_dual(
             )
     except Exception as e:
         print("[backend] get_relevant_context_dual journal chunks:", e)
+    if not parts:
+        try:
+            recent = vec_store.list_journal_entries_with_ids(instance_id or "")
+            lines_fb: list[str] = []
+            for row in recent[:8]:
+                doc = (row.get("document") or "").strip()
+                ts = (row.get("timestamp") or "").strip()
+                if not doc:
+                    continue
+                cap = 1500
+                snippet = doc[:cap] + ("…" if len(doc) > cap else "")
+                lines_fb.append(f"[{ts}] {snippet}" if ts else snippet)
+                retrieved_log.append(
+                    {
+                        "content": snippet[:2000],
+                        "score": 0.0,
+                        "similarity": 0.0,
+                        "source": "journal_entry_fallback",
+                        "entry_id": row.get("id"),
+                        "timestamp": ts,
+                    }
+                )
+            if lines_fb:
+                used_sql_fallback = True
+                parts.append(
+                    "Recent journal entries (recency fallback when vector hits were empty; excerpts may be truncated):\n"
+                    + "\n".join(f"- {ln}" for ln in lines_fb)
+                )
+        except Exception as e:
+            print("[backend] get_relevant_context_dual journal SQL fallback:", e)
     raw = "\n\n".join(parts) if parts else "None."
     ms = int((time.perf_counter() - t0) * 1000)
     if log:
+        notes = "sqlite-vec journal chunks (cosine distance)"
+        if used_sql_fallback:
+            notes += "; recent-entry SQL fallback"
         DecisionLogger.log_context_retrieval(
             instance_id=instance_id or "",
             session_id=session_id,
             query=query.strip(),
             retrieved_items=retrieved_log,
             final_output=((processed + "\n\n" + raw).strip() if processed else raw),
-            reasoning_notes="sqlite-vec journal chunks (cosine distance)",
+            reasoning_notes=notes,
             duration_ms=ms,
         )
     return processed, raw
@@ -3003,6 +3037,7 @@ Return ONLY JSON array of 2–3 strings. Example: ["long read climate adaptation
     out: list[dict] = []
     for h in hits[:8]:
         url = h.get("url") or ""
+        author = ""
         try:
             parsed = urllib.parse.urlparse(url)
             author = (parsed.netloc or "").lower()

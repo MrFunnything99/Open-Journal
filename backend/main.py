@@ -32,7 +32,7 @@ for name in (".env", ".env.local"):
 import vec_store
 from lightrag_bridge import query_for_context, schedule_lightrag_index_after_ingest
 from graph import build_graph, build_librarian_graph, JournalState
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from library import (
     add_consumed,
     add_memory_fact,
@@ -91,6 +91,27 @@ def get_or_create_session(session_id: Optional[str]) -> str:
     if session_id not in sessions:
         sessions[session_id] = []
     return session_id
+
+
+def _session_messages_for_client(session_id: str) -> List[Dict[str, str]]:
+    """Serialize in-memory LangChain transcript for the chat UI (user/assistant turns only)."""
+    out: List[Dict[str, str]] = []
+    for m in sessions.get(session_id) or []:
+        if isinstance(m, HumanMessage):
+            role = "user"
+        elif isinstance(m, AIMessage):
+            role = "assistant"
+        else:
+            continue
+        c = getattr(m, "content", "")
+        if isinstance(c, list):
+            c = " ".join(
+                part.get("text", str(part)) for part in c if isinstance(part, dict)
+            )
+        text = (str(c) if c is not None else "").strip()
+        if text:
+            out.append({"role": role, "content": text})
+    return out
 
 
 @asynccontextmanager
@@ -169,9 +190,11 @@ librarian_graph = build_librarian_graph()
 class ChatRequest(BaseModel):
     text: str
     session_id: Optional[str] = None
-    personalization: Optional[float] = None
+    personalization: Optional[float] = None  # ignored for graph /chat; server uses 1.0 (full memory)
     intrusiveness: Optional[float] = None
-    mode: Optional[str] = None  # "journal" (default) | "conversation" | "autobiography" | "recommendations" | "learning"
+    mode: Optional[str] = None  # "journal" | "conversation" | "autobiography" (Assisted Journal) | "recommendations" | "learning"
+    # Allowlisted OpenRouter id for conversation + autobiography only (see graph.USER_SELECTABLE_CHAT_MODELS)
+    openrouter_model: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -183,6 +206,16 @@ class ChatResponse(BaseModel):
     agent_steps: Optional[List[Dict[str, Any]]] = None  # retrieval + tool summaries for UI
     # Allowlisted UI actions from journal chat agent (e.g. navigate). Frontend must ignore unknown types.
     actions: Optional[List[Dict[str, Any]]] = None
+
+
+class ChatSessionHistoryMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatSessionMessagesResponse(BaseModel):
+    session_id: str
+    messages: List[ChatSessionHistoryMessage]
 
 
 class EndSessionRequest(BaseModel):
@@ -1107,12 +1140,8 @@ async def chat(req: ChatRequest, request: Request):
 
     # Default: journal interview (existing flow)
     messages = sessions[session_id]
-    personalization = req.personalization if req.personalization is not None else 1.0
-    try:
-        personalization = float(personalization)
-    except (TypeError, ValueError):
-        personalization = 1.0
-    personalization = max(0.0, min(1.0, personalization))
+    # Full memory retrieval (vec store + gist) for all graph-backed modes; not client-tunable.
+    personalization = 1.0
     intrusiveness = req.intrusiveness if req.intrusiveness is not None else 0.5
     try:
         intrusiveness = float(intrusiveness)
@@ -1120,6 +1149,7 @@ async def chat(req: ChatRequest, request: Request):
         intrusiveness = 0.5
     intrusiveness = max(0.0, min(1.0, intrusiveness))
     messages.append(HumanMessage(content=req.text))
+    _orm = (req.openrouter_model or "").strip() or None
     state: JournalState = {
         "messages": list(messages),
         "session_id": session_id,
@@ -1127,6 +1157,7 @@ async def chat(req: ChatRequest, request: Request):
         "intrusiveness": intrusiveness,
         "mode": mode,
         "instance_id": instance_id,
+        **({"openrouter_model": _orm} if _orm else {}),
     }
     try:
         result = await asyncio.wait_for(
@@ -1170,6 +1201,21 @@ async def chat(req: ChatRequest, request: Request):
         library_items_added=lib_opt,
         agent_steps=agent_steps,
         actions=actions,
+    )
+
+
+@api_router.get("/chat-session/{session_id}", response_model=ChatSessionMessagesResponse)
+async def get_chat_session_history(session_id: str):
+    """Return transcript for a session (in-memory). Empty if unknown or after server restart."""
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id required")
+    if sid not in sessions:
+        return ChatSessionMessagesResponse(session_id=sid, messages=[])
+    rows = _session_messages_for_client(sid)
+    return ChatSessionMessagesResponse(
+        session_id=sid,
+        messages=[ChatSessionHistoryMessage(role=r["role"], content=r["content"]) for r in rows],
     )
 
 

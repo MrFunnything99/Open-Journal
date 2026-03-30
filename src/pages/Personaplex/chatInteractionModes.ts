@@ -21,11 +21,11 @@ export const CHAT_INTERACTION_MODE_META: Record<
       "A space for free-flow reflection. Write naturally, process your thoughts, and receive optional AI feedback or gentle structure.",
   },
   autobiography: {
-    label: "Autobiography",
-    sublabel: "Track your life",
-    composerChipLabel: "Autobiography",
+    label: "Assisted Journal",
+    sublabel: "Guided prompts from chat",
+    composerChipLabel: "Assisted Journal",
     description:
-      "A structured way to track and understand your life. Reflect on your day, habits, goals, and past experiences through guided conversation.",
+      "Chat-driven journaling: ask about today and get probing questions; ask for autobiographical reflection and explore a past moment already in your journals; or say you want to journal and get a short menu of directions to choose from.",
   },
   learning: {
     label: "Learning",

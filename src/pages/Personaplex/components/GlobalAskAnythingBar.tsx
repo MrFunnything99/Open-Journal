@@ -1,9 +1,14 @@
-import { useEffect, useRef, useState, type MutableRefObject } from "react";
+import { createPortal } from "react-dom";
+import { useEffect, useLayoutEffect, useRef, useState, type MutableRefObject, type RefObject } from "react";
 import {
   CHAT_INTERACTION_MODE_META,
   CHAT_INTERACTION_MODES,
   type ChatInteractionMode,
 } from "../chatInteractionModes";
+import {
+  CHAT_COMPLETION_MODEL_OPTIONS,
+  type UserSelectableChatModelId,
+} from "../chatCompletionModels";
 import { usePersonaplexChat } from "../PersonaplexChatContext";
 
 function ModeChipIcon({ mode }: { mode: ChatInteractionMode }) {
@@ -20,6 +25,7 @@ function ModeChipIcon({ mode }: { mode: ChatInteractionMode }) {
         </svg>
       );
     case "journal":
+    case "autobiography":
       return (
         <svg className={cls} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75} aria-hidden>
           <path
@@ -117,6 +123,27 @@ export function LiveDictationBubble({ className = "" }: { className?: string }) 
 
 export type AskAnythingLayout = "dock" | "rail" | "center";
 
+function ComposerChatModelSelect({ idPrefix }: { idPrefix: string }) {
+  const { userChatModel, setUserChatModel, composerDisabled } = usePersonaplexChat();
+  return (
+    <select
+      id={`${idPrefix}-chat-model`}
+      aria-label="Chat model"
+      value={userChatModel}
+      onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
+      disabled={composerDisabled}
+      title="Model for replies (retrieval + tools use this model)"
+      className="max-w-[10rem] shrink-0 rounded-full border border-white/15 bg-black/35 px-2 py-1 text-[0.65rem] text-white focus:border-white/30 focus:outline-none disabled:opacity-50 sm:max-w-[11rem] sm:text-xs"
+    >
+      {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
+        <option key={o.id} value={o.id}>
+          {o.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 type AskAnythingComposerProps = {
   layout: AskAnythingLayout;
   /** Collapsed sidebar (~72px): icon-only + expand hint */
@@ -130,6 +157,8 @@ function PlusOptionsMenu({
   open,
   onClose,
   placement,
+  anchorRef,
+  menuContainerRef,
   fileInputRef,
   composerDisabled,
   mode,
@@ -138,21 +167,76 @@ function PlusOptionsMenu({
   open: boolean;
   onClose: () => void;
   placement: PlusPlacement;
+  anchorRef: RefObject<HTMLElement | null>;
+  menuContainerRef: RefObject<HTMLDivElement | null>;
   fileInputRef: MutableRefObject<HTMLInputElement | null>;
   composerDisabled: boolean;
   mode: ChatInteractionMode;
   setMode: (m: ChatInteractionMode) => void;
 }) {
-  if (!open) return null;
-  const pos =
-    placement === "above"
-      ? "bottom-full left-0 mb-2"
-      : placement === "below"
-        ? "top-full left-0 mt-1"
-        : "left-full top-0 ml-2";
-  return (
+  useLayoutEffect(() => {
+    if (!open) return;
+    const menu = menuContainerRef.current;
+    const anchor = anchorRef.current;
+    if (!menu || !anchor) return;
+
+    const pad = 8;
+    const gap = 6;
+
+    const place = () => {
+      const r = anchor.getBoundingClientRect();
+      const mw = menu.offsetWidth;
+      const mh = menu.offsetHeight;
+      let left = r.left;
+      left = Math.max(pad, Math.min(left, window.innerWidth - mw - pad));
+
+      menu.style.position = "fixed";
+      menu.style.zIndex = "9999";
+
+      if (placement === "below") {
+        let top = r.bottom + gap;
+        if (top + mh > window.innerHeight - pad) {
+          top = Math.max(pad, window.innerHeight - mh - pad);
+        }
+        menu.style.top = `${top}px`;
+        menu.style.left = `${left}px`;
+      } else if (placement === "above") {
+        let top = r.top - mh - gap;
+        if (top < pad) top = pad;
+        menu.style.top = `${top}px`;
+        menu.style.left = `${left}px`;
+      } else {
+        let top = r.top;
+        let l = r.right + gap;
+        if (l + mw > window.innerWidth - pad) {
+          l = Math.max(pad, r.left - mw - gap);
+        }
+        if (top + mh > window.innerHeight - pad) {
+          top = Math.max(pad, window.innerHeight - mh - pad);
+        }
+        menu.style.top = `${top}px`;
+        menu.style.left = `${l}px`;
+      }
+    };
+
+    place();
+    const ro = new ResizeObserver(() => place());
+    ro.observe(menu);
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open, placement, anchorRef, menuContainerRef]);
+
+  if (!open || typeof document === "undefined") return null;
+
+  const panel = (
     <div
-      className={`absolute z-[100] min-w-[min(100vw-2rem,17rem)] max-w-[min(100vw-2rem,20rem)] rounded-xl border border-white/15 bg-[#14141f]/95 p-1 shadow-2xl backdrop-blur-xl ${pos}`}
+      ref={menuContainerRef}
+      className="min-w-[min(100vw-2rem,17rem)] max-w-[min(100vw-2rem,20rem)] max-h-[min(70dvh,22rem)] overflow-y-auto overscroll-contain rounded-xl border border-white/15 bg-[#14141f]/95 p-1 pb-1.5 shadow-2xl backdrop-blur-xl"
       role="menu"
       aria-label="Composer options"
     >
@@ -208,6 +292,8 @@ function PlusOptionsMenu({
       </button>
     </div>
   );
+
+  return createPortal(panel, document.body);
 }
 
 export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }: AskAnythingComposerProps) {
@@ -230,11 +316,14 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
   } = usePersonaplexChat();
   const [plusOpen, setPlusOpen] = useState(false);
   const plusWrapRef = useRef<HTMLDivElement>(null);
+  const plusMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!plusOpen) return;
     const onDoc = (e: MouseEvent) => {
-      if (plusWrapRef.current?.contains(e.target as Node)) return;
+      const t = e.target as Node;
+      if (plusWrapRef.current?.contains(t)) return;
+      if (plusMenuRef.current?.contains(t)) return;
       setPlusOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
@@ -285,6 +374,8 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
                 open={plusOpen}
                 onClose={() => setPlusOpen(false)}
                 placement="right"
+                anchorRef={plusWrapRef}
+                menuContainerRef={plusMenuRef}
                 fileInputRef={fileInputRef}
                 composerDisabled={composerDisabled}
                 mode={chatInteractionMode}
@@ -335,6 +426,11 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
               <SendIcon className="h-4 w-4" />
             </button>
           </div>
+          {(chatInteractionMode === "conversation" || chatInteractionMode === "autobiography") && (
+            <div className="flex justify-center">
+              <ComposerChatModelSelect idPrefix={idPrefix} />
+            </div>
+          )}
         </div>
       </div>
     );
@@ -392,6 +488,8 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
             open={plusOpen}
             onClose={() => setPlusOpen(false)}
             placement={plusPlacement}
+            anchorRef={plusWrapRef}
+            menuContainerRef={plusMenuRef}
             fileInputRef={fileInputRef}
             composerDisabled={composerDisabled}
             mode={chatInteractionMode}
@@ -467,6 +565,19 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
         <SendIcon className={layout === "rail" ? "h-4 w-4" : "h-5 w-5"} />
       </button>
       </div>
+      {(chatInteractionMode === "conversation" || chatInteractionMode === "autobiography") && (
+        <div
+          className={
+            layout === "center"
+              ? "mx-auto mt-1.5 flex w-full max-w-2xl justify-start px-3 md:px-4"
+              : layout === "rail"
+                ? "mt-1.5 flex w-full justify-start pl-2"
+                : "mt-1.5 flex w-full justify-start pl-3 md:pl-4"
+          }
+        >
+          <ComposerChatModelSelect idPrefix={idPrefix} />
+        </div>
+      )}
     </div>
   );
 }

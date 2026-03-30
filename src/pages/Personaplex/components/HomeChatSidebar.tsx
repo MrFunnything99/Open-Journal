@@ -19,7 +19,7 @@ type Props = {
 };
 
 export function HomeChatSidebar({ active }: Props) {
-  const { chatRecents, chatSessionId, loadRecentSession, newChat, activityLog, clearActivityLog } = usePersonaplexChat();
+  const { chatRecents, chatSessionId, loadRecentSession, newChat } = usePersonaplexChat();
 
   const [open, setOpen] = useState(() => {
     try {
@@ -169,7 +169,7 @@ export function HomeChatSidebar({ active }: Props) {
             </button>
           </div>
 
-          <nav className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-2 pb-2" aria-label="Recent chats">
+          <nav className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-2 pb-3" aria-label="Recent chats">
             {chatRecents.length === 0 ? (
               <p className="px-2 py-3 text-xs leading-relaxed text-white/40">No chats yet. Send a message to create one.</p>
             ) : (
@@ -195,28 +195,6 @@ export function HomeChatSidebar({ active }: Props) {
               </ul>
             )}
           </nav>
-
-          <div className="flex-none border-t border-white/10 p-2">
-            <div className="mb-1 flex items-center justify-between gap-2 px-1">
-              <span className="text-[0.65rem] font-semibold uppercase tracking-[0.12em] text-white/45">This chat</span>
-              {activityLog.length > 0 && (
-                <button type="button" onClick={clearActivityLog} className="text-[10px] font-medium text-emerald-400/90 hover:underline">
-                  Clear
-                </button>
-              )}
-            </div>
-            <ul className="max-h-32 space-y-1 overflow-y-auto text-[11px] leading-snug text-white/55">
-              {activityLog.length === 0 ? (
-                <li className="px-1 py-1 italic text-white/35">No steps yet.</li>
-              ) : (
-                [...activityLog].reverse().map((e) => (
-                  <li key={e.id} className="rounded-md bg-white/[0.04] px-2 py-1">
-                    {e.summary}
-                  </li>
-                ))
-              )}
-            </ul>
-          </div>
         </aside>
       )}
     </div>

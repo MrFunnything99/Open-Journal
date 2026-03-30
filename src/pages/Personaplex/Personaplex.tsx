@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { backendFetch } from "../../backendApi";
+import type { ChatMessage } from "./hooks/useJournalHistory";
 import { parseKnowledgeBaseFile, useJournalHistory } from "./hooks/useJournalHistory";
-import { buildKnowledgeBaseMarkdownZip, parseKnowledgeBaseMarkdownZip } from "./knowledgeBaseMarkdownZip";
+import {
+  buildKnowledgeBaseMarkdownZip,
+  extractJournalEntriesFromMarkdownDump,
+  parseKnowledgeBaseMarkdownZip,
+} from "./knowledgeBaseMarkdownZip";
 import { BrainLayout, type BrainLibraryCategory } from "./components/BrainLayout";
 import { VoiceMemoTab } from "./components/VoiceMemoTab";
 import { LearningTab } from "./components/LearningTab";
@@ -465,41 +470,26 @@ export const Personaplex = () => {
         return;
       }
 
-      const parseDateFromFile = (f: File): string | null => {
+      type Row = { date: string | null; transcript: ChatMessage[] };
+      const rows: Row[] = [];
+      for (const f of list) {
         const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath ?? f.name;
-        const m = rel.match(/(20\d{2})-(\d{2})-(\d{2})/);
-        if (m) {
-          const iso = `${m[1]}-${m[2]}-${m[3]}T12:00:00.000Z`;
-          if (!Number.isNaN(Date.parse(iso))) return iso;
+        const text = (await f.text()).trim();
+        if (!text) continue;
+        for (const item of extractJournalEntriesFromMarkdownDump(rel, text)) {
+          rows.push(item);
         }
-        const m2 = rel.match(/(20\d{2})-(\d{2})/);
-        if (m2) {
-          const iso = `${m2[1]}-${m2[2]}-01T12:00:00.000Z`;
-          if (!Number.isNaN(Date.parse(iso))) return iso;
-        }
-        return null;
-      };
+      }
 
-      const dated = await Promise.all(
-        list.map(async (f) => ({
-          file: f,
-          date: parseDateFromFile(f),
-          text: (await f.text()).trim(),
-        }))
-      );
-
-      const valid = dated
-        .filter((x) => x.text.length > 0)
-        .sort((a, b) => {
-          const ta = a.date ? Date.parse(a.date) : 0;
-          const tb = b.date ? Date.parse(b.date) : 0;
-          return ta - tb;
-        });
+      rows.sort((a, b) => {
+        const ta = a.date ? Date.parse(a.date) : 0;
+        const tb = b.date ? Date.parse(b.date) : 0;
+        return ta - tb;
+      });
 
       let imported = 0;
-      for (const row of valid) {
-        const transcript = [{ role: "user" as const, text: row.text }];
-        const id = saveEntry(transcript, row.date ?? undefined);
+      for (const row of rows) {
+        const id = saveEntry(row.transcript, row.date ?? undefined);
         if (id) imported += 1;
       }
 

@@ -40,9 +40,17 @@ function parseNavigateActions(raw: unknown): PersonaplexNavigateAction[] {
 }
 import { backendFetch } from "../../backendApi";
 import type { ChatInteractionMode } from "./chatInteractionModes";
+import {
+  DEFAULT_USER_CHAT_MODEL,
+  readStoredUserChatModel,
+  type UserSelectableChatModelId,
+  USER_CHAT_MODEL_STORAGE_KEY,
+} from "./chatCompletionModels";
 import { blobToBase64, blobToWavBase64 } from "./utils/audioToWav";
 
 const CHAT_TIMEOUT_MS = 190_000;
+/** Sent for API compatibility; server always uses full memory retrieval (1.0) for graph /chat. */
+const CHAT_PERSONALIZATION_FULL = 1;
 
 export type PersonaplexChatMessage = {
   id: string;
@@ -67,7 +75,8 @@ export type ChatRecentEntry = {
   updatedAt: number;
 };
 
-const RECENTS_STORAGE_KEY = "personaplex-chat-recents";
+/** Bump key to reset persisted sidebar recents (e.g. after UX changes or local testing). */
+const RECENTS_STORAGE_KEY = "personaplex-chat-recents-v2";
 const MAX_RECENTS = 14;
 const MAX_ACTIVITY = 60;
 
@@ -178,10 +187,13 @@ type PersonaplexChatContextValue = {
   activityLog: AgentActivityEntry[];
   clearActivityLog: () => void;
   chatRecents: ChatRecentEntry[];
-  loadRecentSession: (sessionId: string) => void;
+  loadRecentSession: (sessionId: string) => Promise<void>;
   newChat: () => void;
   chatInteractionMode: ChatInteractionMode;
   setChatInteractionMode: (m: ChatInteractionMode) => void;
+  /** OpenRouter model for Conversation + Assisted Journal only. */
+  userChatModel: UserSelectableChatModelId;
+  setUserChatModel: (id: UserSelectableChatModelId) => void;
 };
 
 const PersonaplexChatContext = createContext<PersonaplexChatContextValue | null>(null);
@@ -216,6 +228,9 @@ export function PersonaplexChatProvider({
   const [chatError, setChatError] = useState<string | null>(null);
   const [isChatActive, setIsChatActive] = useState(false);
   const [chatInteractionMode, setChatInteractionMode] = useState<ChatInteractionMode>("conversation");
+  const [userChatModel, setUserChatModelState] = useState<UserSelectableChatModelId>(() =>
+    typeof window !== "undefined" ? readStoredUserChatModel() : DEFAULT_USER_CHAT_MODEL
+  );
   const [activityLog, setActivityLog] = useState<AgentActivityEntry[]>([]);
   const [chatRecents, setChatRecents] = useState<ChatRecentEntry[]>(() =>
     typeof window !== "undefined" ? readRecentsFromStorage() : []
@@ -417,16 +432,20 @@ export function PersonaplexChatProvider({
     const timeoutId = window.setTimeout(() => controller.abort(), CHAT_TIMEOUT_MS);
 
     try {
+      const payload: Record<string, unknown> = {
+        text,
+        session_id: chatSessionId,
+        personalization: CHAT_PERSONALIZATION_FULL,
+        intrusiveness: 0.5,
+        mode: chatInteractionMode,
+      };
+      if (chatInteractionMode === "conversation" || chatInteractionMode === "autobiography") {
+        payload.openrouter_model = userChatModel;
+      }
       const res = await backendFetch("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          session_id: chatSessionId,
-          personalization: 1,
-          intrusiveness: 0.5,
-          mode: chatInteractionMode,
-        }),
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
@@ -524,7 +543,18 @@ export function PersonaplexChatProvider({
     } finally {
       setSending(false);
     }
-  }, [draft, sending, chatSessionId, onToast, pushActivity, bumpRecents, pendingAudioFile, transcribeBlob, chatInteractionMode]);
+  }, [
+    draft,
+    sending,
+    chatSessionId,
+    onToast,
+    pushActivity,
+    bumpRecents,
+    pendingAudioFile,
+    transcribeBlob,
+    chatInteractionMode,
+    userChatModel,
+  ]);
 
   const startRecording = useCallback(async () => {
     if (micPhase !== "idle" || sending) return;
@@ -590,18 +620,59 @@ export function PersonaplexChatProvider({
   const clearJournalFileToProcess = useCallback(() => setJournalFileToProcess(null), []);
   const clearJournalTextToProcess = useCallback(() => setJournalTextToProcess(null), []);
 
+  const setUserChatModel = useCallback((id: UserSelectableChatModelId) => {
+    setUserChatModelState(id);
+    try {
+      localStorage.setItem(USER_CHAT_MODEL_STORAGE_KEY, id);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const composerDisabled = sending || micPhase !== "idle";
 
   const clearActivityLog = useCallback(() => setActivityLog([]), []);
 
   const loadRecentSession = useCallback(
-    (sessionId: string) => {
+    async (sessionId: string) => {
       setChatSessionId(sessionId);
-      setMessages([]);
-      setIsChatActive(false);
       setDraft("");
-      pushActivity({ kind: "system", summary: "Switched to a saved chat session." });
-      onToast("Session loaded — continue the conversation.");
+      setChatError(null);
+      setJournalFileToProcess(null);
+      setJournalTextToProcess(null);
+      try {
+        const res = await backendFetch(`/chat-session/${encodeURIComponent(sessionId)}`, { method: "GET" });
+        const data = (await res.json().catch(() => ({}))) as {
+          detail?: unknown;
+          messages?: Array<{ role?: string; content?: string }>;
+        };
+        if (!res.ok) {
+          const d = data.detail;
+          const detail = typeof d === "string" ? d : `Failed to load session (${res.status})`;
+          throw new Error(detail);
+        }
+        const rows = Array.isArray(data.messages) ? data.messages : [];
+        const mapped: PersonaplexChatMessage[] = rows
+          .filter((r) => (r.role === "user" || r.role === "assistant") && typeof r.content === "string")
+          .map((r, i) => ({
+            id: `hist_${sessionId.slice(0, 8)}_${i}`,
+            role: r.role as "user" | "assistant",
+            content: r.content as string,
+          }));
+        setMessages(mapped);
+        setIsChatActive(mapped.length > 0);
+        pushActivity({ kind: "system", summary: "Switched to a saved chat session." });
+        if (mapped.length === 0) {
+          onToast("No messages found for this session yet—or the server restarted and cleared memory.");
+        }
+      } catch (e) {
+        setMessages([]);
+        setIsChatActive(false);
+        const msg = e instanceof Error ? e.message : "Could not load session";
+        setChatError(msg);
+        onToast(msg);
+        pushActivity({ kind: "system", summary: `Could not load session: ${msg}` });
+      }
     },
     [onToast, pushActivity]
   );
@@ -650,6 +721,8 @@ export function PersonaplexChatProvider({
       newChat,
       chatInteractionMode,
       setChatInteractionMode,
+      userChatModel,
+      setUserChatModel,
     }),
     [
       idPrefix,
@@ -675,6 +748,8 @@ export function PersonaplexChatProvider({
       newChat,
       clearActivityLog,
       chatInteractionMode,
+      userChatModel,
+      setUserChatModel,
     ]
   );
 
