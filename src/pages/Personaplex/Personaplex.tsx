@@ -13,7 +13,9 @@ import { LearningTab } from "./components/LearningTab";
 import { BrainCalendarPanel } from "./components/BrainCalendarPanel";
 import { PersonaplexChatProvider, type PersonaplexNavigateAction } from "./PersonaplexChatContext";
 import { MobileAskComposerDockGate } from "./components/GlobalAskAnythingBar";
-import { PersonaplexLeftRail } from "./components/PersonaplexLeftRail";
+import { AboutTab } from "./components/AboutTab";
+import { PersonaplexGithubLink } from "./components/PersonaplexGithubLink";
+import { PersonaplexLeftRail, type PersonaplexView } from "./components/PersonaplexLeftRail";
 import { HomeChatSidebar } from "./components/HomeChatSidebar";
 
 const RECOMMENDATIONS_CACHE_KEY = "openjournal-recommendations-cache";
@@ -137,8 +139,6 @@ function librarySnapshotToBulkPayload(next: {
   next.research.forEach((r) => push(r, "research"));
   return items;
 }
-
-type PersonaplexView = "voice_memo" | "brain" | "recommendations" | "learning";
 
 export const Personaplex = () => {
   const [view, setView] = useState<PersonaplexView>("voice_memo");
@@ -764,7 +764,11 @@ export const Personaplex = () => {
       <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
         <div
           className={`flex-1 flex flex-col min-h-0 transition-opacity duration-300 ${
-            view === "brain" || view === "voice_memo" || view === "recommendations" || view === "learning"
+            view === "brain" ||
+              view === "voice_memo" ||
+              view === "recommendations" ||
+              view === "learning" ||
+              view === "about"
               ? "overflow-hidden"
               : "overflow-y-auto"
           } opacity-100`}
@@ -1371,34 +1375,16 @@ export const Personaplex = () => {
             </div>
           )}
           {view === "learning" && <LearningTab onToast={chatToast} />}
+          {view === "about" && <AboutTab />}
         </div>
       </main>
 
-      {/* Footer — mobile Home uses a fixed dock when the conversation is active; Chat uses the inline composer */}
-      <footer className="pointer-events-none relative z-10 flex-shrink-0 px-4 pb-[calc(4.5rem+env(safe-area-inset-bottom))] pt-1 text-center md:pb-5">
-        <p className="pointer-events-auto text-xs text-white/60">
-          On Home (desktop), open or resize the chat column on the right for history—the same width rules as Open WebUI. Record or attach audio for journal entries.
-        </p>
-        <p className="pointer-events-auto mx-auto mt-1 max-w-xl text-[10px] leading-relaxed text-white/40">
-          This is a prototype. Please avoid sharing highly sensitive personal information until our data pipeline is more secure. For private or stress testing, run the app locally and use local LLMs.
-        </p>
-        <div className="pointer-events-auto pt-1">
-          <p className="flex flex-wrap items-center justify-center gap-2 text-[10px] text-white/40">
-            <a
-              href="https://github.com/MrFunnything99/Open-Journal"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-white/50 transition-colors hover:text-white/80"
-              aria-label="View on GitHub"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="currentColor" className="inline-block">
-                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
-              </svg>
-              GitHub
-            </a>
-          </p>
-        </div>
-      </footer>
+      {/* Footer pinned below main on other tabs; About includes the link inside its scroll document. */}
+      {view !== "about" && (
+        <footer className="pointer-events-none relative z-10 flex-shrink-0 px-4 pb-[calc(4.5rem+env(safe-area-inset-bottom))] pt-1 text-center md:pb-5">
+          <PersonaplexGithubLink className="pointer-events-auto" />
+        </footer>
+      )}
 
       <MobileAskComposerDockGate railOpen={mobileRailOpen} activeView={view} />
       </div>

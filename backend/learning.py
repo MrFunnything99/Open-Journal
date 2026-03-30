@@ -739,6 +739,100 @@ def _pick_best_article(candidates: list[dict], brief: dict) -> dict | None:
     return result
 
 
+def _title_from_user_pasted_url(url: str) -> str:
+    """Readable default title from a user-pasted article or podcast URL (no network fetch)."""
+    from urllib.parse import unquote, urlparse
+
+    p = urlparse(url.strip())
+    host = (p.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if "spotify.com" in host:
+        return "Podcast (Spotify)"
+    if "podcasts.apple.com" in host or "itunes.apple.com" in host:
+        return "Podcast (Apple Podcasts)"
+    if "overcast.fm" in host:
+        return "Podcast (Overcast)"
+    if "youtube.com" in host or "youtu.be" in host:
+        return "YouTube"
+    if "substack.com" in host:
+        return "Article (Substack)"
+    path = unquote((p.path or "").rstrip("/"))
+    seg = path.split("/")[-1] if path else ""
+    if seg and len(seg) < 120 and "?" not in seg:
+        pretty = seg.replace("-", " ").replace("_", " ").strip()
+        if pretty and not pretty.isdigit():
+            return pretty[:200]
+    return (host or "Saved link").replace("www.", "")[:120] or "Saved link"
+
+
+def register_user_provided_learning_url(instance_id: str, url: str) -> dict:
+    """
+    Store a user-pasted article or podcast URL as today's learning item (replaces curated pick for that date).
+    Reuses journal / media theme brief so reflection chat still bridges to their journals.
+    """
+    from urllib.parse import urlparse
+
+    raw = (url or "").strip()
+    if not raw:
+        raise ValueError("URL is required")
+    if len(raw) > 2048:
+        raise ValueError("URL is too long")
+    parsed = urlparse(raw)
+    if (parsed.scheme or "").lower() not in ("http", "https"):
+        raise ValueError("Link must start with http:// or https://")
+    if not (parsed.netloc or "").strip():
+        raise ValueError("Please enter a valid URL")
+    if _is_junk_domain(raw):
+        raise ValueError("That domain is not allowed for learning links.")
+
+    today = _today_str()
+    _consumed_lower, consumed_rows = _consumed_context(instance_id)
+    brief = _build_learning_brief(instance_id, consumed_rows)
+    themes = brief.get("themes") or []
+    theme_notes = brief.get("theme_notes") or []
+
+    title = _title_from_user_pasted_url(raw)
+    hook = (
+        "You shared this link. Reflect on it here—the assistant will connect the conversation to your journals "
+        "when you move to reflection."
+    )
+
+    vec_store.daily_article_upsert(
+        instance_id=instance_id,
+        entry_date=today,
+        article_title=title,
+        article_url=raw,
+        article_snippet="",
+        hook=hook,
+        candidates_json=json.dumps([{"title": title, "url": raw, "source": "user_pasted"}]),
+        themes_json=json.dumps(
+            {
+                "themes": themes,
+                "theme_notes": theme_notes,
+                "summary": brief.get("summary") or "",
+            },
+            default=str,
+        ),
+        search_queries_json=json.dumps(["user_pasted_link"]),
+        status="pending",
+    )
+
+    return {
+        "title": title,
+        "url": raw,
+        "hook": hook,
+        "snippet": "",
+        "date": today,
+        "status": "pending",
+        "has_article": True,
+        "themes": themes,
+        "theme_notes": theme_notes,
+        "theme_model": _theme_model(),
+        "article_model": "user_pasted_link",
+    }
+
+
 def _parse_json_object(text: str) -> dict | None:
     """Robustly extract a JSON object from LLM output."""
     if not text or not isinstance(text, str):
@@ -922,9 +1016,9 @@ def get_learning_system_prompt(instance_id: str, article_data: dict) -> str:
     else:
         brief_line = "(no per-theme brief stored for this pick)"
 
-    return f"""You are a thoughtful learning companion helping the user reflect on an article they just read.
+    return f"""You are a thoughtful learning companion helping the user reflect on an article, essay, or episode they read or listened to (they may have opened it via a pasted link).
 
-ARTICLE:
+ARTICLE / MEDIA:
 - Title: {title}
 - URL: {url}
 - Snippet: {snippet[:500]}

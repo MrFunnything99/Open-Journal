@@ -2,7 +2,7 @@ import type { Dispatch, ReactNode, SetStateAction } from "react";
 import { ThemeToggle } from "../../../components/ThemeToggle";
 import { useTheme } from "../../../hooks/useTheme";
 
-export type PersonaplexView = "voice_memo" | "brain" | "recommendations" | "learning";
+export type PersonaplexView = "voice_memo" | "brain" | "recommendations" | "learning" | "about";
 
 type Props = {
   /** Expanded width on desktop (Open WebUI–style rail). */
@@ -124,6 +124,24 @@ export function PersonaplexLeftRail({
           "Recommendations",
           <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+          </svg>,
+          narrow
+        )}
+        <div className="min-h-3 flex-1" aria-hidden />
+        {navRow(
+          view === "about",
+          () => {
+            setView("about");
+            closeMobile();
+          },
+          "About",
+          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+            />
           </svg>,
           narrow
         )}

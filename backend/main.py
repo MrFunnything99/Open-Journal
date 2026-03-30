@@ -2536,11 +2536,15 @@ async def api_journal_validate(req: JournalValidateRequest):
 #  Learning Tab endpoints
 # ---------------------------------------------------------------------------
 
-from learning import generate_daily_article
+from learning import generate_daily_article, register_user_provided_learning_url
 
 
 class LearningStatusRequest(BaseModel):
     status: str  # "read" | "skipped"
+
+
+class LearningCustomUrlRequest(BaseModel):
+    url: str
 
 
 @app.get("/api/learning/today", include_in_schema=False)
@@ -2572,6 +2576,19 @@ async def api_learning_regenerate(request: Request):
         raise HTTPException(status_code=504, detail="Article regeneration timed out")
     except Exception as e:
         print(f"[backend] Learning regenerate error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/learning/custom-url", include_in_schema=False)
+async def api_learning_custom_url(request: Request, req: LearningCustomUrlRequest):
+    """User-pasted article or podcast URL for reflection (replaces today's curated slot)."""
+    instance_id = _instance_id(request)
+    try:
+        return await asyncio.to_thread(register_user_provided_learning_url, instance_id, req.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[backend] Learning custom-url error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

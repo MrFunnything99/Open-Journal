@@ -637,5 +637,9 @@ export function MobileAskComposerDockGate({
   const homeIdle =
     activeView === "voice_memo" && !isChatActive && messages.length === 0 && !sending;
   /** Home uses only the in-column composers (see VoiceMemoTab). Other tabs may use this dock on mobile. */
-  return <MobileAskComposerDock hidden={railOpen || homeIdle || activeView === "voice_memo"} />;
+  return (
+    <MobileAskComposerDock
+      hidden={railOpen || homeIdle || activeView === "voice_memo" || activeView === "about"}
+    />
+  );
 }

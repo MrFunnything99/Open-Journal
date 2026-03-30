@@ -22,7 +22,7 @@ type DailyArticle = {
   article_model?: string;
 };
 
-type TabPhase = "loading" | "article" | "reflection";
+type TabPhase = "idle" | "loading" | "article" | "reflection";
 
 export const LearningTab: FC<Props> = ({ onToast }) => {
   const {
@@ -32,11 +32,13 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
     newChat,
   } = usePersonaplexChat();
 
-  const [phase, setPhase] = useState<TabPhase>("loading");
+  const [phase, setPhase] = useState<TabPhase>("idle");
   const [article, setArticle] = useState<DailyArticle | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [regenerating, setRegenerating] = useState(false);
   const [readAloudBusy, setReadAloudBusy] = useState(false);
+  const [customUrl, setCustomUrl] = useState("");
+  const [customLinkBusy, setCustomLinkBusy] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   const fetchArticle = useCallback(
@@ -70,9 +72,47 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
     [setChatInteractionMode]
   );
 
-  useEffect(() => {
-    void fetchArticle(false);
-  }, [fetchArticle]);
+  const submitCustomLearningLink = useCallback(async () => {
+    const raw = customUrl.trim();
+    if (!raw) {
+      onToast("Paste a link first.");
+      return;
+    }
+    setLoadError(null);
+    setCustomLinkBusy(true);
+    try {
+      const res = await backendFetch("/learning/custom-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: raw }),
+      });
+      const data = (await res.json().catch(() => ({}))) as DailyArticle & { detail?: unknown };
+      if (!res.ok) {
+        const d = data.detail;
+        const msg =
+          typeof d === "string"
+            ? d
+            : Array.isArray(d) && d[0] && typeof (d[0] as { msg?: string }).msg === "string"
+              ? (d[0] as { msg: string }).msg
+              : `Could not save that link (${res.status}).`;
+        onToast(msg);
+        return;
+      }
+      setArticle(data);
+      setCustomUrl("");
+      if (data.status === "reflected") {
+        setPhase("reflection");
+        setChatInteractionMode("learning");
+      } else {
+        setPhase("article");
+      }
+      onToast("Link saved — open it, then start reflection when you're ready.");
+    } catch {
+      onToast("Network error saving link.");
+    } finally {
+      setCustomLinkBusy(false);
+    }
+  }, [customUrl, onToast, setChatInteractionMode]);
 
   useEffect(() => {
     if (listRef.current) {
@@ -129,6 +169,57 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
             role="log"
             aria-live="polite"
           >
+            {/* No automatic fetch — user opts in to avoid repeat API cost when switching tabs */}
+            {phase === "idle" && (
+              <div className="flex flex-1 items-start justify-center overflow-y-auto px-4 py-8">
+                <div className="flex w-full max-w-md flex-col gap-4">
+                  <div className="glass-panel rounded-2xl border border-white/10 px-6 py-8 text-center">
+                    <p className="mb-2 text-sm font-medium text-white/90">Today’s pick</p>
+                    <p className="mb-6 text-sm leading-relaxed text-white/55">
+                      Load the curated article only when you want it. Switching tabs does not run a query.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => void fetchArticle(false)}
+                      className="rounded-xl bg-indigo-600/85 px-5 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-indigo-600"
+                    >
+                      Load today’s article
+                    </button>
+                  </div>
+                  <div className="glass-panel rounded-2xl border border-white/10 px-6 py-8 text-center">
+                    <p className="mb-2 text-sm font-medium text-white/90">Your own link</p>
+                    <p className="mb-4 text-sm leading-relaxed text-white/55">
+                      Paste an article, post, or podcast episode you already read or listened to. Reflection chat still
+                      uses your journals to connect the conversation—no automatic web search for a new pick.
+                    </p>
+                    <input
+                      type="url"
+                      inputMode="url"
+                      autoComplete="url"
+                      placeholder="https://…"
+                      value={customUrl}
+                      onChange={(e) => setCustomUrl(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !customLinkBusy) {
+                          e.preventDefault();
+                          void submitCustomLearningLink();
+                        }
+                      }}
+                      className="mb-4 w-full rounded-xl border border-white/15 bg-black/25 px-4 py-3 text-left text-sm text-white placeholder:text-white/35 focus:border-white/30 focus:outline-none focus:ring-2 focus:ring-white/10"
+                    />
+                    <button
+                      type="button"
+                      disabled={customLinkBusy || !customUrl.trim()}
+                      onClick={() => void submitCustomLearningLink()}
+                      className="rounded-xl border border-white/20 bg-white/10 px-5 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-45"
+                    >
+                      {customLinkBusy ? "Saving…" : "Reflect on this link"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Loading state */}
             {phase === "loading" && (
               <div className="flex flex-1 items-center justify-center">
@@ -180,7 +271,7 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
                   ) : article ? (
                     <div className="glass-panel rounded-2xl border border-white/10 px-6 py-8">
                       <p className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-white/40">
-                        Today's read
+                        {article.article_model === "user_pasted_link" ? "Your link" : "Today's read"}
                       </p>
                       <h2 className="mb-3 text-xl font-bold leading-snug text-white/95">
                         {article.title}
