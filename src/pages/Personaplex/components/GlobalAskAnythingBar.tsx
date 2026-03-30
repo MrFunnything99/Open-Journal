@@ -172,7 +172,8 @@ function PlusOptionsMenu({
   onClose: () => void;
   placement: PlusPlacement;
   anchorRef: RefObject<HTMLElement | null>;
-  menuContainerRef: RefObject<HTMLDivElement | null>;
+  /** RefObject<T>.current is T | null — do not use RefObject<T | null>. */
+  menuContainerRef: RefObject<HTMLDivElement>;
   fileInputRef: MutableRefObject<HTMLInputElement | null>;
   composerDisabled: boolean;
   mode: ChatInteractionMode;

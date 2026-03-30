@@ -106,7 +106,8 @@ export async function playChatReadAloud(
       return;
     }
 
-    const blob = new Blob([bytes], { type: mimeForTtsFormat(data.format) });
+    // Copy into a fresh ArrayBuffer-backed view so `Blob` accepts the part under strict DOM typings.
+    const blob = new Blob([new Uint8Array(bytes)], { type: mimeForTtsFormat(data.format) });
     const url = URL.createObjectURL(blob);
     currentObjectUrl = url;
     const audio = new Audio(url);
