@@ -1,5 +1,6 @@
 import { FC, useCallback, useEffect, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
+import { playChatReadAloud } from "../utils/chatReadAloud";
 import { usePersonaplexChat } from "../PersonaplexChatContext";
 import { AskAnythingComposer, LiveDictationBubble } from "./GlobalAskAnythingBar";
 
@@ -35,6 +36,7 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
   const [article, setArticle] = useState<DailyArticle | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [regenerating, setRegenerating] = useState(false);
+  const [readAloudBusy, setReadAloudBusy] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   const fetchArticle = useCallback(
@@ -98,16 +100,9 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
 
   const readAloud = useCallback(
     (text: string) => {
-      if (typeof window === "undefined" || !window.speechSynthesis) {
-        onToast("Read aloud is not supported in this browser.");
-        return;
-      }
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1;
-      window.speechSynthesis.speak(u);
+      void playChatReadAloud(text, onToast, { onLoading: setReadAloudBusy });
     },
-    [onToast]
+    [onToast],
   );
 
   const copyText = useCallback(
@@ -303,8 +298,10 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
                           <button
                             type="button"
                             onClick={() => readAloud(m.content)}
-                            className="rounded-lg p-2 hover:bg-white/10 hover:text-white"
-                            title="Read aloud"
+                            disabled={readAloudBusy}
+                            aria-busy={readAloudBusy}
+                            className="rounded-lg p-2 hover:bg-white/10 hover:text-white disabled:pointer-events-none disabled:opacity-35"
+                            title={readAloudBusy ? "Loading audio…" : "Read aloud"}
                             aria-label="Read response aloud"
                           >
                             <svg xmlns="http://www.w3.org/2000/svg" className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>

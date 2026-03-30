@@ -728,12 +728,12 @@ export const Personaplex = () => {
       <div className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
       <div className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       {/* Header — centered brand; nav lives in left rail (Open WebUI–style shell) */}
-      <header className="relative z-20 flex-none px-4 py-3 sm:px-6 sm:py-4">
-        <div className="flex w-full items-center gap-2">
+      <header className="relative z-20 flex-none border-b border-white/[0.06] px-4 py-2.5 sm:px-6 sm:py-3">
+        <div className="flex w-full items-center gap-3">
           <div className="flex min-w-0 flex-1 justify-start">
             <button
               type="button"
-              className="rounded-full border border-white/15 bg-white/10 p-2.5 text-white shadow-sm backdrop-blur-md md:hidden"
+                    className="rounded-full border border-white/15 bg-white/10 p-2.5 text-white shadow-sm backdrop-blur-md md:hidden"
               onClick={() => setMobileRailOpen(true)}
               aria-label="Open menu"
             >
@@ -742,8 +742,8 @@ export const Personaplex = () => {
               </svg>
             </button>
           </div>
-          <div className="glass-panel flex min-w-0 max-w-full shrink-0 flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-full px-4 py-2.5 text-center">
-            <h1 className="shrink-0 text-xs font-medium uppercase tracking-[0.2em] text-white sm:text-sm md:text-base">
+          <div className="glass-panel flex shrink-0 items-center justify-center rounded-full px-5 py-2 text-center shadow-sm">
+            <h1 className="whitespace-nowrap text-xs font-medium uppercase tracking-[0.22em] text-white sm:text-sm">
               Selfmeridian
             </h1>
           </div>

@@ -487,6 +487,139 @@ FALLBACK_VOICES = [
     {"voice_id": "N2lVS1w4EtoT3dr4eOWO", "name": "Sam"},
 ]
 
+_MISTRAL_VOICE_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
+# Preset voices from Mistral (voice_id can be a slug, not only a saved UUID).
+_MISTRAL_PRESET_VOICE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,62}$", re.I)
+
+# Catalog voice slug from GET /v1/audio/voices (e.g. "Paul - Neutral" → en_paul_neutral).
+DEFAULT_MISTRAL_TTS_VOICE_ID = "en_paul_neutral"
+
+
+def _mistral_voice_id_valid(raw: str) -> bool:
+    t = raw.strip()
+    if not t:
+        return False
+    return bool(_MISTRAL_VOICE_UUID_RE.match(t) or _MISTRAL_PRESET_VOICE_RE.match(t))
+
+
+def _resolve_mistral_voice_id(req_voice_id: Optional[str]) -> str:
+    """
+    Voxtral voice_id: saved voice UUID or catalog slug from /v1/audio/voices (e.g. en_paul_neutral).
+    https://docs.mistral.ai/capabilities/audio/text_to_speech
+    """
+    env_vid = os.getenv("MISTRAL_TTS_VOICE_ID", "").strip()
+    if env_vid:
+        return env_vid
+    if req_voice_id and _mistral_voice_id_valid(req_voice_id):
+        return req_voice_id.strip()
+    api_key = os.getenv("MISTRAL_API_KEY", "").strip()
+    if api_key:
+        import urllib.request
+
+        try:
+            request = urllib.request.Request(
+                "https://api.mistral.ai/v1/audio/voices?limit=30&offset=0",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            items = data.get("items") or []
+            # Prefer the default catalog neutral voice if Mistral lists it (slug or UUID).
+            want = DEFAULT_MISTRAL_TTS_VOICE_ID.lower()
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                slug = ((it.get("slug") or "") or "").lower()
+                vid = (it.get("id") or "").strip()
+                if slug == want or vid.lower() == want:
+                    return (it.get("slug") or it.get("id") or "").strip() or vid
+            if len(items) == 1 and isinstance(items[0], dict):
+                vid = (items[0].get("id") or "").strip()
+                if vid:
+                    return vid
+        except Exception as e:
+            print("[backend] Mistral voices list:", e)
+    return DEFAULT_MISTRAL_TTS_VOICE_ID
+
+
+def _mistral_tts_playback_rate() -> float:
+    """Client hint for HTMLAudioElement.playbackRate (API has no speed field in OpenAPI)."""
+    raw = (os.getenv("MISTRAL_TTS_PLAYBACK_RATE") or "1.05").strip()
+    try:
+        r = float(raw)
+    except (TypeError, ValueError):
+        return 1.05
+    if r < 0.25 or r > 4.0:
+        return 1.05
+    return r
+
+
+def _mistral_tts_response_format() -> str:
+    """Smaller/faster-to-encode opus vs mp3 for chat read-aloud; override with MISTRAL_TTS_RESPONSE_FORMAT."""
+    raw = (os.getenv("MISTRAL_TTS_RESPONSE_FORMAT") or "opus").strip().lower()
+    if raw in ("opus", "mp3", "wav", "flac"):
+        return raw
+    return "opus"
+
+
+def _mistral_tts_speech(text: str, voice_id: str, response_format: str) -> bytes:
+    """https://docs.mistral.ai/capabilities/audio/text_to_speech/speech"""
+    import base64 as b64mod
+    import urllib.request
+    import urllib.error
+
+    api_key = os.getenv("MISTRAL_API_KEY", "").strip()
+    if not api_key or not voice_id:
+        raise ValueError("Mistral TTS not configured (API key or voice id missing).")
+    model = (os.getenv("MISTRAL_TTS_MODEL") or "voxtral-mini-tts-2603").strip()
+    inp = text.strip()
+    if len(inp) > 12_000:
+        inp = inp[:12_000] + "…"
+    fmt = (response_format or "opus").strip().lower()
+    if fmt not in ("opus", "mp3", "wav", "flac", "pcm"):
+        fmt = "opus"
+    body = json.dumps({
+        "model": model,
+        "input": inp,
+        "voice_id": voice_id,
+        "response_format": fmt,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.mistral.ai/v1/audio/speech",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8")
+            err_json = json.loads(err_body) if err_body.strip() else {}
+            detail = err_json.get("detail") or err_json.get("message")
+            if isinstance(detail, list) and detail:
+                detail = detail[0] if isinstance(detail[0], str) else detail[0].get("msg")
+            if isinstance(detail, dict):
+                detail = detail.get("message") or str(detail)
+            msg = detail if isinstance(detail, str) else (err_body[:400] if err_body else str(e))
+        except Exception:
+            msg = str(e)
+        print(f"[backend] Mistral TTS HTTP {e.code}: {msg}")
+        raise ValueError(msg or f"Mistral TTS failed (HTTP {e.code})") from e
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid Mistral TTS response")
+    audio_b64 = payload.get("audio_data")
+    if not audio_b64 or not isinstance(audio_b64, str):
+        raise ValueError("Mistral TTS returned no audio_data")
+    return b64mod.b64decode(audio_b64)
+
 
 class VoiceRequest(BaseModel):
     text: str
@@ -965,16 +1098,45 @@ async def _validate_journal_openrouter(raw: str, model_override: Optional[str] =
 
 @api_router.post("/voice")
 async def api_voice(req: VoiceRequest):
-    """Proxy to ElevenLabs text-to-speech. Returns { audio: base64, format: \"mp3\" } or { error }."""
+    """
+    Text-to-speech: Mistral Voxtral when MISTRAL_API_KEY is set, else ElevenLabs.
+    Returns { audio: base64, format: \"opus\" | \"mp3\" | ... }.
+    Voxtral: https://docs.mistral.ai/capabilities/audio/text_to_speech
+    """
     import base64 as b64
     import urllib.request
+    import urllib.error
 
-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY is not configured")
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
+
+    mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
+    if mistral_key:
+        vid = _resolve_mistral_voice_id(req.voiceId)
+        tts_fmt = _mistral_tts_response_format()
+        try:
+            audio_bytes = await asyncio.to_thread(_mistral_tts_speech, text, vid, tts_fmt)
+        except ValueError as e:
+            print("[backend] Mistral TTS:", e)
+            raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            print("[backend] Mistral TTS error:", e)
+            raise HTTPException(status_code=500, detail=str(e))
+        rate = _mistral_tts_playback_rate()
+        return {
+            "audio": b64.b64encode(audio_bytes).decode("ascii"),
+            "format": tts_fmt,
+            "provider": "mistral",
+            "playback_rate": rate,
+        }
+
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="No TTS configured: set MISTRAL_API_KEY for Voxtral (default voice en_paul_neutral), or ELEVENLABS_API_KEY.",
+        )
     voice_id = req.voiceId or DEFAULT_VOICE_ID
     raw = req.voice_settings or {}
     stability = max(0, min(1, raw.get("stability", 0.5) if isinstance(raw.get("stability"), (int, float)) else 0.5))
@@ -1017,13 +1179,33 @@ async def api_voice(req: VoiceRequest):
 
 @api_router.get("/voices")
 async def api_voices():
-    """Proxy to ElevenLabs voices list. Returns { voices: [{ voice_id, name }] }."""
+    """Voices for TTS UI: Mistral when MISTRAL_API_KEY is set, else ElevenLabs. Returns { voices: [{ voice_id, name }], provider? }."""
     import urllib.request
     import urllib.error
 
+    mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
+    if mistral_key:
+        try:
+            request = urllib.request.Request(
+                "https://api.mistral.ai/v1/audio/voices?limit=50&offset=0",
+                headers={"Authorization": f"Bearer {mistral_key}"},
+            )
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            items = data.get("items") or []
+            voices = [
+                {"voice_id": (v.get("id") or ""), "name": (v.get("name") or "Voice")}
+                for v in items
+                if isinstance(v, dict) and v.get("id")
+            ]
+            if voices:
+                return {"voices": voices, "provider": "mistral"}
+        except Exception as e:
+            print("[backend] Mistral /voices list:", e)
+
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     if not api_key:
-        return {"voices": FALLBACK_VOICES}
+        return {"voices": FALLBACK_VOICES, "provider": "fallback"}
     request = urllib.request.Request(
         ELEVENLABS_VOICES_URL,
         headers={"xi-api-key": api_key},
@@ -1041,7 +1223,7 @@ async def api_voices():
     voices = [v for v in voices if v["voice_id"]]
     if not any(v["voice_id"] == DEFAULT_VOICE_ID for v in voices):
         voices.insert(0, {"voice_id": DEFAULT_VOICE_ID, "name": "Rachel"})
-    return {"voices": voices}
+    return {"voices": voices, "provider": "elevenlabs"}
 
 
 @api_router.get("/scribe-token")

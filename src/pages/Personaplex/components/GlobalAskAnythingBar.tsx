@@ -51,7 +51,7 @@ function ModeChipIcon({ mode }: { mode: ChatInteractionMode }) {
 function composerModeChipClass(mode: ChatInteractionMode, compact: boolean): string {
   const pad = compact ? "px-2 py-0.5" : "px-2.5 py-1";
   const text = compact ? "text-[0.65rem] sm:text-[0.7rem]" : "text-[0.7rem] sm:text-xs";
-  const base = `inline-flex max-w-[10rem] shrink-0 items-center gap-1 truncate rounded-full border font-semibold tracking-tight transition-colors hover:brightness-110 sm:max-w-[12rem] ${pad} ${text}`;
+  const base = `inline-flex max-w-[11rem] shrink-0 items-center gap-1 truncate rounded-full border font-semibold tracking-tight transition-colors hover:brightness-110 sm:max-w-[14rem] ${pad} ${text}`;
   if (mode === "conversation") {
     return `${base} border-white/25 bg-white/[0.09] text-white/90`;
   }
@@ -123,7 +123,7 @@ export function LiveDictationBubble({ className = "" }: { className?: string }) 
 
 export type AskAnythingLayout = "dock" | "rail" | "center";
 
-function ComposerChatModelSelect({ idPrefix }: { idPrefix: string }) {
+function ComposerChatModelSelect({ idPrefix, embedded }: { idPrefix: string; embedded?: boolean }) {
   const { userChatModel, setUserChatModel, composerDisabled } = usePersonaplexChat();
   return (
     <select
@@ -133,7 +133,11 @@ function ComposerChatModelSelect({ idPrefix }: { idPrefix: string }) {
       onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
       disabled={composerDisabled}
       title="Model for replies (retrieval + tools use this model)"
-      className="max-w-[10rem] shrink-0 rounded-full border border-white/15 bg-black/35 px-2 py-1 text-[0.65rem] text-white focus:border-white/30 focus:outline-none disabled:opacity-50 sm:max-w-[11rem] sm:text-xs"
+      className={
+        embedded
+          ? "min-w-0 flex-1 rounded-lg border border-white/12 bg-black/40 px-2.5 py-1.5 text-[0.7rem] text-white focus:border-white/25 focus:outline-none focus:ring-1 focus:ring-white/15 disabled:opacity-50 sm:max-w-[16rem] sm:flex-none sm:text-xs"
+          : "max-w-[10rem] shrink-0 rounded-full border border-white/15 bg-black/35 px-2 py-1 text-[0.65rem] text-white focus:border-white/30 focus:outline-none disabled:opacity-50 sm:max-w-[11rem] sm:text-xs"
+      }
     >
       {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
         <option key={o.id} value={o.id}>
@@ -330,16 +334,26 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
     return () => document.removeEventListener("mousedown", onDoc);
   }, [plusOpen]);
 
-  const shellClass =
+  const showModelFooter =
+    chatInteractionMode === "conversation" || chatInteractionMode === "autobiography";
+
+  const shellOuterClass =
     layout === "dock"
-      ? "glass-panel flex items-center gap-1 rounded-full pl-3 pr-2 shadow-[0_-4px_32px_rgba(0,0,0,0.35)] transition-shadow md:gap-2 md:pl-4"
+      ? "glass-panel flex w-full flex-col overflow-hidden rounded-[1.75rem] shadow-[0_-4px_32px_rgba(0,0,0,0.35)] transition-shadow"
       : layout === "center"
-        ? "glass-panel mx-auto flex w-full max-w-2xl items-center gap-1 rounded-2xl border border-white/12 px-3 py-2 shadow-[0_8px_32px_rgba(0,0,0,0.28)] transition-shadow md:gap-2 md:px-4 md:py-2.5"
-        : "glass-panel flex w-full items-center gap-1 rounded-2xl px-2 py-1.5 shadow-[0_4px_24px_rgba(0,0,0,0.25)] transition-shadow";
+        ? "glass-panel mx-auto flex w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/12 shadow-[0_8px_32px_rgba(0,0,0,0.28)] transition-shadow"
+        : "glass-panel flex w-full flex-col overflow-hidden rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.25)] transition-shadow";
+
+  const shellRowClass =
+    layout === "dock"
+      ? "flex items-center gap-1 pl-3 pr-2 py-1.5 md:gap-2 md:pl-4 md:py-2"
+      : layout === "center"
+        ? "flex items-center gap-1 px-3 py-2 md:gap-2 md:px-4 md:py-2.5"
+        : "flex w-full items-center gap-1 px-2 py-1.5";
 
   if (layout === "rail" && railNarrow) {
     return (
-      <div className="flex w-full flex-col gap-1 border-t border-white/10 px-0.5 py-2">
+      <div className="flex w-full flex-col gap-1.5 border-t border-white/10 px-0.5 py-2">
         <button
           type="button"
           onClick={onExpandRail}
@@ -354,8 +368,8 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
           className="hidden"
           onChange={onPickFile}
         />
-        <div className="flex flex-col items-stretch gap-1">
-          <div className="relative flex flex-wrap justify-center gap-1">
+        <div className="glass-panel flex flex-col overflow-hidden rounded-xl border border-white/10">
+          <div className="relative flex flex-wrap justify-center gap-1 px-1.5 py-2">
             <div className="relative shrink-0" ref={plusWrapRef}>
               <button
                 type="button"
@@ -426,9 +440,10 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
               <SendIcon className="h-4 w-4" />
             </button>
           </div>
-          {(chatInteractionMode === "conversation" || chatInteractionMode === "autobiography") && (
-            <div className="flex justify-center">
-              <ComposerChatModelSelect idPrefix={idPrefix} />
+          {showModelFooter && (
+            <div className="flex items-center gap-2 border-t border-white/10 bg-black/25 px-2 py-1.5">
+              <span className="shrink-0 text-[0.6rem] font-semibold uppercase tracking-[0.14em] text-white/40">Model</span>
+              <ComposerChatModelSelect idPrefix={idPrefix} embedded />
             </div>
           )}
         </div>
@@ -459,7 +474,14 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
           </button>
         </div>
       )}
-      <div className={shellClass + (micPhase === "recording" ? " ring-2 ring-red-400/50" : "") + (pendingAudioFile ? " rounded-t-none border-t-0" : "")}>
+      <div
+        className={
+          shellOuterClass +
+          (micPhase === "recording" ? " ring-2 ring-red-400/50" : "") +
+          (pendingAudioFile ? " rounded-t-none border-t-0" : "")
+        }
+      >
+      <div className={shellRowClass}>
       <input
         ref={fileInputRef as React.LegacyRef<HTMLInputElement>}
         type="file"
@@ -565,19 +587,21 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
         <SendIcon className={layout === "rail" ? "h-4 w-4" : "h-5 w-5"} />
       </button>
       </div>
-      {(chatInteractionMode === "conversation" || chatInteractionMode === "autobiography") && (
+      {showModelFooter && (
         <div
           className={
             layout === "center"
-              ? "mx-auto mt-1.5 flex w-full max-w-2xl justify-start px-3 md:px-4"
+              ? "flex items-center gap-2 border-t border-white/10 bg-black/20 px-3 py-1.5 md:px-4"
               : layout === "rail"
-                ? "mt-1.5 flex w-full justify-start pl-2"
-                : "mt-1.5 flex w-full justify-start pl-3 md:pl-4"
+                ? "flex items-center gap-2 border-t border-white/10 bg-black/20 px-2 py-1.5"
+                : "flex items-center gap-2 border-t border-white/10 bg-black/25 px-3 py-1.5 md:px-4"
           }
         >
-          <ComposerChatModelSelect idPrefix={idPrefix} />
+          <span className="shrink-0 text-[0.6rem] font-semibold uppercase tracking-[0.14em] text-white/40">Model</span>
+          <ComposerChatModelSelect idPrefix={idPrefix} embedded />
         </div>
       )}
+      </div>
     </div>
   );
 }

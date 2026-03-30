@@ -5,6 +5,7 @@ import type { ChatMessage } from "../hooks/useJournalHistory";
 import { usePersonaplexChat } from "../PersonaplexChatContext";
 import { blobToBase64, blobToWavBase64 } from "../utils/audioToWav";
 import { AskAnythingComposer, LiveDictationBubble } from "./GlobalAskAnythingBar";
+import { playChatReadAloud } from "../utils/chatReadAloud";
 
 type Props = {
   onToast: (msg: string) => void;
@@ -68,6 +69,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const [journalEntryTime, setJournalEntryTime] = useState("");
   const [savingJournal, setSavingJournal] = useState(false);
   const [journalMessages, setJournalMessages] = useState<ChatMessage[]>([]);
+  const [readAloudBusy, setReadAloudBusy] = useState(false);
 
   const listRef = useRef<HTMLDivElement>(null);
   const journalScrollRef = useRef<HTMLDivElement>(null);
@@ -87,16 +89,12 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     el.scrollTop = el.scrollHeight;
   }, [journalMessages, gettingFeedback]);
 
-  const readAloud = useCallback((text: string) => {
-    if (typeof window === "undefined" || !window.speechSynthesis) {
-      onToast("Read aloud is not supported in this browser.");
-      return;
-    }
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 1;
-    window.speechSynthesis.speak(u);
-  }, [onToast]);
+  const readAloud = useCallback(
+    (text: string) => {
+      void playChatReadAloud(text, onToast, { onLoading: setReadAloudBusy });
+    },
+    [onToast],
+  );
 
   const copyText = useCallback(
     async (text: string) => {
@@ -359,7 +357,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                 >
                   {CHAT_INTERACTION_MODE_META[chatInteractionMode].description}
                 </p>
-                <div className="w-full max-w-2xl space-y-2 text-left">
+                <div className="w-full max-w-2xl space-y-1.5 text-left">
                   <LiveDictationBubble />
                   <AskAnythingComposer layout="center" />
                 </div>
@@ -489,8 +487,10 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                                   <button
                                     type="button"
                                     onClick={() => readAloud(m.text)}
-                                    className="rounded-md p-1 hover:bg-white/10 hover:text-white"
-                                    title="Read aloud"
+                                    disabled={readAloudBusy}
+                                    aria-busy={readAloudBusy}
+                                    className="rounded-md p-1 hover:bg-white/10 hover:text-white disabled:pointer-events-none disabled:opacity-35"
+                                    title={readAloudBusy ? "Loading audio…" : "Read aloud"}
                                   >
                                     <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                                       <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
@@ -662,8 +662,10 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                           <button
                             type="button"
                             onClick={() => readAloud(m.content)}
-                            className="rounded-lg p-2 hover:bg-white/10 hover:text-white"
-                            title="Read aloud"
+                            disabled={readAloudBusy}
+                            aria-busy={readAloudBusy}
+                            className="rounded-lg p-2 hover:bg-white/10 hover:text-white disabled:pointer-events-none disabled:opacity-35"
+                            title={readAloudBusy ? "Loading audio…" : "Read aloud"}
                             aria-label="Read response aloud"
                           >
                             <svg xmlns="http://www.w3.org/2000/svg" className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -697,8 +699,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
           </div>
 
           {showBottomComposer && (
-            <div className="flex-none border-t border-white/10 bg-[#0a0a12]/90 px-3 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur-md">
-              <div className="mx-auto w-full max-w-[48rem] space-y-2">
+            <div className="flex-none border-t border-white/10 bg-[#0a0a12]/92 px-3 py-2.5 pb-[max(0.65rem,env(safe-area-inset-bottom))] backdrop-blur-md">
+              <div className="mx-auto w-full max-w-[48rem] space-y-1.5">
                 <LiveDictationBubble />
                 <AskAnythingComposer layout="center" />
               </div>
