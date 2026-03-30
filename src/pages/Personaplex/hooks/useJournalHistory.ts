@@ -10,6 +10,11 @@ export type JournalEntry = {
   fullTranscript: ChatMessage[];
   /** True after this entry has been sent to /ingest-history so recommendations use it */
   syncedToMemory?: boolean;
+  /**
+   * `conversation` = live Personaplex AI session (saveOrUpdateEntry).
+   * Omitted or `journal` = imported / pasted / one-off saves (saveEntry).
+   */
+  entrySource?: "journal" | "conversation";
 };
 
 const STORAGE_KEY = "openjournal-history";
@@ -73,6 +78,78 @@ function isExportPayload(obj: unknown): obj is ExportPayload {
   );
 }
 
+export const KNOWLEDGE_BASE_EXPORT_VERSION = 2 as const;
+
+export type KnowledgeBaseLibraryItem = {
+  id: string;
+  title: string;
+  author?: string;
+  date_completed?: string;
+  note?: string;
+};
+
+export type KnowledgeBaseLibrarySnapshot = {
+  books: KnowledgeBaseLibraryItem[];
+  podcasts: KnowledgeBaseLibraryItem[];
+  articles: KnowledgeBaseLibraryItem[];
+  research: KnowledgeBaseLibraryItem[];
+};
+
+export type KnowledgeBaseExport = {
+  version: typeof KNOWLEDGE_BASE_EXPORT_VERSION;
+  exportedAt: string;
+  entries: JournalEntry[];
+  library: KnowledgeBaseLibrarySnapshot;
+};
+
+function isKnowledgeBaseExport(obj: unknown): obj is KnowledgeBaseExport {
+  if (!isExportPayload(obj)) return false;
+  const o = obj as Record<string, unknown>;
+  if (o.version !== KNOWLEDGE_BASE_EXPORT_VERSION) return false;
+  const lib = o.library;
+  if (lib == null || typeof lib !== "object") return false;
+  const L = lib as Record<string, unknown>;
+  return (
+    Array.isArray(L.books) &&
+    Array.isArray(L.podcasts) &&
+    Array.isArray(L.articles) &&
+    Array.isArray(L.research)
+  );
+}
+
+export function buildKnowledgeBaseJson(
+  entries: JournalEntry[],
+  library: KnowledgeBaseLibrarySnapshot
+): string {
+  const payload: KnowledgeBaseExport = {
+    version: KNOWLEDGE_BASE_EXPORT_VERSION,
+    exportedAt: new Date().toISOString(),
+    entries,
+    library: {
+      books: [...library.books],
+      podcasts: [...library.podcasts],
+      articles: [...library.articles],
+      research: [...library.research],
+    },
+  };
+  return JSON.stringify(payload, null, 2);
+}
+
+export type ParsedKnowledgeBaseFile =
+  | { kind: "full"; data: KnowledgeBaseExport }
+  | { kind: "journalsOnly"; data: ExportPayload };
+
+export function parseKnowledgeBaseFile(text: string): ParsedKnowledgeBaseFile | null {
+  try {
+    const j = JSON.parse(text) as unknown;
+    if (isKnowledgeBaseExport(j)) return { kind: "full", data: j };
+    if (isExportPayload(j)) return { kind: "journalsOnly", data: j };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeMessage(m: unknown): ChatMessage | null {
   if (m == null || typeof m !== "object") return null;
   const o = m as Record<string, unknown>;
@@ -93,7 +170,10 @@ function normalizeEntry(raw: unknown): JournalEntry | null {
   const date = typeof o.date === "string" ? o.date : new Date().toISOString();
   const preview = typeof o.preview === "string" ? o.preview : transcriptToPreview(fullTranscript);
   const syncedToMemory = o.syncedToMemory === true;
-  return { id, date, preview, fullTranscript, syncedToMemory };
+  let entrySource: "journal" | "conversation" | undefined;
+  if (o.entrySource === "conversation") entrySource = "conversation";
+  else if (o.entrySource === "journal") entrySource = "journal";
+  return { id, date, preview, fullTranscript, syncedToMemory, entrySource };
 }
 
 export const useJournalHistory = () => {
@@ -123,6 +203,7 @@ export const useJournalHistory = () => {
       preview,
       fullTranscript: transcript,
       syncedToMemory: false,
+      entrySource: "journal",
     };
     setEntries((prev) => [entry, ...prev]);
     return id;
@@ -150,6 +231,7 @@ export const useJournalHistory = () => {
           fullTranscript: transcript,
           // Any update means this entry should be re-synced.
           syncedToMemory: false,
+          entrySource: "conversation",
         };
         if (idx === -1) return [nextEntry, ...prev];
         const copy = [...prev];
@@ -182,7 +264,11 @@ export const useJournalHistory = () => {
         const r = await backendFetch("/ingest-history", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: text.trim(), entry_date: entry.date }),
+          body: JSON.stringify({
+            text: text.trim(),
+            entry_date: entry.date,
+            session_id: entry.id,
+          }),
         });
         const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };
         if (data && data.ok !== false) syncedIds.push(entry.id);
@@ -204,6 +290,26 @@ export const useJournalHistory = () => {
 
   const deleteEntry = useCallback((id: string) => {
     setEntries((prev) => prev.filter((e) => e.id !== id));
+  }, []);
+
+  /** Replace transcript for an existing entry (e.g. edits on The Brain). Marks unsynced for re-ingest. */
+  const updateJournalEntry = useCallback((id: string, fullTranscript: ChatMessage[]) => {
+    if (fullTranscript.length === 0) return;
+    const hasText = fullTranscript.some((m) => m.text.trim().length > 0);
+    if (!hasText) return;
+    setEntries((prev) => {
+      const idx = prev.findIndex((e) => e.id === id);
+      if (idx === -1) return prev;
+      const preview = transcriptToPreview(fullTranscript);
+      const copy = [...prev];
+      copy[idx] = {
+        ...copy[idx],
+        fullTranscript,
+        preview,
+        syncedToMemory: false,
+      };
+      return copy;
+    });
   }, []);
 
   const getFormattedDate = useCallback((entry: JournalEntry) => {
@@ -232,6 +338,26 @@ export const useJournalHistory = () => {
     return withNewIds.length;
   }, []);
 
+  /** Replace local journal history entirely (used after server vector wipe + knowledge base re-import). */
+  const importEntriesReplaceAll = useCallback((payload: ExportPayload): number => {
+    const normalized = payload.entries
+      .map((raw) => normalizeEntry(raw))
+      .filter((e): e is JournalEntry => e != null);
+    if (normalized.length === 0) {
+      setEntries([]);
+      saveToStorage([]);
+      return 0;
+    }
+    const withNewIds = normalized.map((e) => ({
+      ...e,
+      id: generateId(),
+      syncedToMemory: false as const,
+    }));
+    setEntries(withNewIds);
+    saveToStorage(withNewIds);
+    return withNewIds.length;
+  }, []);
+
   return {
     entries,
     saveEntry,
@@ -240,9 +366,11 @@ export const useJournalHistory = () => {
     syncUnsyncedEntries,
     clearHistory,
     deleteEntry,
+    updateJournalEntry,
     getFormattedDate,
     exportAllJournals,
     importEntriesFromExport,
+    importEntriesReplaceAll,
     isExportPayload,
   };
 };

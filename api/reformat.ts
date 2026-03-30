@@ -1,7 +1,10 @@
 /// <reference types="node" />
 
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
-const NARRATOR_MODEL = "google/gemini-3.1-pro-preview";
+const NARRATOR_MODEL =
+  process.env.OPENROUTER_NARRATOR_MODEL?.trim() ||
+  process.env.OPENROUTER_CHAT_MODEL?.trim() ||
+  "openai/gpt-4.1-mini";
 
 const SYSTEM_PROMPT = `You are an expert editor. You will be given a transcript of a conversation between a User and a Selfmeridian assistant.
 TASK: Rewrite this conversation into a single, beautifully formatted, cohesive, first-person journal entry written from the User's perspective. The output should read like a polished diary entry.

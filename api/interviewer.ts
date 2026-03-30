@@ -1,7 +1,10 @@
 /// <reference types="node" />
 
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
-const INTERVIEWER_MODEL = "google/gemini-3.1-pro-preview";
+const INTERVIEWER_MODEL =
+  process.env.OPENROUTER_INTERVIEWER_MODEL?.trim() ||
+  process.env.OPENROUTER_CHAT_MODEL?.trim() ||
+  "openai/gpt-4.1-mini";
 
 type ChatMessage = { role: "user" | "ai"; text: string };
 

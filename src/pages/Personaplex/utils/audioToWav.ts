@@ -1,6 +1,7 @@
 /**
  * Converts a MediaRecorder blob (audio/webm or audio/mp4) to WAV format
  * for sending to Voxtral/OpenRouter which expects base64 WAV.
+ * Only use for short mic recordings — uploaded files should use blobToBase64.
  */
 export async function blobToWavBase64(blob: Blob): Promise<string> {
   const arrayBuffer = await blob.arrayBuffer();
@@ -12,6 +13,12 @@ export async function blobToWavBase64(blob: Blob): Promise<string> {
 
   audioContext.close();
   return base64;
+}
+
+/** Base64-encode a blob without format conversion (keeps mp3/m4a/etc. small). */
+export async function blobToBase64(blob: Blob): Promise<string> {
+  const buf = await blob.arrayBuffer();
+  return arrayBufferToBase64(buf);
 }
 
 function audioBufferToWav(audioBuffer: AudioBuffer): ArrayBuffer {

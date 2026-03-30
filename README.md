@@ -92,8 +92,9 @@ flowchart LR
     U[User] --> FE[React Frontend]
     FE --> VOICE[ElevenLabs Voice APIs]
     FE --> API[FastAPI Backend]
-    API --> CHAT[Grok / XAI for chat]
-    API --> GEM[Gemini for memory extraction and embeddings]
+    API --> CHAT[OpenRouter for chat]
+    API --> GEM[Gemini for extraction only]
+    API --> PPLX[Perplexity for embeddings]
     API --> DB[(SQLite + sqlite-vec)]
     API --> REC[Recommendations Engine]
     DB --> REC
@@ -115,7 +116,8 @@ sequenceDiagram
     Frontend->>Backend: /api/chat or /api/ingest-history
     Backend->>Gemini: Extract summary, facts, topics, people
     Gemini-->>Backend: Structured output
-    Backend->>DB: Save summary + facts + metadata
+    Backend->>Backend: Perplexity embeddings for vectors
+    Backend->>DB: Save summary + facts + metadata + vectors
     Frontend->>Backend: /api/recommendations
     Backend->>DB: Retrieve memory context
     Backend-->>Frontend: Personalized recommendations
@@ -131,18 +133,13 @@ sequenceDiagram
 | Voice | ElevenLabs | Speech-to-text and text-to-speech |
 | Main backend | FastAPI, LangGraph | Chat routes, memory sync, recommendations, auth, ingest |
 | Memory layer | SQLite, sqlite-vec | Persistent journal memory and vector search |
-| AI models | Gemini, Grok/XAI | Gemini for extraction/embeddings; Grok for conversational chat |
+| AI models | Perplexity, Gemini, OpenRouter | Perplexity for vector embeddings; Gemini or OpenRouter for extraction/helpers; OpenRouter for `/chat` (default GPT 5.4) |
 | Optional extras | LightRAG, Tavily, Semantic Scholar, Listen Notes | RAG, web/news search, paper lookup, podcast links |
 
-### Important note about OpenRouter
+### OpenRouter
 
-OpenRouter is **not the main path** for this project right now.
-
-- The current main app flow uses:
-  - **Gemini** for embeddings, memory extraction, and some supporting tasks
-  - **Grok/XAI** for the core journaling chat experience
-- There are still some older or convenience-oriented Node routes in the repo where a developer could choose to use OpenRouter if they want to experiment locally.
-- If you are just running or deploying the main app, think of **Gemini + Grok** as the primary setup.
+- **OpenRouter** powers the journal **`/chat`** interviewer (default model `openai/gpt-5.4` via `OPENROUTER_CHAT_MODEL`), plus journal validation and (when enabled) extraction/helpers alongside **Gemini**.
+- Set **`OPENROUTER_API_KEY`** in `.env` for chat to work.
 
 ---
 
@@ -153,8 +150,8 @@ OpenRouter is **not the main path** for this project right now.
 - **Node.js 18+**
 - **Python 3.11 recommended**
 - API keys for:
-  - `GEMINI_API_KEY`
-  - `XAI_API_KEY`
+  - `OPENROUTER_API_KEY`
+  - `GEMINI_API_KEY` (or rely on OpenRouter for extraction if configured)
   - `ELEVENLABS_API_KEY`
 
 Python 3.11 is strongly recommended because some optional libraries are awkward on Python 3.9.
@@ -174,8 +171,8 @@ Copy `.env.example` to `.env` in the project root.
 Minimum useful setup:
 
 ```env
+OPENROUTER_API_KEY=your_openrouter_key
 GEMINI_API_KEY=your_gemini_key
-XAI_API_KEY=your_xai_key
 ELEVENLABS_API_KEY=your_elevenlabs_key
 ```
 
@@ -276,7 +273,7 @@ flowchart TD
     FastAPI --> Routes[/API routes/]
     Routes --> SQLite[(SQLite + sqlite-vec)]
     Routes --> Gemini[Gemini APIs]
-    Routes --> Grok[Grok / XAI API]
+    Routes --> OpenRouter[OpenRouter API]
     Routes --> ElevenLabs[ElevenLabs API]
 ```
 
@@ -354,8 +351,9 @@ More backend-only detail (run, endpoints, Fly volume) is in **`backend/README.md
 
 | Variable | Purpose |
 |---|---|
-| `GEMINI_API_KEY` | Memory extraction, embeddings, date inference |
-| `XAI_API_KEY` | Grok chat model for `/api/chat` |
+| `GEMINI_API_KEY` | Extraction and Gemini helpers when using direct Google SDK (not embeddings) |
+| `PERPLEXITY_API_KEY` | Vector embeddings for gist / episodic / library (sqlite-vec) |
+| `OPENROUTER_API_KEY` | Chat (`/api/chat`), journal validation; optional `OPENROUTER_CHAT_MODEL` (default `openai/gpt-5.4`) |
 | `ELEVENLABS_API_KEY` | Voice transcription and voice playback |
 
 ### Common optional variables
@@ -363,10 +361,11 @@ More backend-only detail (run, endpoints, Fly volume) is in **`backend/README.md
 | Variable | Purpose |
 |---|---|
 | `JWT_SECRET` | Enables login / refresh-token auth |
+| `OPENROUTER_CHAT_MODEL` | Override `/chat` model on OpenRouter (default `openai/gpt-5.4`) |
 | `GEMINI_CHAT_MODEL` | Override backend Gemini model for helper tasks |
-| `GEMINI_EMBEDDING_MODEL` | Override embedding model |
-| `EMBEDDING_DIM` | Must match the embedding model output size |
-| `LIGHTRAG_ENABLED` | Turn LightRAG on or off |
+| `PERPLEXITY_EMBEDDING_MODEL` | e.g. `pplx-embed-context-v1-4b` (default) or `pplx-embed-v1-4b` |
+| `EMBEDDING_DIM` | Must match stored vector length (default `2560` for full Perplexity 4B embeddings) |
+| `LIGHTRAG_ENABLED` | Default off; set `true` to enable optional LightRAG (`lightrag_bridge.py`) |
 | `VECTOR_DB_PATH` | SQLite DB path, especially important in production |
 | `TAVILY_API_KEY` | Better article/news recommendations |
 | `SEMANTIC_SCHOLAR_API_KEY` | Better research paper recommendations |
@@ -376,7 +375,6 @@ More backend-only detail (run, endpoints, Fly volume) is in **`backend/README.md
 
 | Variable | Purpose |
 |---|---|
-| `OPENROUTER_API_KEY` | Optional for older local Node routes or experiments; not the main production path |
 | `API_PORT` | Local Node API dev port |
 | `VITE_API_URL` | Local proxy target |
 | `VITE_BACKEND_URL` | Frontend build-time backend URL if needed |
@@ -482,7 +480,7 @@ fly deploy
 | Issue | What to check |
 |-------|----------------|
 | **Recommendations feel generic** | Entries may be in History but not yet synced to backend memory. Open the Recommendations tab (sync runs automatically), or ensure `VECTOR_DB_PATH` is set and persistent (e.g. Fly volume). |
-| **Memory stats stay at 0** | Backend needs `GEMINI_API_KEY` and `XAI_API_KEY`. On Fly.io, set `VECTOR_DB_PATH` to a path on a mounted volume so the SQLite DB persists across deploys. |
+| **Memory stats stay at 0** | Backend needs `GEMINI_API_KEY` or OpenRouter extraction, plus `PERPLEXITY_API_KEY`, and `OPENROUTER_API_KEY` for `/chat`. On Fly.io, set `VECTOR_DB_PATH` to a path on a mounted volume so the SQLite DB persists across deploys. |
 | **502 or app unreachable on Fly.io** | App must listen on `0.0.0.0` and use the `PORT` env var (see `backend/Dockerfile`). |
 | **524 (timeout) in production** | Cloudflare (or another proxy) closes the connection when the origin doesn’t respond in time (~100s). The backend now times out ingest/recommendations before that. If you still see 524: increase the proxy’s **origin read timeout** to at least 100s, or use **DNS-only (grey cloud)** for this host so requests hit Fly.io directly. |
 | **Voice or API not working locally** | Ensure both the Python backend (port 8000) and `npm run dev` (frontend + Node API proxy) are running. |
@@ -501,13 +499,12 @@ If recommendations seem generic, it usually means one of these is true:
 
 ### Current model responsibilities
 
-- **Grok / XAI**: main journaling conversation
-- **Gemini**: embeddings, extraction, date inference, and helper generation
+- **OpenRouter**: journal `/chat` conversation (default `openai/gpt-5.4`), journal validation, optional extraction
+- **Perplexity**: vector embeddings for sqlite-vec (gist, episodic, library)
+- **Gemini**: extraction, date inference, and helper generation when not routed via OpenRouter (not embeddings)
 - **ElevenLabs**: speech input/output
 
 ### Optional or experimental pieces
-
-- **OpenRouter**: optional convenience for legacy Node-side experimentation
 - **LightRAG**: optional enrichment layer, not required for core memory sync
 
 ---
