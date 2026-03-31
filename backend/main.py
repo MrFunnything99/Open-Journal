@@ -80,7 +80,7 @@ def _instance_id(request: Request) -> str:
 sessions: dict[str, list] = {}
 library_interview_sessions: dict[str, list] = {}  # session_id -> list of {role, content}
 
-# Chat may run OpenRouter + tool round-trips + external API lookups (e.g. Open Library); keep headroom.
+# Chat may run OpenRouter + tool round-trips; keep headroom.
 CHAT_INVOKE_TIMEOUT_SEC = 180
 LIBRARY_INTERVIEW_TIMEOUT_SEC = 45
 
@@ -1300,6 +1300,8 @@ async def chat(req: ChatRequest, request: Request):
                 asyncio.to_thread(run_library_interview, list(messages), library_items, user_message),
                 timeout=LIBRARY_INTERVIEW_TIMEOUT_SEC,
             )
+        except asyncio.CancelledError:
+            raise HTTPException(status_code=499, detail="Request cancelled")
         except asyncio.TimeoutError:
             return ChatResponse(
                 response="That took a bit long—try again in a moment.",
@@ -1346,10 +1348,16 @@ async def chat(req: ChatRequest, request: Request):
             asyncio.to_thread(chat_graph.invoke, state),
             timeout=CHAT_INVOKE_TIMEOUT_SEC,
         )
+    except asyncio.CancelledError:
+        try:
+            messages.pop()
+        except IndexError:
+            pass
+        # Avoid ASGI "500" noise when the client disconnects or the server is stopping mid-request.
+        raise HTTPException(status_code=499, detail="Request cancelled")
     except asyncio.TimeoutError:
         messages.pop()
         print("[backend] /chat timed out after %ss" % CHAT_INVOKE_TIMEOUT_SEC)
-        from fastapi import HTTPException
         raise HTTPException(
             status_code=504,
             detail=f"Chat took longer than {CHAT_INVOKE_TIMEOUT_SEC}s (LLM or memory slow). Try again or lower personalization.",
@@ -1448,6 +1456,8 @@ async def library_interview(req: LibraryInterviewRequest, request: Request):
             ),
             timeout=LIBRARY_INTERVIEW_TIMEOUT_SEC,
         )
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=499, detail="Request cancelled")
     except asyncio.TimeoutError:
         return LibraryInterviewResponse(
             response="That took a bit long—try again in a moment.",

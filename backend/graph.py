@@ -28,7 +28,6 @@ from library import (
     ingest_journal_entry,
     resolve_books_via_openlibrary,
     save_resolved_books,
-    _validate_books_via_llm,
 )
 from agent_site_tools import (
     log_tool_invocation,
@@ -132,8 +131,8 @@ LIBRARY_ITEMS_TOOL = {
         "name": "add_library_items",
         "description": (
             "Save podcasts, articles, or research papers the user has finished (or wants logged) into their "
-            "Library for recommendations. For BOOKS, always use extract_books_read instead — it verifies "
-            "spelling via Open Library. Use this tool when they paste a list, enumerate several titles, or ask to "
+            "Library for recommendations. For BOOKS, always use extract_books_read instead — it normalizes "
+            "title/author via the same LLM stack as chat. Use this tool when they paste a list, enumerate several titles, or ask to "
             "add/track what they listened to or read (non-book). Use correct type per item. "
             "Leave url empty unless they gave a real link. "
             "Do NOT use for hypothetical picks, things they might read later, or casual single mentions unless "
@@ -366,7 +365,7 @@ EXTRACT_BOOKS_READ_TOOL = {
             "Extract books the user mentions having read, finished, or consumed during conversation. "
             "Use this when the user says they read a book, finished a book, loved a book, etc. — even if "
             "mentioned casually or indirectly (e.g. 'I just finished Dune' or 'that Brené Brown book was great'). "
-            "Extract the raw title and author as the user said them; the backend will verify spelling and metadata. "
+            "Extract the raw title and author as the user said them; the backend will normalize title/author with the LLM. "
             "Include any opinion or short comment the user expressed as a note (e.g. 'it was good', 'didn't love the ending'). "
             "Do NOT use add_library_items for books — always use this tool instead."
         ),
@@ -551,7 +550,6 @@ def _interviewer_run_with_tools(
                 try:
                     raw_books = args.get("books", [])
                     resolved = resolve_books_via_openlibrary(raw_books)
-                    resolved = _validate_books_via_llm(resolved)
                     n, labels = save_resolved_books(resolved, instance_id)
                     total_saved += n
                     result = {"ok": True, "books_saved": n, "saved": labels[:24]}
@@ -731,7 +729,7 @@ def interviewer_node(state: JournalState) -> JournalState:
             "At high levels, you may ask more direct questions when it feels supportive, while still respecting boundaries. ",
             "When the user asks 'what should we talk about?' or 'what should we explore?', you may offer 1–2 broad areas if the memory context clearly suggests them; otherwise keep it open: 'Whatever feels most present—we can go wherever you'd like.' ",
             "When the user mentions a **book** they read, finished, or enjoyed (even casually), call **extract_books_read** — "
-            "the backend will verify the title/author spelling via Open Library and save clean data automatically. "
+            "the backend will normalize title/author with the configured OpenRouter model and save to the library. "
             "Use **add_library_items** only for non-book media (podcasts, articles, research). "
             "Use **update_library_item** to change an existing library item's **note** or **date_completed** when they ask to edit, rename phrasing in a note, or fix metadata (prefer **title_query** if you don't have an id). "
             "Use **mark_recommendation_consumed** when they say they finished or consumed a recommendation. "

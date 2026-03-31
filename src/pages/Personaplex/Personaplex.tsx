@@ -102,7 +102,7 @@ const KB_UPLOAD_CONFIRM_MESSAGE =
   "Continue?";
 
 const JOURNAL_FOLDER_UPLOAD_CONFIRM_MESSAGE =
-  "Import all journal files from the selected folder? New entries will be added to your knowledge base.";
+  "Import journal files from the selected folder or chosen files? New entries will be added to your knowledge base.";
 
 type LibraryBulkImportPayloadItem = {
   id: string;

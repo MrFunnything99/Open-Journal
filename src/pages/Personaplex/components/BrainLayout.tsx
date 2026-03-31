@@ -170,7 +170,7 @@ const CAT_LABEL: Record<BrainLibraryCategory, string> = {
 const knowledgeBaseToolbarBtnClass =
   "rounded-full border border-gray-300 bg-transparent px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-100 dark:border-white/20 dark:text-white/85 dark:hover:bg-white/10";
 const journalDumpBtnClass =
-  "w-full rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-left text-xs font-medium text-white/80 transition-colors hover:bg-white/10 hover:text-white";
+  "flex-1 min-w-0 rounded-xl border border-white/15 bg-white/5 px-2 py-2 text-center text-xs font-medium text-white/80 transition-colors hover:bg-white/10 hover:text-white leading-snug";
 
 export const BrainLayout: FC<BrainLayoutProps> = ({
   entries,
@@ -212,6 +212,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const moreRef = useRef<HTMLDivElement>(null);
   const knowledgeBaseFileRef = useRef<HTMLInputElement>(null);
   const journalDumpFolderRef = useRef<HTMLInputElement>(null);
+  const journalDumpFilesRef = useRef<HTMLInputElement>(null);
 
   const openKnowledgeBaseFilePicker = useCallback(() => {
     if (onPrepareKnowledgeBaseUpload && !onPrepareKnowledgeBaseUpload()) return;
@@ -222,6 +223,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
     if (onPrepareJournalDumpUpload && !onPrepareJournalDumpUpload()) return;
     journalDumpFolderRef.current?.click();
   }, [onPrepareJournalDumpUpload]);
+
+  const openJournalDumpFilesPicker = useCallback(() => {
+    if (onPrepareJournalDumpUpload && !onPrepareJournalDumpUpload()) return;
+    journalDumpFilesRef.current?.click();
+  }, [onPrepareJournalDumpUpload]);
+
   const [journalEditing, setJournalEditing] = useState(false);
   const [journalDraft, setJournalDraft] = useState<ChatMessage[]>([]);
   const [writingHints, setWritingHints] = useState<{
@@ -870,14 +877,36 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 e.target.value = "";
               }}
             />
-            <button
-              type="button"
-              className={journalDumpBtnClass}
-              onClick={openJournalDumpFolderPicker}
-              title="Import a folder like Journal/YYYY-MM/YYYY-MM-DD.md"
-            >
-              Journal dump upload
-            </button>
+            <input
+              ref={journalDumpFilesRef}
+              type="file"
+              multiple
+              accept=".md,text/markdown,.txt,text/plain"
+              className="hidden"
+              aria-hidden
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) onImportJournalDumpFolder(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className={journalDumpBtnClass}
+                onClick={openJournalDumpFolderPicker}
+                title="Import a folder like Journal/YYYY-MM/YYYY-MM-DD.md"
+              >
+                Journal dump upload
+              </button>
+              <button
+                type="button"
+                className={journalDumpBtnClass}
+                onClick={openJournalDumpFilesPicker}
+                title="Pick one or more .md/.txt files; date comes from filename (e.g. YYYY-MM-DD.md) or file contents, same as folder import"
+              >
+                Individual journal(s)
+              </button>
+            </div>
           </div>
         )}
       </aside>
@@ -1416,7 +1445,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 <p className="mb-6 text-sm leading-relaxed text-gray-500 dark:text-gray-400">
                   Import a Markdown <strong className="font-medium text-gray-700 dark:text-gray-300">.zip</strong> to load journals,
                   conversations, and library items. Or use <strong className="font-medium text-gray-700 dark:text-gray-300">Journal dump upload</strong>{" "}
-                  in the sidebar — folder of <code className="rounded bg-gray-200/80 px-1 text-xs dark:bg-black/30">.md</code> files.
+                  or <strong className="font-medium text-gray-700 dark:text-gray-300">Individual journal(s)</strong> in the sidebar — a folder or
+                  separate <code className="rounded bg-gray-200/80 px-1 text-xs dark:bg-black/30">.md</code> files (dates from names or file content).
                   New entries from the Assistant show up here after you save.
                 </p>
                 {onImportKnowledgeBaseFile ? (

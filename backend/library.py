@@ -608,12 +608,22 @@ def apply_library_tool_items(items: object, instance_id: str = "") -> tuple[int,
     return added, labels
 
 
+# --- Open Library HTTP (disabled): constants + helpers kept for when we re-enable catalog lookup. ---
 OPENLIBRARY_SEARCH_URL = "https://openlibrary.org/search.json"
 OPENLIBRARY_USER_AGENT = os.getenv(
     "OPENLIBRARY_USER_AGENT",
     "SelfMeridian/1.0 (https://github.com/MrFunnything99/Open-Journal)",
 )
 OPENLIBRARY_THROTTLE_SEC = 0.2
+
+
+def _openlibrary_http_timeout_sec() -> float:
+    """Unused while Open Library queries are stubbed out."""
+    try:
+        v = float(os.getenv("OPENLIBRARY_HTTP_TIMEOUT_SEC", "3.5"))
+    except ValueError:
+        v = 3.5
+    return max(1.0, min(v, 30.0))
 
 
 _DERIVATIVE_TITLE_PATTERNS = [
@@ -679,46 +689,13 @@ _OL_FIELDS = "title,author_name,language,isbn,first_publish_year,subject,cover_i
 
 
 def _query_openlibrary_structured(raw_title: str, raw_author: str | None = None) -> list[dict]:
-    """Search Open Library with structured title/author params."""
-    params: dict[str, str] = {
-        "title": raw_title,
-        "limit": "8",
-        "fields": _OL_FIELDS,
-        "language": "eng",
-    }
-    if raw_author:
-        params["author"] = raw_author
-    url = f"{OPENLIBRARY_SEARCH_URL}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": OPENLIBRARY_USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[backend] Open Library structured query failed for '{raw_title}': {e}")
-        return []
-    return data.get("docs") or []
+    """DISABLED — restore urllib GET to OPENLIBRARY_SEARCH_URL (structured params) when re-enabling OL."""
+    return []
 
 
 def _query_openlibrary_freetext(raw_title: str, raw_author: str | None = None) -> list[dict]:
-    """Search Open Library with the q= freetext param (fuzzy, handles misspellings)."""
-    q_parts = [raw_title]
-    if raw_author:
-        q_parts.append(raw_author)
-    params: dict[str, str] = {
-        "q": " ".join(q_parts),
-        "limit": "8",
-        "fields": _OL_FIELDS,
-        "language": "eng",
-    }
-    url = f"{OPENLIBRARY_SEARCH_URL}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": OPENLIBRARY_USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[backend] Open Library freetext query failed for '{raw_title}': {e}")
-        return []
-    return data.get("docs") or []
+    """DISABLED — restore urllib GET with q= freetext when re-enabling OL."""
+    return []
 
 
 def _author_prefix_match(raw_author: str, candidate_authors: list[str], min_prefix: int = 4) -> bool:
@@ -787,111 +764,109 @@ def _score_docs(docs: list[dict], raw_title: str, raw_author: str | None = None)
 
 
 def _resolve_book_openlibrary(raw_title: str, raw_author: str | None = None) -> dict:
-    """
-    Query Open Library for the canonical title and author.
-    Retry chain: title+author (strict) → q=title+author (fuzzy) → title-only (last resort).
-    Scores results by title proximity, English preference, and author-word-prefix similarity.
-    Filters publishers masquerading as authors.
-    """
-    fallback = {"title": raw_title or "", "author": raw_author or "",
-                 "isbn": "", "publish_year": "", "openlibrary_key": "",
-                 "cover_url": "", "subjects": ""}
-    if not raw_title:
-        return fallback
-
-    docs = _query_openlibrary_structured(raw_title, raw_author)
-
-    if not docs and raw_author:
-        title_docs = _query_openlibrary_structured(raw_title, None)
-        q_docs = _query_openlibrary_freetext(raw_title, raw_author)
-        seen_titles = set()
-        docs = []
-        for d in title_docs + q_docs:
-            key = (d.get("title", ""), str(d.get("author_name", [])))
-            if key not in seen_titles:
-                seen_titles.add(key)
-                docs.append(d)
-
-    if not docs:
-        return fallback
-
-    scored = _score_docs(docs, raw_title, raw_author)
-
-    if scored:
-        scored.sort(key=lambda x: -x[0])
-        top = scored[0][1]
-    else:
-        top = docs[0]
-
-    canonical_title = _clean_title((top.get("title") or raw_title or "").strip(), raw_title)
-    authors = top.get("author_name") or []
-    canonical_author = _pick_clean_author(authors, raw_author)
-
-    isbns = top.get("isbn") or []
-    isbn13 = next((i for i in isbns if len(i) == 13 and i.isdigit()), "")
-    if not isbn13:
-        isbn10 = next((i for i in isbns if len(i) == 10), "")
-        if isbn10:
-            isbn13 = _isbn10_to_13(isbn10)
-
-    publish_year = str(top.get("first_publish_year") or "")
-    ol_key = (top.get("key") or "").strip()
-    cover_id = top.get("cover_i")
-    cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else ""
-    subjects_raw = top.get("subject") or []
-    subjects = ", ".join(s.strip() for s in subjects_raw[:5] if s.strip())
-
+    """DISABLED — was: full Open Library resolution. Restore implementation from git when re-enabling OL."""
     return {
-        "title": canonical_title,
-        "author": canonical_author,
-        "isbn": isbn13,
-        "publish_year": publish_year,
-        "openlibrary_key": ol_key,
-        "cover_url": cover_url,
-        "subjects": subjects,
+        "title": raw_title or "",
+        "author": raw_author or "",
+        "isbn": "",
+        "publish_year": "",
+        "openlibrary_key": "",
+        "cover_url": "",
+        "subjects": "",
     }
+
+
+_BOOK_VALIDATION_MODEL = os.getenv("OPENROUTER_BOOK_VALIDATION_MODEL", "openai/gpt-4.1-mini")
+
+_BOOK_TOOL_NORMALIZE_PROMPT = """The user mentioned these books in conversation. For each entry, output a clean standard English title and the primary author (fix typos and casing for well-known books).
+Return ONLY a JSON array — same length and order as the input. Each element: {"title":"...","author":"..."}.
+Use "" for author only if unknown. No markdown, no explanation.
+
+Input:
+"""
 
 
 def resolve_books_via_openlibrary(
     books: list[dict],
 ) -> list[dict]:
     """
-    Takes the raw array from the extract_books_read tool call and resolves
-    each book against Open Library with a 1-second throttle between requests.
-    Returns enriched dicts with canonical title/author plus original liked/note.
+    Normalize title/author via OpenRouter (OPENROUTER_BOOK_VALIDATION_MODEL), then save_resolved_books.
+    Open Library HTTP is stubbed; re-enable by restoring _query_openlibrary_* and _resolve_book_openlibrary bodies.
     """
     resolved: list[dict] = []
-    for i, raw in enumerate(books):
+    for raw in books:
         if not isinstance(raw, dict):
             continue
         raw_title = (raw.get("raw_title") or "").strip()
         raw_author = (raw.get("raw_author") or "").strip() or None
         if not raw_title:
             continue
-
-        if i > 0:
-            time.sleep(OPENLIBRARY_THROTTLE_SEC)
-
-        match = _resolve_book_openlibrary(raw_title, raw_author)
         resolved.append({
             "type": "book",
-            "title": match["title"],
-            "author": match["author"] or None,
+            "title": raw_title,
+            "author": raw_author,
             "raw_title": raw_title,
             "raw_author": raw_author,
             "liked": raw.get("liked", True),
             "note": (raw.get("note") or "").strip() or None,
-            "isbn": match.get("isbn", ""),
-            "publish_year": match.get("publish_year", ""),
-            "openlibrary_key": match.get("openlibrary_key", ""),
-            "cover_url": match.get("cover_url", ""),
-            "subjects": match.get("subjects", ""),
+            "isbn": "",
+            "publish_year": "",
+            "openlibrary_key": "",
+            "cover_url": "",
+            "subjects": "",
         })
+
+    if not resolved or not openrouter_api_configured():
+        return resolved
+
+    batch_size = 12
+    for start in range(0, len(resolved), batch_size):
+        batch = resolved[start : start + batch_size]
+        payload = [
+            {
+                "raw_title": b.get("raw_title", ""),
+                "raw_author": str(b.get("raw_author") or ""),
+            }
+            for b in batch
+        ]
+        prompt = _BOOK_TOOL_NORMALIZE_PROMPT + json.dumps(payload, ensure_ascii=False)
+        try:
+            raw = _openrouter_chat_completion(
+                prompt,
+                model=_BOOK_VALIDATION_MODEL,
+                temperature=0.1,
+                timeout_sec=45,
+                max_tokens=2048,
+            )
+            raw = (raw or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            corrections = json.loads(raw)
+            if not isinstance(corrections, list) or len(corrections) != len(batch):
+                print(
+                    f"[backend] Book normalize batch: expected {len(batch)} items, got "
+                    f"{len(corrections) if isinstance(corrections, list) else 'non-list'} — skip"
+                )
+                continue
+            for k, correction in enumerate(corrections):
+                if not isinstance(correction, dict):
+                    continue
+                idx = start + k
+                new_title = (correction.get("title") or "").strip()
+                new_author = (correction.get("author") or "").strip()
+                if new_title:
+                    resolved[idx]["title"] = new_title
+                if new_author:
+                    resolved[idx]["author"] = new_author
+                elif correction.get("author") == "":
+                    resolved[idx]["author"] = None
+        except Exception as e:
+            print(f"[backend] Book normalize LLM error (non-fatal): {e}")
+
     return resolved
 
 
-_BOOK_VALIDATION_MODEL = os.getenv("OPENROUTER_BOOK_VALIDATION_MODEL", "openai/gpt-4.1-mini")
-
+# Kept for when Open Library + second LLM pass are restored alongside catalog results.
 _BOOK_VALIDATION_PROMPT = """You validate book metadata from a catalog search. Some entries have wrong authors (publisher, adapter, or summary writer instead of the real author) or wrong titles (non-English, adaptation, or subtitle appended).
 
 For each entry, output the correct canonical English title and the original author's full name.
@@ -903,7 +878,7 @@ If already correct, return unchanged. No markdown, no explanation.
 
 def _validate_books_via_llm(resolved: list[dict]) -> list[dict]:
     """
-    LLM verification pass to catch author/title mismatches the catalog search missed.
+    Second LLM pass when Open Library catalog results need cleanup (unused while OL is disabled).
     Processes in batches of 10 to stay within token limits.
     """
     if not resolved or not openrouter_api_configured():
