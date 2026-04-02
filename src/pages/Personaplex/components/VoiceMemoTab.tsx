@@ -100,9 +100,16 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const [journalEntryTime, setJournalEntryTime] = useState("");
   const [savingJournal, setSavingJournal] = useState(false);
   const [journalMessages, setJournalMessages] = useState<ChatMessage[]>([]);
-  /** True when the current draft originated from an AI-Assisted handoff (determines entrySource on save). */
-  const [assistedHandoff, setAssistedHandoff] = useState(false);
   const [readAloudBusy, setReadAloudBusy] = useState(false);
+
+  // --- AI-Assisted Finalizer (distinct from Manual Journal editor) ---
+  const [finalizerOpen, setFinalizerOpen] = useState(false);
+  const [finalizerText, setFinalizerText] = useState("");
+  const [finalizerMessages, setFinalizerMessages] = useState<ChatMessage[]>([]);
+  const [finalizerDate, setFinalizerDate] = useState("");
+  const [finalizerTime, setFinalizerTime] = useState("");
+  const [finalizerSaving, setFinalizerSaving] = useState(false);
+  const [finalizerCleanupBusy, setFinalizerCleanupBusy] = useState(false);
 
   const listRef = useRef<HTMLDivElement>(null);
   const journalScrollRef = useRef<HTMLDivElement>(null);
@@ -145,27 +152,85 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const handoffAssistedToJournal = useCallback(() => {
     if (chatInteractionMode !== "autobiography" || sending || messages.length === 0) return;
     const transcript = personaplexChatToJournalTranscript(messages);
-    setJournalMessages(transcript);
-    setAssistedHandoff(true);
-    setReviewText("");
-    setRawTranscript("");
-    setError(null);
+    const fullText = transcript.map((m) => {
+      const label = m.role === "user" ? "You" : "AI";
+      return `### ${label}\n\n${m.text}`;
+    }).join("\n\n---\n\n");
+    setFinalizerMessages(transcript);
+    setFinalizerText(fullText);
     const now = new Date();
-    if (!journalEntryDate) setJournalEntryDate(toDateInputValue(now));
-    if (!journalEntryTime) setJournalEntryTime(toTimeInputValue(now));
-    setChatInteractionMode("journal");
-    resetAssistedWorkspace();
-    onToast("Edit your reflection below, then tap Save to journal.");
+    setFinalizerDate(toDateInputValue(now));
+    setFinalizerTime(toTimeInputValue(now));
+    setFinalizerOpen(true);
+  }, [chatInteractionMode, sending, messages]);
+
+  const finalizerDismiss = useCallback(() => {
+    setFinalizerOpen(false);
+    setFinalizerText("");
+    setFinalizerMessages([]);
+    setFinalizerDate("");
+    setFinalizerTime("");
+  }, []);
+
+  const finalizerSave = useCallback(async () => {
+    if (!saveEntry || finalizerSaving) return;
+    if (!finalizerDate.trim() || !finalizerTime.trim()) {
+      onToast("Set entry date and time before saving.");
+      return;
+    }
+    const edited = finalizerText.trim();
+    const transcript: ChatMessage[] = edited
+      ? [{ role: "user" as const, text: edited }]
+      : finalizerMessages;
+    if (transcript.length === 0) {
+      onToast("Nothing to save.");
+      return;
+    }
+    const dateIso = dateAndTimeToIso(finalizerDate, finalizerTime);
+    setFinalizerSaving(true);
+    try {
+      const id = saveEntry(transcript, dateIso, "conversation");
+      if (!id) { onToast("Could not save."); return; }
+      void syncUnsyncedEntries?.();
+      onToast("Saved to your journal.");
+      finalizerDismiss();
+      resetAssistedWorkspace();
+    } finally {
+      setFinalizerSaving(false);
+    }
   }, [
-    chatInteractionMode,
-    sending,
-    messages,
-    journalEntryDate,
-    journalEntryTime,
-    resetAssistedWorkspace,
-    setChatInteractionMode,
-    onToast,
+    saveEntry, syncUnsyncedEntries, finalizerSaving,
+    finalizerText, finalizerMessages,
+    finalizerDate, finalizerTime,
+    onToast, finalizerDismiss, resetAssistedWorkspace,
   ]);
+
+  const finalizerCleanup = useCallback(async () => {
+    const text = finalizerText.trim();
+    if (!text || finalizerCleanupBusy) return;
+    setFinalizerCleanupBusy(true);
+    try {
+      const res = await backendFetch("/journal-cleanup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { detail?: string; cleaned_text?: string };
+      if (!res.ok) {
+        const d = data.detail;
+        throw new Error(typeof d === "string" ? d : `Correction failed (${res.status})`);
+      }
+      const cleaned = (data.cleaned_text ?? "").trim();
+      if (!cleaned) throw new Error("No corrected text returned.");
+      setFinalizerText(cleaned);
+      onToast("Spelling and formatting applied.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Correction failed";
+      onToast(msg);
+    } finally {
+      setFinalizerCleanupBusy(false);
+    }
+  }, [finalizerText, finalizerCleanupBusy, onToast]);
 
   const readAloud = useCallback(
     (text: string) => {
@@ -231,7 +296,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       if (line) {
         const capturedAt = new Date();
         const rawBody = ((data.raw_transcript ?? "").trim() || line).trim();
-        // Manual Journal Mode: show raw transcript only; use "AI Journal Cleanup" for the polish pass.
+        // Manual Journal Mode: show raw transcript only; polish via "AI Spelling Correction/Reformatting".
         const reviewBody = !isJournal && data.cleaned_transcript?.trim()
           ? data.cleaned_transcript.trim()
           : rawBody;
@@ -344,14 +409,14 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       };
       if (!res.ok) {
         const d = data.detail;
-        throw new Error(typeof d === "string" ? d : `Cleanup failed (${res.status})`);
+        throw new Error(typeof d === "string" ? d : `Correction failed (${res.status})`);
       }
       const cleaned = (data.cleaned_text ?? "").trim();
-      if (!cleaned) throw new Error("Cleanup returned empty text.");
+      if (!cleaned) throw new Error("No corrected text returned.");
       setReviewText(cleaned);
-      onToast("Journal text cleaned.");
+      onToast("Spelling and formatting applied.");
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Cleanup failed";
+      const msg = e instanceof Error ? e.message : "Correction failed";
       setError(msg);
       onToast(msg);
     } finally {
@@ -363,7 +428,6 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     setRawTranscript("");
     setReviewText("");
     setJournalMessages([]);
-    setAssistedHandoff(false);
     setJournalEntryDate("");
     setJournalEntryTime("");
     setError(null);
@@ -392,8 +456,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     const dateIso = dateAndTimeToIso(journalEntryDate, journalEntryTime);
     setSavingJournal(true);
     try {
-      const source = assistedHandoff ? "conversation" : "journal";
-      const id = saveEntry(transcript, dateIso, source);
+      const id = saveEntry(transcript, dateIso, "journal");
       if (!id) {
         onToast("Could not save.");
         return;
@@ -407,7 +470,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     }
   }, [
     saveEntry, syncUnsyncedEntries, savingJournal,
-    journalMessages, reviewText, assistedHandoff,
+    journalMessages, reviewText,
     journalEntryDate, journalEntryTime,
     onToast, startAnotherEntry, resetAssistedWorkspace,
   ]);
@@ -471,7 +534,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const hasConversation = messages.length > 0 || sending;
   const assistedHero =
     chatInteractionMode === "autobiography" && !isChatActive && !hasConversation;
-  const showAssistedBottomComposer = chatInteractionMode === "autobiography" && !assistedHero;
+  const showAssistedBottomComposer =
+    chatInteractionMode === "autobiography" && !assistedHero && !finalizerOpen;
 
   const errorBanner = (error || chatError) && (
     <div className="glass-panel mb-6 rounded-2xl px-4 py-3 text-sm text-red-200">{error || chatError}</div>
@@ -704,7 +768,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                         disabled={!reviewText.trim() || journalCleanupBusy || gettingFeedback}
                         className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
                       >
-                        {journalCleanupBusy ? "Cleaning up…" : "AI Journal Cleanup"}
+                        {journalCleanupBusy ? "Applying…" : "AI Spelling Correction/Reformatting"}
                       </button>
                       <button
                         type="button"
@@ -732,7 +796,96 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
               </div>
           )}
 
-          {chatInteractionMode === "autobiography" && assistedHero && (
+          {chatInteractionMode === "autobiography" && finalizerOpen && (
+            <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-6 md:px-6 md:py-8">
+              {errorBanner}
+
+              <div className="glass-panel rounded-2xl border border-white/10 px-4 py-4 md:px-5">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/50">
+                      AI-Assisted Journal
+                    </p>
+                    <p className="mt-1 text-sm text-white/70">
+                      Polish your reflection, then save.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={finalizerDismiss}
+                    className="rounded-lg px-2 py-1 text-[0.65rem] font-medium text-white/50 hover:bg-white/10 hover:text-white"
+                  >
+                    Cancel
+                  </button>
+                </div>
+
+                <div className="mt-3 flex flex-wrap items-end gap-3">
+                  <div className="flex flex-wrap items-end gap-2">
+                    <div className="flex flex-col gap-0.5">
+                      <label className="text-[0.6rem] text-white/45" htmlFor={`${idPrefix}-fdate`}>
+                        Date
+                      </label>
+                      <input
+                        id={`${idPrefix}-fdate`}
+                        type="date"
+                        value={finalizerDate}
+                        onChange={(e) => setFinalizerDate(e.target.value)}
+                        className="rounded-lg border border-white/15 bg-black/30 px-2 py-1 text-xs text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-0.5">
+                      <label className="text-[0.6rem] text-white/45" htmlFor={`${idPrefix}-ftime`}>
+                        Time
+                      </label>
+                      <input
+                        id={`${idPrefix}-ftime`}
+                        type="time"
+                        value={finalizerTime}
+                        onChange={(e) => setFinalizerTime(e.target.value)}
+                        className="rounded-lg border border-white/15 bg-black/30 px-2 py-1 text-xs text-white focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <textarea
+                  value={finalizerText}
+                  onChange={(e) => setFinalizerText(e.target.value)}
+                  rows={12}
+                  placeholder="Your AI-assisted reflection…"
+                  className="mt-3 w-full resize-y rounded-xl border border-white/15 bg-black/25 px-3 py-3 text-sm leading-relaxed text-white placeholder:text-white/40 focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
+                  style={{ minHeight: "12rem" }}
+                />
+
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void finalizerSave()}
+                    disabled={
+                      finalizerSaving ||
+                      finalizerCleanupBusy ||
+                      !finalizerDate.trim() ||
+                      !finalizerTime.trim() ||
+                      (!finalizerText.trim() && finalizerMessages.length === 0)
+                    }
+                    className="rounded-full bg-white px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-50"
+                  >
+                    {finalizerSaving ? "Saving…" : "Save to journal"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void finalizerCleanup()}
+                    disabled={!finalizerText.trim() || finalizerCleanupBusy || finalizerSaving}
+                    className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
+                  >
+                    {finalizerCleanupBusy ? "Applying…" : "AI Spelling Correction/Reformatting"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {chatInteractionMode === "autobiography" && !finalizerOpen && assistedHero && (
             <div className="flex min-h-[min(55vh,560px)] flex-1 flex-col items-center justify-center gap-6 px-4 py-8 text-center sm:min-h-[50vh]">
               <h1 className="max-w-lg text-[1.65rem] font-normal leading-snug tracking-tight text-white sm:text-3xl md:text-[1.75rem]">
                 What can I help with?
@@ -747,7 +900,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
             </div>
           )}
 
-          {chatInteractionMode === "autobiography" && !assistedHero && (
+          {chatInteractionMode === "autobiography" && !finalizerOpen && !assistedHero && (
             <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-8 md:px-6">
               {errorBanner}
 

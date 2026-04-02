@@ -13,7 +13,7 @@ export const CHAT_INTERACTION_MODE_META: Record<
     sublabel: "Reflect",
     composerChipLabel: "Manual Journal Mode",
     description:
-      "Your private writing space: type or dictate, optionally run AI Journal Cleanup, get feedback, and save. Switch to AI-Assisted Journal Mode when you want a reflective chat with the model.",
+      "Your private writing space: type or dictate, optionally run AI Spelling Correction/Reformatting, get feedback, and save. Switch to AI-Assisted Journal Mode when you want a reflective chat with the model.",
   },
   autobiography: {
     label: "AI-Assisted Journal Mode",

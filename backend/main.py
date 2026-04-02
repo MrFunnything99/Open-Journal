@@ -2522,7 +2522,7 @@ async def api_voice_memo(req: VoiceMemoRequest):
     print(f"[backend] voice-memo: transcribe done in {_t1 - _t0:.1f}s ({transcribe_engine})")
 
     if req.journal_mode:
-        # Journal Mode on Home: transcribe only; AI cleanup runs when the user taps "AI Journal Cleanup".
+        # Journal Mode on Home: transcribe only; polish runs when the user taps AI Spelling Correction/Reformatting.
         polished = raw_transcript or ""
         did_polish = False
         cleaned = ""
