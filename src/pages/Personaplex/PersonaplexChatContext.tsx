@@ -39,6 +39,7 @@ function parseNavigateActions(raw: unknown): PersonaplexNavigateAction[] {
   return out;
 }
 import { backendFetch } from "../../backendApi";
+import type { ChatMessage } from "./hooks/useJournalHistory";
 import type { ChatInteractionMode } from "./chatInteractionModes";
 import {
   DEFAULT_USER_CHAT_MODEL,
@@ -69,15 +70,6 @@ export type AgentActivityEntry = {
   detail?: string;
 };
 
-export type ChatRecentEntry = {
-  sessionId: string;
-  title: string;
-  updatedAt: number;
-};
-
-/** Bump key to reset persisted sidebar recents (e.g. after UX changes or local testing). */
-const RECENTS_STORAGE_KEY = "personaplex-chat-recents-v2";
-const MAX_RECENTS = 14;
 const MAX_ACTIVITY = 60;
 
 export function defaultFilenameForMicBlob(mimeType: string): string {
@@ -102,33 +94,12 @@ function effectiveRecorderMime(recorder: MediaRecorder): string {
   return "audio/webm";
 }
 
-function readRecentsFromStorage(): ChatRecentEntry[] {
-  try {
-    const raw = localStorage.getItem(RECENTS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(
-        (x): x is ChatRecentEntry =>
-          x &&
-          typeof x === "object" &&
-          typeof (x as ChatRecentEntry).sessionId === "string" &&
-          typeof (x as ChatRecentEntry).title === "string" &&
-          typeof (x as ChatRecentEntry).updatedAt === "number"
-      )
-      .slice(0, MAX_RECENTS);
-  } catch {
-    return [];
-  }
-}
-
-function writeRecentsToStorage(entries: ChatRecentEntry[]) {
-  try {
-    localStorage.setItem(RECENTS_STORAGE_KEY, JSON.stringify(entries.slice(0, MAX_RECENTS)));
-  } catch {
-    /* ignore */
-  }
+/** Map Personaplex /chat messages to journal transcript format (AI-Assisted Journal handoff / tab-close save). */
+export function personaplexChatToJournalTranscript(messages: PersonaplexChatMessage[]): ChatMessage[] {
+  return messages.map((m) => ({
+    role: m.role === "user" ? "user" : "ai",
+    text: m.content,
+  }));
 }
 
 /** Minimal typing for browser Speech Recognition (Chrome / Safari). */
@@ -186,12 +157,12 @@ type PersonaplexChatContextValue = {
   composerDisabled: boolean;
   activityLog: AgentActivityEntry[];
   clearActivityLog: () => void;
-  chatRecents: ChatRecentEntry[];
-  loadRecentSession: (sessionId: string) => Promise<void>;
   newChat: () => void;
+  /** Clear assisted /chat workspace (after handoff to journal or intentional new reflection). */
+  resetAssistedWorkspace: () => void;
   chatInteractionMode: ChatInteractionMode;
   setChatInteractionMode: (m: ChatInteractionMode) => void;
-  /** OpenRouter model for Conversation + Assisted Journal only. */
+  /** OpenRouter model for AI-Assisted Journal Mode only (/chat with tools + model picker). */
   userChatModel: UserSelectableChatModelId;
   setUserChatModel: (id: UserSelectableChatModelId) => void;
 };
@@ -227,14 +198,11 @@ export function PersonaplexChatProvider({
   const [liveDictationText, setLiveDictationText] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
   const [isChatActive, setIsChatActive] = useState(false);
-  const [chatInteractionMode, setChatInteractionMode] = useState<ChatInteractionMode>("conversation");
+  const [chatInteractionMode, setChatInteractionMode] = useState<ChatInteractionMode>("journal");
   const [userChatModel, setUserChatModelState] = useState<UserSelectableChatModelId>(() =>
     typeof window !== "undefined" ? readStoredUserChatModel() : DEFAULT_USER_CHAT_MODEL
   );
   const [activityLog, setActivityLog] = useState<AgentActivityEntry[]>([]);
-  const [chatRecents, setChatRecents] = useState<ChatRecentEntry[]>(() =>
-    typeof window !== "undefined" ? readRecentsFromStorage() : []
-  );
 
   const [pendingAudioFile, setPendingAudioFile] = useState<File | null>(null);
   const [journalFileToProcess, setJournalFileToProcess] = useState<File | null>(null);
@@ -318,16 +286,6 @@ export function PersonaplexChatProvider({
       ts: Date.now(),
     };
     setActivityLog((prev) => [...prev.slice(-(MAX_ACTIVITY - 1)), full]);
-  }, []);
-
-  const bumpRecents = useCallback((sessionId: string, userLine: string) => {
-    const title = userLine.trim().slice(0, 56) || "Chat";
-    const now = Date.now();
-    setChatRecents((prev) => {
-      const next = [{ sessionId, title, updatedAt: now }, ...prev.filter((r) => r.sessionId !== sessionId)];
-      writeRecentsToStorage(next);
-      return next.slice(0, MAX_RECENTS);
-    });
   }, []);
 
   const transcribeBlob = useCallback(
@@ -439,7 +397,7 @@ export function PersonaplexChatProvider({
         intrusiveness: 0.5,
         mode: chatInteractionMode,
       };
-      if (chatInteractionMode === "conversation" || chatInteractionMode === "autobiography") {
+      if (chatInteractionMode === "autobiography") {
         payload.openrouter_model = userChatModel;
       }
       const res = await backendFetch("/chat", {
@@ -474,7 +432,6 @@ export function PersonaplexChatProvider({
         throw new Error(data.error || "Invalid chat response");
       }
       setChatSessionId(data.session_id);
-      bumpRecents(data.session_id, text);
 
       const steps = Array.isArray(data.agent_steps) ? data.agent_steps : [];
       for (const s of steps) {
@@ -549,7 +506,6 @@ export function PersonaplexChatProvider({
     chatSessionId,
     onToast,
     pushActivity,
-    bumpRecents,
     pendingAudioFile,
     transcribeBlob,
     chatInteractionMode,
@@ -633,50 +589,6 @@ export function PersonaplexChatProvider({
 
   const clearActivityLog = useCallback(() => setActivityLog([]), []);
 
-  const loadRecentSession = useCallback(
-    async (sessionId: string) => {
-      setChatSessionId(sessionId);
-      setDraft("");
-      setChatError(null);
-      setJournalFileToProcess(null);
-      setJournalTextToProcess(null);
-      try {
-        const res = await backendFetch(`/chat-session/${encodeURIComponent(sessionId)}`, { method: "GET" });
-        const data = (await res.json().catch(() => ({}))) as {
-          detail?: unknown;
-          messages?: Array<{ role?: string; content?: string }>;
-        };
-        if (!res.ok) {
-          const d = data.detail;
-          const detail = typeof d === "string" ? d : `Failed to load session (${res.status})`;
-          throw new Error(detail);
-        }
-        const rows = Array.isArray(data.messages) ? data.messages : [];
-        const mapped: PersonaplexChatMessage[] = rows
-          .filter((r) => (r.role === "user" || r.role === "assistant") && typeof r.content === "string")
-          .map((r, i) => ({
-            id: `hist_${sessionId.slice(0, 8)}_${i}`,
-            role: r.role as "user" | "assistant",
-            content: r.content as string,
-          }));
-        setMessages(mapped);
-        setIsChatActive(mapped.length > 0);
-        pushActivity({ kind: "system", summary: "Switched to a saved chat session." });
-        if (mapped.length === 0) {
-          onToast("No messages found for this session yet—or the server restarted and cleared memory.");
-        }
-      } catch (e) {
-        setMessages([]);
-        setIsChatActive(false);
-        const msg = e instanceof Error ? e.message : "Could not load session";
-        setChatError(msg);
-        onToast(msg);
-        pushActivity({ kind: "system", summary: `Could not load session: ${msg}` });
-      }
-    },
-    [onToast, pushActivity]
-  );
-
   const newChat = useCallback(() => {
     setChatSessionId(null);
     setMessages([]);
@@ -686,6 +598,16 @@ export function PersonaplexChatProvider({
     setChatError(null);
     pushActivity({ kind: "system", summary: "Started a new chat." });
   }, [pushActivity]);
+
+  const resetAssistedWorkspace = useCallback(() => {
+    setChatSessionId(null);
+    setMessages([]);
+    setDraft("");
+    setLiveDictationText("");
+    setIsChatActive(false);
+    setChatError(null);
+    setPendingAudioFile(null);
+  }, []);
 
   const value = useMemo(
     () => ({
@@ -716,9 +638,8 @@ export function PersonaplexChatProvider({
       composerDisabled,
       activityLog,
       clearActivityLog,
-      chatRecents,
-      loadRecentSession,
       newChat,
+      resetAssistedWorkspace,
       chatInteractionMode,
       setChatInteractionMode,
       userChatModel,
@@ -743,9 +664,8 @@ export function PersonaplexChatProvider({
       journalFileToProcess,
       journalTextToProcess,
       activityLog,
-      chatRecents,
-      loadRecentSession,
       newChat,
+      resetAssistedWorkspace,
       clearActivityLog,
       chatInteractionMode,
       userChatModel,

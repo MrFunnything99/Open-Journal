@@ -14,16 +14,6 @@ import { usePersonaplexChat } from "../PersonaplexChatContext";
 function ModeChipIcon({ mode }: { mode: ChatInteractionMode }) {
   const cls = "h-3.5 w-3.5 shrink-0 opacity-95";
   switch (mode) {
-    case "conversation":
-      return (
-        <svg className={cls} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75} aria-hidden>
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
-          />
-        </svg>
-      );
     case "journal":
     case "autobiography":
       return (
@@ -52,9 +42,6 @@ function composerModeChipClass(mode: ChatInteractionMode, compact: boolean): str
   const pad = compact ? "px-2 py-0.5" : "px-2.5 py-1";
   const text = compact ? "text-[0.65rem] sm:text-[0.7rem]" : "text-[0.7rem] sm:text-xs";
   const base = `inline-flex max-w-[11rem] shrink-0 items-center gap-1 truncate rounded-full border font-semibold tracking-tight transition-colors hover:brightness-110 sm:max-w-[14rem] ${pad} ${text}`;
-  if (mode === "conversation") {
-    return `${base} border-white/25 bg-white/[0.09] text-white/90`;
-  }
   if (mode === "journal") {
     return `${base} border-sky-400/50 bg-sky-500/[0.22] text-sky-100 shadow-[0_0_12px_-4px_rgba(56,189,248,0.45)]`;
   }
@@ -153,6 +140,8 @@ type AskAnythingComposerProps = {
   /** Collapsed sidebar (~72px): icon-only + expand hint */
   railNarrow?: boolean;
   onExpandRail?: () => void;
+  /** Home — AI-Assisted Journal Mode: hide + menu and mode chip (mode is chosen above). */
+  assistedJournalMinimal?: boolean;
 };
 
 type PlusPlacement = "above" | "below" | "right";
@@ -301,7 +290,12 @@ function PlusOptionsMenu({
   return createPortal(panel, document.body);
 }
 
-export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }: AskAnythingComposerProps) {
+export function AskAnythingComposer({
+  layout,
+  railNarrow = false,
+  onExpandRail,
+  assistedJournalMinimal = false,
+}: AskAnythingComposerProps) {
   const {
     idPrefix,
     draft,
@@ -335,8 +329,7 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
     return () => document.removeEventListener("mousedown", onDoc);
   }, [plusOpen]);
 
-  const showModelFooter =
-    chatInteractionMode === "conversation" || chatInteractionMode === "autobiography";
+  const showModelFooter = chatInteractionMode === "autobiography";
 
   const shellOuterClass =
     layout === "dock"
@@ -371,38 +364,42 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
         />
         <div className="glass-panel flex flex-col overflow-hidden rounded-xl border border-white/10">
           <div className="relative flex flex-wrap justify-center gap-1 px-1.5 py-2">
-            <div className="relative shrink-0" ref={plusWrapRef}>
-              <button
-                type="button"
-                onClick={() => setPlusOpen((o) => !o)}
-                disabled={composerDisabled}
-                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-white/90 outline-none hover:bg-white/10 disabled:opacity-40"
-                aria-label="More options and modes"
-                aria-expanded={plusOpen}
-                title="Modes and attachments"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-                </svg>
-              </button>
-              <PlusOptionsMenu
-                open={plusOpen}
-                onClose={() => setPlusOpen(false)}
-                placement="right"
-                anchorRef={plusWrapRef}
-                menuContainerRef={plusMenuRef}
-                fileInputRef={fileInputRef}
-                composerDisabled={composerDisabled}
-                mode={chatInteractionMode}
-                setMode={setChatInteractionMode}
-              />
-            </div>
-            <ComposerModeChip
-              mode={chatInteractionMode}
-              compact
-              onOpen={() => setPlusOpen(true)}
-              disabled={composerDisabled}
-            />
+            {!assistedJournalMinimal ? (
+              <>
+                <div className="relative shrink-0" ref={plusWrapRef}>
+                  <button
+                    type="button"
+                    onClick={() => setPlusOpen((o) => !o)}
+                    disabled={composerDisabled}
+                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-white/90 outline-none hover:bg-white/10 disabled:opacity-40"
+                    aria-label="More options and modes"
+                    aria-expanded={plusOpen}
+                    title="Modes and attachments"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                    </svg>
+                  </button>
+                  <PlusOptionsMenu
+                    open={plusOpen}
+                    onClose={() => setPlusOpen(false)}
+                    placement="right"
+                    anchorRef={plusWrapRef}
+                    menuContainerRef={plusMenuRef}
+                    fileInputRef={fileInputRef}
+                    composerDisabled={composerDisabled}
+                    mode={chatInteractionMode}
+                    setMode={setChatInteractionMode}
+                  />
+                </div>
+                <ComposerModeChip
+                  mode={chatInteractionMode}
+                  compact
+                  onOpen={() => setPlusOpen(true)}
+                  disabled={composerDisabled}
+                />
+              </>
+            ) : null}
             {micPhase === "recording" ? (
               <button
                 type="button"
@@ -490,42 +487,44 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
         className="hidden"
         onChange={onPickFile}
       />
-      <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
-        <div className="relative shrink-0" ref={plusWrapRef}>
-          <button
-            type="button"
-            onClick={() => setPlusOpen((o) => !o)}
-            disabled={composerDisabled}
-            className={`flex shrink-0 items-center justify-center rounded-full text-white/90 outline-none hover:bg-white/10 disabled:opacity-40 ${
-              layout === "rail" ? "h-9 w-9" : "h-11 w-11"
-            }`}
-            aria-label="Modes and attachments"
-            aria-expanded={plusOpen}
-            title="Modes and attachments"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className={layout === "rail" ? "h-5 w-5" : "h-6 w-6"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-            </svg>
-          </button>
-          <PlusOptionsMenu
-            open={plusOpen}
-            onClose={() => setPlusOpen(false)}
-            placement={plusPlacement}
-            anchorRef={plusWrapRef}
-            menuContainerRef={plusMenuRef}
-            fileInputRef={fileInputRef}
-            composerDisabled={composerDisabled}
+      {!assistedJournalMinimal ? (
+        <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
+          <div className="relative shrink-0" ref={plusWrapRef}>
+            <button
+              type="button"
+              onClick={() => setPlusOpen((o) => !o)}
+              disabled={composerDisabled}
+              className={`flex shrink-0 items-center justify-center rounded-full text-white/90 outline-none hover:bg-white/10 disabled:opacity-40 ${
+                layout === "rail" ? "h-9 w-9" : "h-11 w-11"
+              }`}
+              aria-label="Modes and attachments"
+              aria-expanded={plusOpen}
+              title="Modes and attachments"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className={layout === "rail" ? "h-5 w-5" : "h-6 w-6"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+              </svg>
+            </button>
+            <PlusOptionsMenu
+              open={plusOpen}
+              onClose={() => setPlusOpen(false)}
+              placement={plusPlacement}
+              anchorRef={plusWrapRef}
+              menuContainerRef={plusMenuRef}
+              fileInputRef={fileInputRef}
+              composerDisabled={composerDisabled}
+              mode={chatInteractionMode}
+              setMode={setChatInteractionMode}
+            />
+          </div>
+          <ComposerModeChip
             mode={chatInteractionMode}
-            setMode={setChatInteractionMode}
+            compact={layout === "rail"}
+            onOpen={() => setPlusOpen(true)}
+            disabled={composerDisabled}
           />
         </div>
-        <ComposerModeChip
-          mode={chatInteractionMode}
-          compact={layout === "rail"}
-          onOpen={() => setPlusOpen(true)}
-          disabled={composerDisabled}
-        />
-      </div>
+      ) : null}
 
       <textarea
         id={`${idPrefix}-global-composer`}
@@ -539,7 +538,13 @@ export function AskAnythingComposer({ layout, railNarrow = false, onExpandRail }
         }}
         disabled={composerDisabled}
         rows={layout === "rail" ? 2 : 1}
-        placeholder={pendingAudioFile ? "Add a message or press send to transcribe" : "Ask anything"}
+        placeholder={
+          pendingAudioFile
+            ? "Add a message or press send to transcribe"
+            : chatInteractionMode === "autobiography"
+              ? "Chat for AI-assisted journaling…"
+              : "Write in your manual journal…"
+        }
         className={`max-h-36 min-w-0 flex-1 resize-none border-0 bg-transparent text-[0.95rem] text-white placeholder:text-white/45 focus:outline-none focus:ring-0 disabled:opacity-50 ${
           layout === "rail" ? "min-h-[44px] py-2 text-[0.9rem] leading-snug" : "min-h-[48px] py-3"
         }`}

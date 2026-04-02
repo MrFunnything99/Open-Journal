@@ -195,7 +195,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   onImportJournalDumpFolder,
   onPrepareJournalDumpUpload,
 }) => {
-  type ExplorerTab = "journals" | "conversations" | "library";
+  type ExplorerTab = "journals" | "conversations" | "library" | "learning";
   const [explorerTab, setExplorerTab] = useState<ExplorerTab>("journals");
   const [selection, setSelection] = useState<Selection | null>(null);
   const [journalExpandedYears, setJournalExpandedYears] = useState<Set<number>>(() => new Set());
@@ -278,6 +278,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
       if (tab === "conversations") {
         return conversationSorted[0] ? { kind: "conversation", id: conversationSorted[0].id } : null;
       }
+      if (tab === "learning") return null;
       for (const cat of ["book", "podcast", "article", "research"] as BrainLibraryCategory[]) {
         const list = libraryItems[CAT_KEY[cat]];
         if (list.length > 0) return { kind: "library", category: cat, id: list[0].id };
@@ -582,44 +583,32 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   return (
     <div className="flex flex-1 min-h-0 flex-col lg:flex-row gap-0 overflow-hidden">
       <aside className="w-full lg:w-[min(100%,340px)] lg:flex-shrink-0 flex flex-col min-h-0 border-b lg:border-b-0 lg:border-r border-gray-100 dark:border-gray-700 bg-white/90 dark:bg-[#2f2f2f]">
-        <div className="border-b border-gray-100 bg-gray-50/90 px-3 py-2 dark:border-white/10 dark:bg-black/20 dark:backdrop-blur-md">
-          <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-gray-500 dark:text-white/45">
+        <div className="border-b border-gray-100 bg-gray-50/90 px-4 py-3 dark:border-white/10 dark:bg-black/20 dark:backdrop-blur-md">
+          <p className="mb-2.5 text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-gray-500 dark:text-white/45">
             Explorer
           </p>
-          <div className="inline-flex max-w-full flex-wrap gap-0.5 rounded-full border border-gray-200/90 bg-gray-100/90 p-1 dark:border-white/[0.08] dark:bg-black/20 dark:backdrop-blur-md">
-            <button
-              type="button"
-              onClick={() => switchExplorerTab("journals")}
-              className={`rounded-full px-3 py-1.5 text-xs font-medium transition-colors ${
-                explorerTab === "journals"
-                  ? "bg-white text-gray-900 shadow-sm"
-                  : "text-gray-600 hover:bg-gray-200/80 hover:text-gray-900 dark:text-white/60 dark:hover:bg-white/10 dark:hover:text-white"
-              }`}
-            >
-              Journals
-            </button>
-            <button
-              type="button"
-              onClick={() => switchExplorerTab("conversations")}
-              className={`rounded-full px-3 py-1.5 text-xs font-medium transition-colors ${
-                explorerTab === "conversations"
-                  ? "bg-white text-gray-900 shadow-sm"
-                  : "text-gray-600 hover:bg-gray-200/80 hover:text-gray-900 dark:text-white/60 dark:hover:bg-white/10 dark:hover:text-white"
-              }`}
-            >
-              Conversations
-            </button>
-            <button
-              type="button"
-              onClick={() => switchExplorerTab("library")}
-              className={`rounded-full px-3 py-1.5 text-xs font-medium transition-colors ${
-                explorerTab === "library"
-                  ? "bg-white text-gray-900 shadow-sm"
-                  : "text-gray-600 hover:bg-gray-200/80 hover:text-gray-900 dark:text-white/60 dark:hover:bg-white/10 dark:hover:text-white"
-              }`}
-            >
-              Library
-            </button>
+          <div className="flex w-full gap-0.5 rounded-xl border border-gray-200/90 bg-gray-100/90 p-1 dark:border-white/[0.08] dark:bg-black/20 dark:backdrop-blur-md">
+            {(
+              [
+                { key: "journals", label: "Manual Journals" },
+                { key: "conversations", label: "AI-Assisted Journals" },
+                { key: "library", label: "Library" },
+                { key: "learning", label: "Learning" },
+              ] as { key: ExplorerTab; label: string }[]
+            ).map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => switchExplorerTab(tab.key)}
+                className={`flex-1 rounded-lg px-2 py-1.5 text-[0.7rem] font-medium leading-tight transition-colors ${
+                  explorerTab === tab.key
+                    ? "bg-white text-gray-900 shadow-sm dark:bg-white/90"
+                    : "text-gray-500 hover:bg-gray-200/80 hover:text-gray-900 dark:text-white/50 dark:hover:bg-white/10 dark:hover:text-white"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
           </div>
         </div>
         <nav className="flex-1 overflow-y-auto scrollbar p-2" aria-label="Brain explorer">
@@ -650,7 +639,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
               )}
               <div className="ml-1 border-l border-gray-100 dark:border-gray-600 pl-2">
                 {journalTree.length === 0 ? (
-                  <p className="text-xs text-gray-400 py-1 px-1">No journal entries yet.</p>
+                  <p className="text-xs text-gray-400 py-1 px-1">No manual journal entries yet.</p>
                 ) : (
                   journalTree.map(({ year, months }) => {
                     const yearEntries = months.flatMap((m) => m.entries);
@@ -740,7 +729,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
             <div className="mb-2">
               <div className="ml-1 border-l border-gray-100 dark:border-gray-600 pl-2">
                 {conversationTree.length === 0 ? (
-                  <p className="text-xs text-gray-400 py-1 px-1">No conversation transcripts in your journal yet.</p>
+                  <p className="text-xs text-gray-400 py-1 px-1">No AI-assisted journal entries yet.</p>
                 ) : (
                   conversationTree.map(({ year, months }) => (
                     <div key={`conv-${year}`} className="mb-1">
@@ -861,6 +850,18 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
               </div>
             </div>
           )}
+
+          {explorerTab === "learning" && (
+            <div className="flex flex-col items-center justify-center px-4 py-10 text-center">
+              <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-gray-100 dark:bg-white/10">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-gray-400 dark:text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" />
+                </svg>
+              </div>
+              <p className="text-sm font-medium text-gray-600 dark:text-white/60">Coming soon</p>
+              <p className="mt-1 text-xs text-gray-400 dark:text-white/35">Learning insights will appear here.</p>
+            </div>
+          )}
         </nav>
         {onImportJournalDumpFolder && (
           <div className="border-t border-white/10 p-2">
@@ -933,7 +934,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                     type="button"
                     onClick={onDownloadKnowledgeBase}
                     className={knowledgeBaseToolbarBtnClass}
-                    title="Download a .zip of Markdown files: journals/, conversations/, library/"
+                    title="Download a .zip: journals/ (manual), conversations/ (AI-assisted), library/"
                   >
                     Download Markdown folder
                   </button>
@@ -1194,7 +1195,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                     type="button"
                     onClick={onDownloadKnowledgeBase}
                     className={knowledgeBaseToolbarBtnClass}
-                    title="Download a .zip of Markdown files: journals/, conversations/, library/"
+                    title="Download a .zip: journals/ (manual), conversations/ (AI-assisted), library/"
                   >
                     Download Markdown folder
                   </button>
@@ -1297,7 +1298,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                     type="button"
                     onClick={onDownloadKnowledgeBase}
                     className={knowledgeBaseToolbarBtnClass}
-                    title="Download a .zip of Markdown files: journals/, conversations/, library/"
+                    title="Download a .zip: journals/ (manual), conversations/ (AI-assisted), library/"
                   >
                     Download Markdown folder
                   </button>
@@ -1399,6 +1400,22 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
               </div>
             </div>
           </div>
+        ) : explorerTab === "learning" ? (
+          <div className="flex flex-1 items-center justify-center p-6 min-h-[200px]">
+            <div className="w-full max-w-md rounded-2xl border-2 border-dashed border-gray-200 bg-gray-50 px-8 py-14 text-center dark:border-gray-600 dark:bg-[#343541]">
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-gray-100 dark:bg-white/10">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-gray-400 dark:text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" />
+                </svg>
+              </div>
+              <h3 className="mb-2 text-sm font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-300">
+                Learning — coming soon
+              </h3>
+              <p className="text-sm leading-relaxed text-gray-500 dark:text-gray-400">
+                This section will surface insights, patterns, and growth themes extracted from your journals and AI-assisted reflections.
+              </p>
+            </div>
+          </div>
         ) : !hasAnyContent ? (
           <div className="flex flex-1 min-h-0 flex-col m-3 md:m-4 overflow-hidden rounded-2xl border border-gray-100 bg-white shadow-sm dark:border-gray-700 dark:bg-[#2f2f2f]">
             {onImportKnowledgeBaseFile && (
@@ -1421,7 +1438,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                       type="button"
                       onClick={onDownloadKnowledgeBase}
                       className={knowledgeBaseToolbarBtnClass}
-                      title="Download a .zip of Markdown files: journals/, conversations/, library/"
+                      title="Download a .zip: journals/ (manual), conversations/ (AI-assisted), library/"
                     >
                       Download Markdown folder
                     </button>
@@ -1443,11 +1460,11 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                   Knowledge base is empty
                 </h3>
                 <p className="mb-6 text-sm leading-relaxed text-gray-500 dark:text-gray-400">
-                  Import a Markdown <strong className="font-medium text-gray-700 dark:text-gray-300">.zip</strong> to load journals,
-                  conversations, and library items. Or use <strong className="font-medium text-gray-700 dark:text-gray-300">Journal dump upload</strong>{" "}
+                  Import a Markdown <strong className="font-medium text-gray-700 dark:text-gray-300">.zip</strong> to load manual journals,
+                  AI-assisted journals, and library items. Or use <strong className="font-medium text-gray-700 dark:text-gray-300">Journal dump upload</strong>{" "}
                   or <strong className="font-medium text-gray-700 dark:text-gray-300">Individual journal(s)</strong> in the sidebar — a folder or
                   separate <code className="rounded bg-gray-200/80 px-1 text-xs dark:bg-black/30">.md</code> files (dates from names or file content).
-                  New entries from the Assistant show up here after you save.
+                  New entries from AI-Assisted Journal Mode appear here after you save.
                 </p>
                 {onImportKnowledgeBaseFile ? (
                   <button

@@ -60,6 +60,33 @@ function transcriptToPreview(messages: ChatMessage[], maxLen = 100): string {
   return text.slice(0, maxLen).trim() + "…";
 }
 
+/**
+ * Synchronous persist for page lifecycle (e.g. pagehide). Prepends a journal entry to local storage.
+ * React state in useJournalHistory updates on next mount from the same tab.
+ */
+export function appendJournalEntrySync(
+  transcript: ChatMessage[],
+  entrySource: "journal" | "conversation" = "journal",
+): void {
+  if (transcript.length === 0) return;
+  try {
+    const existing = loadFromStorage();
+    const id = generateId();
+    const date = new Date().toISOString();
+    const entry: JournalEntry = {
+      id,
+      date,
+      preview: transcriptToPreview(transcript),
+      fullTranscript: transcript,
+      syncedToMemory: false,
+      entrySource,
+    };
+    saveToStorage([entry, ...existing]);
+  } catch (e) {
+    console.warn("[Personaplex] appendJournalEntrySync failed:", e);
+  }
+}
+
 export const EXPORT_VERSION = 1;
 
 export type ExportPayload = {
@@ -189,25 +216,28 @@ export const useJournalHistory = () => {
     saveToStorage(entries);
   }, [entries]);
 
-  const saveEntry = useCallback((transcript: ChatMessage[], dateOverride?: string) => {
-    if (transcript.length === 0) return "";
-    const id = generateId();
-    const date =
-      dateOverride && !Number.isNaN(Date.parse(dateOverride))
-        ? dateOverride
-        : new Date().toISOString();
-    const preview = transcriptToPreview(transcript);
-    const entry: JournalEntry = {
-      id,
-      date,
-      preview,
-      fullTranscript: transcript,
-      syncedToMemory: false,
-      entrySource: "journal",
-    };
-    setEntries((prev) => [entry, ...prev]);
-    return id;
-  }, []);
+  const saveEntry = useCallback(
+    (transcript: ChatMessage[], dateOverride?: string, source: "journal" | "conversation" = "journal") => {
+      if (transcript.length === 0) return "";
+      const id = generateId();
+      const date =
+        dateOverride && !Number.isNaN(Date.parse(dateOverride))
+          ? dateOverride
+          : new Date().toISOString();
+      const preview = transcriptToPreview(transcript);
+      const entry: JournalEntry = {
+        id,
+        date,
+        preview,
+        fullTranscript: transcript,
+        syncedToMemory: false,
+        entrySource: source,
+      };
+      setEntries((prev) => [entry, ...prev]);
+      return id;
+    },
+    [],
+  );
 
   /**
    * Create or update one active history entry while a live session is running.

@@ -1,31 +1,26 @@
-export type ChatInteractionMode = "conversation" | "journal" | "autobiography" | "learning";
+/** Modes the backend /chat accepts; home composer offers Manual Journal + AI-Assisted Journal (plus Learning on its tab). */
+export type ChatInteractionMode = "journal" | "autobiography" | "learning";
 
-export const CHAT_INTERACTION_MODES: ChatInteractionMode[] = ["conversation", "journal", "autobiography"];
+/** Options in the + menu where it appears (e.g. Learning tab). */
+export const CHAT_INTERACTION_MODES: ChatInteractionMode[] = ["journal", "autobiography"];
 
 export const CHAT_INTERACTION_MODE_META: Record<
   ChatInteractionMode,
   { label: string; sublabel: string; description: string; /** Pill next to + in composer (ChatGPT-style tag). */ composerChipLabel: string }
 > = {
-  conversation: {
-    label: "Conversation",
-    sublabel: "Chat freely",
-    composerChipLabel: "Conversation",
-    description:
-      "Your default AI assistant. Chat freely, ask questions, and explore ideas—enhanced with your personal context.",
-  },
   journal: {
-    label: "Journal",
+    label: "Manual Journal Mode",
     sublabel: "Reflect",
-    composerChipLabel: "Journaling",
+    composerChipLabel: "Manual Journal Mode",
     description:
-      "A space for free-flow reflection. Write naturally, process your thoughts, and receive optional AI feedback or gentle structure.",
+      "Your private writing space: type or dictate, optionally run AI Journal Cleanup, get feedback, and save. Switch to AI-Assisted Journal Mode when you want a reflective chat with the model.",
   },
   autobiography: {
-    label: "Assisted Journal",
-    sublabel: "Guided prompts from chat",
-    composerChipLabel: "Assisted Journal",
+    label: "AI-Assisted Journal Mode",
+    sublabel: "Reflect with AI",
+    composerChipLabel: "AI-Assisted Journal Mode",
     description:
-      "Chat-driven journaling: ask about today and get probing questions; ask for autobiographical reflection and explore a past moment already in your journals; or say you want to journal and get a short menu of directions to choose from.",
+      "Chat with the AI to reflect—on today, on memories from your manual journals, or on where to steer your writing. When you are ready, use Save to Journal to move the thread into Manual Journal Mode for editing and saving.",
   },
   learning: {
     label: "Learning",

@@ -16,7 +16,7 @@ import { MobileAskComposerDockGate } from "./components/GlobalAskAnythingBar";
 import { AboutTab } from "./components/AboutTab";
 import { PersonaplexGithubLink } from "./components/PersonaplexGithubLink";
 import { PersonaplexLeftRail, type PersonaplexView } from "./components/PersonaplexLeftRail";
-import { HomeChatSidebar } from "./components/HomeChatSidebar";
+import { AssistedJournalUnloadSync } from "./components/AssistedJournalUnloadSync";
 
 const RECOMMENDATIONS_CACHE_KEY = "openjournal-recommendations-cache";
 const LIBRARY_CACHE_KEY = "openjournal-library-cache";
@@ -96,7 +96,7 @@ function readRecommendationsCache(): RecommendationsBundle {
 const KB_UPLOAD_CONFIRM_MESSAGE =
   "Uploading a knowledge base replaces everything for this session.\n\n" +
   "• Server: all journal embeddings and your library vector index are deleted, then rebuilt from this file.\n" +
-  "• This device: journals and library are replaced by the import (not merged).\n" +
+  "• This device: manual journals, AI-assisted journals, and library are replaced by the import (not merged).\n" +
   "• Cached recommendations are cleared.\n\n" +
   "Stay online until syncing finishes. This cannot be undone.\n\n" +
   "Continue?";
@@ -194,7 +194,7 @@ export const Personaplex = () => {
   const [calendarSelectedDate, setCalendarSelectedDate] = useState<string | null>(null);
   const [calendarDaySummary, setCalendarDaySummary] = useState<string | null>(null);
   const [calendarDaySummaryLoading, setCalendarDaySummaryLoading] = useState(false);
-  /** Left sidebar: Knowledge base (journals, transcripts, library) vs Calendar */
+  /** Left sidebar: Knowledge base (manual + AI-assisted journals, library) vs Calendar */
   const [brainSection, setBrainSection] = useState<"knowledgeBase" | "calendar">("knowledgeBase");
   const fetchLibrary = useCallback((showCachedFirst = false): Promise<void> => {
     if (showCachedFirst) {
@@ -327,7 +327,7 @@ export const Personaplex = () => {
       a.download = `selfmeridian-knowledge-base-${new Date().toISOString().slice(0, 10)}.zip`;
       a.click();
       URL.revokeObjectURL(url);
-      setToastMessage("Downloaded Markdown folder (.zip). Unzip to browse journals, conversations, and library.");
+      setToastMessage("Downloaded Markdown folder (.zip). Unzip to browse manual journals, AI-assisted journals, and library.");
       setTimeout(() => setToastMessage(null), 4000);
     } catch {
       setToastMessage("Download failed.");
@@ -396,7 +396,7 @@ export const Personaplex = () => {
         const bulk = librarySnapshotToBulkPayload(nextLib);
         const libOk = await pushLibraryBulkToServer(bulk);
         if (!libOk) {
-          setToastMessage("Journals updated locally; library sync failed. Check the API and try uploading again.");
+          setToastMessage("Journal entries updated locally; library sync failed. Check the API and try uploading again.");
           setTimeout(() => setToastMessage(null), 6000);
         }
         const synced = await syncUnsyncedEntries();
@@ -675,6 +675,7 @@ export const Personaplex = () => {
 
   return (
     <PersonaplexChatProvider onToast={chatToast} onAgentAction={handleChatAgentAction}>
+      <AssistedJournalUnloadSync />
     <div className="relative flex h-screen w-full flex-row overflow-hidden bg-[#0a0a12] font-sans text-white antialiased">
       {/* Ethereal mesh + animated ambient orbs (pointer-events none on layer) */}
       <div className="pointer-events-none fixed inset-0 z-0" aria-hidden>
@@ -725,7 +726,6 @@ export const Personaplex = () => {
         setView={setView}
       />
 
-      <div className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
       <div className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       {/* Header — centered brand; nav lives in left rail (Open WebUI–style shell) */}
       <header className="relative z-20 flex-none border-b border-white/[0.06] px-4 py-2.5 sm:px-6 sm:py-3">
@@ -786,7 +786,7 @@ export const Personaplex = () => {
                 </h2>
                     <p className="mt-1 text-xs text-white/50 md:text-sm">
                       {brainSection === "knowledgeBase"
-                        ? "Journal entries, conversation transcripts, and your books & media library."
+                        ? "Manual journals, AI-assisted journals, and your books & media library."
                         : "Click a date for an AI summary of that day (journal entries + memory)."}
                     </p>
                         </div>
@@ -1387,9 +1387,6 @@ export const Personaplex = () => {
       )}
 
       <MobileAskComposerDockGate railOpen={mobileRailOpen} activeView={view} />
-      </div>
-
-      <HomeChatSidebar active={view === "voice_memo"} />
       </div>
 
       {libraryEditingId ? (() => {

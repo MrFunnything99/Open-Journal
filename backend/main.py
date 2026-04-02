@@ -653,6 +653,15 @@ class JournalValidateResponse(BaseModel):
     model_used: Optional[str] = None
 
 
+class JournalCleanupRequest(BaseModel):
+    text: str
+    model: Optional[str] = None
+
+
+class JournalCleanupResponse(BaseModel):
+    cleaned_text: str
+
+
 VOICE_MEMO_POLISH_INSTRUCTION = """You are editing a voice memo transcript. Clean it into clear, readable prose suitable for a personal journal.
 - Fix punctuation, capitalization, and obvious speech-to-text errors.
 - Remove filler words (um, uh, like, you know), false starts, and repeated words.
@@ -978,12 +987,15 @@ def _elevenlabs_transcribe_bytes(audio_bytes: bytes) -> str:
     return str(text).strip() if text is not None else ""
 
 
-async def _polish_voice_memo_openrouter(raw: str) -> str:
+async def _polish_voice_memo_openrouter(raw: str, model_override: Optional[str] = None) -> str:
     """Single LLM call: clean up filler words, fix STT errors, polish into readable prose."""
     text = (raw or "").strip()
     if not text or not (os.getenv("OPENROUTER_API_KEY") or "").strip():
         return text
-    model = (os.getenv("OPENROUTER_VOICE_MEMO_POLISH_MODEL") or "openai/gpt-5.4").strip()
+    model = (
+        (model_override or "").strip()
+        or (os.getenv("OPENROUTER_VOICE_MEMO_POLISH_MODEL") or "openai/gpt-5.4").strip()
+    )
     prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
 
     def _call():
@@ -2509,13 +2521,24 @@ async def api_voice_memo(req: VoiceMemoRequest):
     _t1 = _time.monotonic()
     print(f"[backend] voice-memo: transcribe done in {_t1 - _t0:.1f}s ({transcribe_engine})")
 
-    polished = await _polish_voice_memo_openrouter(raw_transcript)
-    _t2 = _time.monotonic()
-    print(f"[backend] voice-memo: polish done in {_t2 - _t1:.1f}s (total {_t2 - _t0:.1f}s)")
-    did_polish = bool(
-        or_key and (raw_transcript or "").strip() and (polished or "").strip() and (polished or "").strip() != (raw_transcript or "").strip()
-    )
-    cleaned = polished if did_polish else ""
+    if req.journal_mode:
+        # Journal Mode on Home: transcribe only; AI cleanup runs when the user taps "AI Journal Cleanup".
+        polished = raw_transcript or ""
+        did_polish = False
+        cleaned = ""
+        _t2 = _time.monotonic()
+        print(f"[backend] voice-memo: journal_mode polish skipped in {_t2 - _t1:.1f}s (total {_t2 - _t0:.1f}s)")
+    else:
+        polished = await _polish_voice_memo_openrouter(raw_transcript)
+        _t2 = _time.monotonic()
+        print(f"[backend] voice-memo: polish done in {_t2 - _t1:.1f}s (total {_t2 - _t0:.1f}s)")
+        did_polish = bool(
+            or_key
+            and (raw_transcript or "").strip()
+            and (polished or "").strip()
+            and (polished or "").strip() != (raw_transcript or "").strip()
+        )
+        cleaned = polished if did_polish else ""
 
     return {
         "raw_transcript": raw_transcript or "",
@@ -2524,6 +2547,18 @@ async def api_voice_memo(req: VoiceMemoRequest):
         "transcribe_engine": transcribe_engine,
         "polished_by_llm": did_polish,
     }
+
+
+@app.post("/api/journal-cleanup", response_model=JournalCleanupResponse, include_in_schema=False)
+async def api_journal_cleanup(req: JournalCleanupRequest):
+    """Journal Mode: optional LLM pass (same instruction as voice-memo polish) to clean journal text."""
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) < 3:
+        raise HTTPException(status_code=400, detail="Text too short to clean up")
+    cleaned = await _polish_voice_memo_openrouter(text, req.model)
+    return JournalCleanupResponse(cleaned_text=cleaned)
 
 
 @app.post("/api/journal-validate", response_model=JournalValidateResponse, include_in_schema=False)

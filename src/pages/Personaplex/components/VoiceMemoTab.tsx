@@ -2,14 +2,14 @@ import { FC, useCallback, useEffect, useId, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
 import { CHAT_INTERACTION_MODE_META } from "../chatInteractionModes";
 import type { ChatMessage } from "../hooks/useJournalHistory";
-import { usePersonaplexChat } from "../PersonaplexChatContext";
+import { personaplexChatToJournalTranscript, usePersonaplexChat } from "../PersonaplexChatContext";
 import { blobToBase64, blobToWavBase64 } from "../utils/audioToWav";
 import { AskAnythingComposer, LiveDictationBubble } from "./GlobalAskAnythingBar";
 import { playChatReadAloud } from "../utils/chatReadAloud";
 
 type Props = {
   onToast: (msg: string) => void;
-  saveEntry?: (transcript: ChatMessage[], dateIso: string) => string;
+  saveEntry?: (transcript: ChatMessage[], dateIso: string, source?: "journal" | "conversation") => string;
   syncUnsyncedEntries?: () => Promise<number>;
 };
 
@@ -46,6 +46,34 @@ function dateAndTimeToIso(dateStr: string, timeStr: string): string {
   return new Date(y, mo - 1, day, h, mi, 0, 0).toISOString();
 }
 
+/** Insert transcribed speech into the journal editor with readable spacing (multi-segment dictation). */
+function insertTranscriptSegment(existing: string, segment: string, insertAt?: number | null): string {
+  const seg = segment.trim();
+  if (!seg) return existing;
+
+  const len = existing.length;
+  const at =
+    insertAt == null || Number.isNaN(insertAt)
+      ? len
+      : Math.max(0, Math.min(Math.floor(insertAt), len));
+  const before = existing.slice(0, at);
+  const after = existing.slice(at);
+
+  let glueLeft = "";
+  if (before.trim().length > 0) {
+    if (before.endsWith("\n\n")) glueLeft = "";
+    else if (before.endsWith("\n")) glueLeft = "\n";
+    else glueLeft = "\n\n";
+  }
+
+  let glueRight = "";
+  if (after.trim().length > 0) {
+    glueRight = after.startsWith("\n") ? "" : "\n\n";
+  }
+
+  return `${before}${glueLeft}${seg}${glueRight}${after}`;
+}
+
 export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntries }) => {
   const {
     messages,
@@ -53,10 +81,12 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     isChatActive,
     chatError,
     chatInteractionMode,
+    setChatInteractionMode,
     journalFileToProcess,
     clearJournalFileToProcess,
     journalTextToProcess,
     clearJournalTextToProcess,
+    resetAssistedWorkspace,
   } = usePersonaplexChat();
   const idPrefix = useId();
   const [journalMicPhase, setJournalMicPhase] = useState<"idle" | "recording" | "processing">("idle");
@@ -65,17 +95,34 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const [reviewText, setReviewText] = useState("");
   const [feedbackModel, setFeedbackModel] = useState("openai/gpt-5.4");
   const [gettingFeedback, setGettingFeedback] = useState(false);
+  const [journalCleanupBusy, setJournalCleanupBusy] = useState(false);
   const [journalEntryDate, setJournalEntryDate] = useState("");
   const [journalEntryTime, setJournalEntryTime] = useState("");
   const [savingJournal, setSavingJournal] = useState(false);
   const [journalMessages, setJournalMessages] = useState<ChatMessage[]>([]);
+  /** True when the current draft originated from an AI-Assisted handoff (determines entrySource on save). */
+  const [assistedHandoff, setAssistedHandoff] = useState(false);
   const [readAloudBusy, setReadAloudBusy] = useState(false);
 
   const listRef = useRef<HTMLDivElement>(null);
   const journalScrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const journalTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const reviewTextRef = useRef(reviewText);
+  reviewTextRef.current = reviewText;
+  /** Insert offset for the next journal voice/file transcription (captured when record/file pick starts). */
+  const journalVoiceInsertPosRef = useRef<number | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+
+  const captureJournalVoiceInsertPosition = useCallback(() => {
+    const ta = journalTextareaRef.current;
+    if (ta && document.activeElement === ta) {
+      journalVoiceInsertPosRef.current = ta.selectionStart;
+    } else {
+      journalVoiceInsertPosRef.current = reviewTextRef.current.length;
+    }
+  }, []);
 
   useEffect(() => {
     const el = listRef.current;
@@ -88,6 +135,37 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [journalMessages, gettingFeedback]);
+
+  useEffect(() => {
+    if (chatInteractionMode === "learning") {
+      setChatInteractionMode("journal");
+    }
+  }, [chatInteractionMode, setChatInteractionMode]);
+
+  const handoffAssistedToJournal = useCallback(() => {
+    if (chatInteractionMode !== "autobiography" || sending || messages.length === 0) return;
+    const transcript = personaplexChatToJournalTranscript(messages);
+    setJournalMessages(transcript);
+    setAssistedHandoff(true);
+    setReviewText("");
+    setRawTranscript("");
+    setError(null);
+    const now = new Date();
+    if (!journalEntryDate) setJournalEntryDate(toDateInputValue(now));
+    if (!journalEntryTime) setJournalEntryTime(toTimeInputValue(now));
+    setChatInteractionMode("journal");
+    resetAssistedWorkspace();
+    onToast("Edit your reflection below, then tap Save to journal.");
+  }, [
+    chatInteractionMode,
+    sending,
+    messages,
+    journalEntryDate,
+    journalEntryTime,
+    resetAssistedWorkspace,
+    setChatInteractionMode,
+    onToast,
+  ]);
 
   const readAloud = useCallback(
     (text: string) => {
@@ -153,11 +231,23 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       if (line) {
         const capturedAt = new Date();
         const rawBody = ((data.raw_transcript ?? "").trim() || line).trim();
-        setRawTranscript(rawBody);
-        const reviewBody = isJournal && data.cleaned_transcript?.trim()
+        // Manual Journal Mode: show raw transcript only; use "AI Journal Cleanup" for the polish pass.
+        const reviewBody = !isJournal && data.cleaned_transcript?.trim()
           ? data.cleaned_transcript.trim()
           : rawBody;
-        setReviewText(reviewBody);
+
+        if (isJournal) {
+          const pos = journalVoiceInsertPosRef.current;
+          journalVoiceInsertPosRef.current = null;
+          setReviewText((prev) => {
+            const next = insertTranscriptSegment(prev, reviewBody, pos ?? undefined);
+            setRawTranscript(next);
+            return next;
+          });
+        } else {
+          setRawTranscript(rawBody);
+          setReviewText(reviewBody);
+        }
         if (!journalEntryDate) setJournalEntryDate(toDateInputValue(capturedAt));
         if (!journalEntryTime) setJournalEntryTime(toTimeInputValue(capturedAt));
       }
@@ -172,6 +262,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     if (journalFileToProcess && chatInteractionMode === "journal") {
       const file = journalFileToProcess;
       clearJournalFileToProcess();
+      journalVoiceInsertPosRef.current = reviewTextRef.current.length;
       void processMicAudio(file);
     }
   }, [journalFileToProcess, chatInteractionMode, clearJournalFileToProcess, processMicAudio]);
@@ -235,10 +326,44 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     }
   }, [reviewText, gettingFeedback, onToast, feedbackModel]);
 
+  const runJournalCleanup = useCallback(async () => {
+    const text = reviewText.trim();
+    if (!text || journalCleanupBusy || gettingFeedback) return;
+
+    setJournalCleanupBusy(true);
+    setError(null);
+    try {
+      const res = await backendFetch("/journal-cleanup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, model: feedbackModel.trim() || undefined }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        detail?: string;
+        cleaned_text?: string;
+      };
+      if (!res.ok) {
+        const d = data.detail;
+        throw new Error(typeof d === "string" ? d : `Cleanup failed (${res.status})`);
+      }
+      const cleaned = (data.cleaned_text ?? "").trim();
+      if (!cleaned) throw new Error("Cleanup returned empty text.");
+      setReviewText(cleaned);
+      onToast("Journal text cleaned.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Cleanup failed";
+      setError(msg);
+      onToast(msg);
+    } finally {
+      setJournalCleanupBusy(false);
+    }
+  }, [reviewText, journalCleanupBusy, gettingFeedback, feedbackModel, onToast]);
+
   const startAnotherEntry = useCallback(() => {
     setRawTranscript("");
     setReviewText("");
     setJournalMessages([]);
+    setAssistedHandoff(false);
     setJournalEntryDate("");
     setJournalEntryTime("");
     setError(null);
@@ -267,7 +392,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     const dateIso = dateAndTimeToIso(journalEntryDate, journalEntryTime);
     setSavingJournal(true);
     try {
-      const id = saveEntry(transcript, dateIso);
+      const source = assistedHandoff ? "conversation" : "journal";
+      const id = saveEntry(transcript, dateIso, source);
       if (!id) {
         onToast("Could not save.");
         return;
@@ -275,19 +401,23 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       void syncUnsyncedEntries?.();
       onToast("Saved to your journal.");
       startAnotherEntry();
+      resetAssistedWorkspace();
     } finally {
       setSavingJournal(false);
     }
   }, [
     saveEntry, syncUnsyncedEntries, savingJournal,
-    journalMessages, reviewText,
+    journalMessages, reviewText, assistedHandoff,
     journalEntryDate, journalEntryTime,
-    onToast, startAnotherEntry,
+    onToast, startAnotherEntry, resetAssistedWorkspace,
   ]);
 
   const startRecording = useCallback(async () => {
     if (journalMicPhase !== "idle" || sending) return;
     setError(null);
+    if (chatInteractionMode === "journal") {
+      captureJournalVoiceInsertPosition();
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -314,7 +444,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       setError(e instanceof Error ? e.message : "Microphone unavailable");
       setJournalMicPhase("idle");
     }
-  }, [journalMicPhase, sending, processMicAudio]);
+  }, [journalMicPhase, sending, processMicAudio, chatInteractionMode, captureJournalVoiceInsertPosition]);
 
   const stopRecording = useCallback(() => {
     const mr = mediaRecorderRef.current;
@@ -327,59 +457,74 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       const f = e.target.files?.[0];
       if (!f) return;
       setError(null);
+      if (chatInteractionMode === "journal") {
+        captureJournalVoiceInsertPosition();
+      }
       void processMicAudio(f);
       e.target.value = "";
     },
-    [processMicAudio]
+    [processMicAudio, chatInteractionMode, captureJournalVoiceInsertPosition]
   );
 
-  const journalRecorderBusy = journalMicPhase !== "idle" || gettingFeedback;
+  const journalRecorderBusy = journalMicPhase !== "idle" || gettingFeedback || journalCleanupBusy;
   const journalProcessing = chatInteractionMode === "journal" && journalMicPhase === "processing";
-  const journalActive = rawTranscript || reviewText || journalMessages.length > 0 || journalProcessing;
   const hasConversation = messages.length > 0 || sending;
-  const showHomeHeroStack =
-    !isChatActive && !hasConversation && !journalActive;
-  const showBottomComposer = !showHomeHeroStack;
+  const assistedHero =
+    chatInteractionMode === "autobiography" && !isChatActive && !hasConversation;
+  const showAssistedBottomComposer = chatInteractionMode === "autobiography" && !assistedHero;
+
+  const errorBanner = (error || chatError) && (
+    <div className="glass-panel mb-6 rounded-2xl px-4 py-3 text-sm text-red-200">{error || chatError}</div>
+  );
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col bg-transparent">
-      <div className="flex min-h-0 flex-1 flex-row">
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div ref={listRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto" role="log" aria-live="polite">
-            {showHomeHeroStack && (
-              <div className="flex min-h-[min(55vh,560px)] flex-1 flex-col items-center justify-center gap-6 px-4 py-8 text-center sm:min-h-[50vh]">
-                <h1 className="max-w-lg text-[1.65rem] font-normal leading-snug tracking-tight text-white sm:text-3xl md:text-[1.75rem]">
-                  What can I help with?
-                </h1>
-                <p
-                  key={chatInteractionMode}
-                  className="max-w-md animate-hero-mode-desc text-sm leading-relaxed text-white/55 md:text-[0.95rem]"
-                >
-                  {CHAT_INTERACTION_MODE_META[chatInteractionMode].description}
-                </p>
-                <div className="w-full max-w-2xl space-y-1.5 text-left">
-                  <LiveDictationBubble />
-                  <AskAnythingComposer layout="center" />
-                </div>
-              </div>
-            )}
+      <div
+        className="flex flex-none flex-wrap items-center justify-center gap-1.5 border-b border-white/[0.08] bg-[#0a0a12]/88 px-3 py-2 backdrop-blur-md sm:gap-2 sm:px-4"
+        role="tablist"
+        aria-label="Manual Journal Mode and AI-Assisted Journal Mode"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={chatInteractionMode === "autobiography"}
+          onClick={() => setChatInteractionMode("autobiography")}
+          className={`rounded-full px-3 py-1.5 text-xs font-medium transition sm:px-4 sm:text-[0.8rem] ${
+            chatInteractionMode === "autobiography"
+              ? "bg-white text-gray-900 shadow-sm"
+              : "text-white/65 hover:bg-white/10 hover:text-white"
+          }`}
+        >
+          {CHAT_INTERACTION_MODE_META.autobiography.label}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={chatInteractionMode === "journal"}
+          onClick={() => setChatInteractionMode("journal")}
+          className={`rounded-full px-3 py-1.5 text-xs font-medium transition sm:px-4 sm:text-[0.8rem] ${
+            chatInteractionMode === "journal"
+              ? "bg-white text-gray-900 shadow-sm"
+              : "text-white/65 hover:bg-white/10 hover:text-white"
+          }`}
+        >
+          {CHAT_INTERACTION_MODE_META.journal.label}
+        </button>
+      </div>
 
-            {(hasConversation || journalActive) && (
-              <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-8 md:px-6">
-                {(error || chatError) && (
-                  <div className="glass-panel mb-6 rounded-2xl px-4 py-3 text-sm text-red-200">
-                    {error || chatError}
-                  </div>
-                )}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div ref={listRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto" role="log" aria-live="polite">
+          {chatInteractionMode === "journal" && (
+            <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-6 md:px-6 md:py-8">
+              {errorBanner}
 
-                {chatInteractionMode === "journal" && journalActive && (
-                  <div className="glass-panel mb-8 rounded-2xl border border-white/10 px-4 py-4 md:px-5">
+              <div className="glass-panel rounded-2xl border border-white/10 px-4 py-4 md:px-5">
                     {/* Header */}
                     <div className="flex items-start justify-between gap-2">
                       <div>
-                        <p className="text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/50">Journal</p>
+                        <p className="text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/50">Manual Journal Mode</p>
                         <p className="mt-1 text-sm text-white/70">
-                          Record or type, edit, get feedback or save directly.
+                          Write directly in the journal box below — type, record, or attach audio.
                         </p>
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
@@ -525,6 +670,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                     {/* Editor textarea */}
                     {(reviewText || rawTranscript || !journalProcessing) && (
                       <textarea
+                        ref={journalTextareaRef}
                         value={reviewText}
                         onChange={(e) => setReviewText(e.target.value)}
                         rows={journalMessages.length > 0 ? 6 : 12}
@@ -542,6 +688,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                           onClick={() => void saveToJournal()}
                           disabled={
                             savingJournal ||
+                            journalCleanupBusy ||
                             !journalEntryDate.trim() ||
                             !journalEntryTime.trim() ||
                             (!reviewText.trim() && journalMessages.length === 0)
@@ -553,8 +700,16 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                       )}
                       <button
                         type="button"
+                        onClick={() => void runJournalCleanup()}
+                        disabled={!reviewText.trim() || journalCleanupBusy || gettingFeedback}
+                        className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
+                      >
+                        {journalCleanupBusy ? "Cleaning up…" : "AI Journal Cleanup"}
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => void getJournalFeedback()}
-                        disabled={!reviewText.trim() || gettingFeedback}
+                        disabled={!reviewText.trim() || gettingFeedback || journalCleanupBusy}
                         className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
                       >
                         {gettingFeedback ? "Getting feedback…" : "Get feedback"}
@@ -574,10 +729,29 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                       </div>
                     </div>
                   </div>
-                )}
+              </div>
+          )}
 
-                {/* Regular chat messages (non-journal conversation mode) */}
-                {messages.map((m) => (
+          {chatInteractionMode === "autobiography" && assistedHero && (
+            <div className="flex min-h-[min(55vh,560px)] flex-1 flex-col items-center justify-center gap-6 px-4 py-8 text-center sm:min-h-[50vh]">
+              <h1 className="max-w-lg text-[1.65rem] font-normal leading-snug tracking-tight text-white sm:text-3xl md:text-[1.75rem]">
+                What can I help with?
+              </h1>
+              <p className="max-w-md animate-hero-mode-desc text-sm leading-relaxed text-white/55 md:text-[0.95rem]">
+                {CHAT_INTERACTION_MODE_META.autobiography.description}
+              </p>
+              <div className="w-full max-w-2xl space-y-1.5 text-left">
+                <LiveDictationBubble />
+                <AskAnythingComposer layout="center" assistedJournalMinimal />
+              </div>
+            </div>
+          )}
+
+          {chatInteractionMode === "autobiography" && !assistedHero && (
+            <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-8 md:px-6">
+              {errorBanner}
+
+              {messages.map((m) => (
                   <div
                     key={m.id}
                     className={`group mb-10 w-full ${m.role === "user" ? "flex justify-end" : ""}`}
@@ -682,31 +856,40 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                   </div>
                 ))}
 
-                {sending && (
-                  <div className="glass-panel-subtle mb-10 inline-block rounded-2xl border border-white/10 px-4 py-3 text-[0.95rem] text-white/60">
-                    <span className="inline-flex gap-1">
-                      <span className="animate-pulse">Thinking</span>
-                      <span className="inline-flex gap-0.5">
-                        <span className="animate-bounce" style={{ animationDelay: "0ms" }}>.</span>
-                        <span className="animate-bounce" style={{ animationDelay: "150ms" }}>.</span>
-                        <span className="animate-bounce" style={{ animationDelay: "300ms" }}>.</span>
-                      </span>
+              {sending && (
+                <div className="glass-panel-subtle mb-10 inline-block rounded-2xl border border-white/10 px-4 py-3 text-[0.95rem] text-white/60">
+                  <span className="inline-flex gap-1">
+                    <span className="animate-pulse">Thinking</span>
+                    <span className="inline-flex gap-0.5">
+                      <span className="animate-bounce" style={{ animationDelay: "0ms" }}>.</span>
+                      <span className="animate-bounce" style={{ animationDelay: "150ms" }}>.</span>
+                      <span className="animate-bounce" style={{ animationDelay: "300ms" }}>.</span>
                     </span>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {showBottomComposer && (
-            <div className="flex-none border-t border-white/10 bg-[#0a0a12]/92 px-3 py-2.5 pb-[max(0.65rem,env(safe-area-inset-bottom))] backdrop-blur-md">
-              <div className="mx-auto w-full max-w-[48rem] space-y-1.5">
-                <LiveDictationBubble />
-                <AskAnythingComposer layout="center" />
-              </div>
+                  </span>
+                </div>
+              )}
             </div>
           )}
         </div>
+
+        {showAssistedBottomComposer && (
+          <div className="flex-none border-t border-white/10 bg-[#0a0a12]/92 px-3 py-2.5 pb-[max(0.65rem,env(safe-area-inset-bottom))] backdrop-blur-md">
+            <div className="mx-auto w-full max-w-[48rem] space-y-2">
+              {messages.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handoffAssistedToJournal}
+                  disabled={sending}
+                  className="w-full rounded-2xl bg-[#10a37f] px-4 py-3.5 text-center text-sm font-semibold tracking-tight text-white shadow-lg shadow-[#10a37f]/20 transition hover:bg-[#0d8c6e] disabled:pointer-events-none disabled:opacity-45"
+                >
+                  Save to Journal
+                </button>
+              )}
+              <LiveDictationBubble />
+              <AskAnythingComposer layout="center" assistedJournalMinimal />
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

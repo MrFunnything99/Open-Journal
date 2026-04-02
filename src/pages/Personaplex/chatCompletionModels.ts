@@ -1,4 +1,4 @@
-/** OpenRouter ids allowlisted for Conversation + Assisted Journal (client + server). Journal mode ignores this. */
+/** OpenRouter ids allowlisted for AI-Assisted Journal Mode /chat (client + server). Manual Journal Mode ignores this. */
 export const CHAT_COMPLETION_MODEL_OPTIONS = [
   { id: "openai/gpt-5.4", label: "GPT‑5.4" },
   { id: "anthropic/claude-sonnet-4.6", label: "Sonnet 4.6" },

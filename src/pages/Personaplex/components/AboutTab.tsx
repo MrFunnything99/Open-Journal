@@ -22,8 +22,8 @@ export const AboutTab: FC = () => {
           </h2>
           <p className="text-[0.95rem] leading-relaxed text-white/80">
             This is placeholder text for the guide section. Here you will find how to navigate the app, start a journal
-            entry, use the knowledge base, and get the most out of conversation modes—written for new visitors and
-            returning users alike.
+            entry, use the knowledge base, and get the most out of Manual Journal Mode and AI-Assisted Journal Mode—written
+            for new visitors and returning users alike.
           </p>
           <p className="text-[0.95rem] leading-relaxed text-white/80">
             Additional paragraphs can document keyboard shortcuts, import and export, and where your data lives. Replace

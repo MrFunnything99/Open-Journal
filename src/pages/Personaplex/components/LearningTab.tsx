@@ -190,7 +190,7 @@ export const LearningTab: FC<Props> = ({ onToast }) => {
                     <p className="mb-2 text-sm font-medium text-white/90">Your own link</p>
                     <p className="mb-4 text-sm leading-relaxed text-white/55">
                       Paste an article, post, or podcast episode you already read or listened to. Reflection chat still
-                      uses your journals to connect the conversation—no automatic web search for a new pick.
+                      uses your manual and AI-assisted journals for context—no automatic web search for a new pick.
                     </p>
                     <input
                       type="url"
