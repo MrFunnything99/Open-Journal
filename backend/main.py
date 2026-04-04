@@ -193,6 +193,8 @@ class ChatRequest(BaseModel):
     mode: Optional[str] = None  # "journal" | "conversation" | "autobiography" (Assisted Journal) | "recommendations" | "learning"
     # Allowlisted OpenRouter id for conversation + autobiography only (see graph.USER_SELECTABLE_CHAT_MODELS)
     openrouter_model: Optional[str] = None
+    # Optional: client-formatted local time + daypart string for Assisted Journal (autobiography) check-ins
+    client_time_context: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -249,6 +251,8 @@ class IngestHistoryRequest(BaseModel):
     session_id: Optional[str] = None
     entry_date: Optional[str] = None  # ISO date/datetime when the journal was written; used for vector DB timestamp
     content_hash: Optional[str] = None  # optional client hint; server uses canonical normalized SHA-256 for skip gate
+    # "manual" = solo journal text; "assisted" = saved AI-assisted session transcript (balanced retrieval in Assisted Journal)
+    entry_source: Optional[str] = None
 
 
 class IngestHistoryResponse(BaseModel):
@@ -263,6 +267,14 @@ class InferEntryDateRequest(BaseModel):
 
 class InferEntryDateResponse(BaseModel):
     date: Optional[str] = None  # ISO 8601 or null if unclear
+
+
+class InferJournalFilenameDatesRequest(BaseModel):
+    paths: List[str]  # file names or relative paths only — no file contents
+
+
+class InferJournalFilenameDatesResponse(BaseModel):
+    dates: List[Optional[str]]  # YYYY-MM-DD or null per path, same order
 
 
 class MemoryItem(BaseModel):
@@ -1176,6 +1188,7 @@ async def chat(req: ChatRequest, request: Request):
     intrusiveness = max(0.0, min(1.0, intrusiveness))
     messages.append(HumanMessage(content=req.text))
     _orm = (req.openrouter_model or "").strip() or None
+    _ctc = (req.client_time_context or "").strip() or None
     state: JournalState = {
         "messages": list(messages),
         "session_id": session_id,
@@ -1184,6 +1197,7 @@ async def chat(req: ChatRequest, request: Request):
         "mode": mode,
         "instance_id": instance_id,
         **({"openrouter_model": _orm} if _orm else {}),
+        **({"client_time_context": _ctc} if _ctc else {}),
     }
     try:
         result = await asyncio.wait_for(
@@ -1369,6 +1383,8 @@ async def ingest_history(req: IngestHistoryRequest, request: Request):
         if not text:
             return IngestHistoryResponse(ok=True, session_id=session_id)
         entry_date = (req.entry_date or "").strip() or None
+        _es = (req.entry_source or "").strip().lower()
+        entry_source = _es if _es in ("manual", "assisted") else None
         extracted = await asyncio.wait_for(
             asyncio.to_thread(
                 save_session_data,
@@ -1377,6 +1393,7 @@ async def ingest_history(req: IngestHistoryRequest, request: Request):
                 entry_date,
                 instance_id,
                 req.content_hash,
+                entry_source,
             ),
             timeout=INGEST_HISTORY_TIMEOUT_SEC,
         )
@@ -1602,6 +1619,130 @@ CRITICAL: What is written in the entry has absolute precedence. Use the exact da
 Reply with ONLY a single line: either an ISO 8601 date in UTC (e.g. 2025-12-18T12:00:00.000Z), or the word NONE if you cannot determine a date from the entry. No other text."""
 
 
+JOURNAL_FILENAME_DATE_SYSTEM = """You file journal entries into a calendar sidebar. You ONLY see file names or relative paths — never file contents.
+
+For each numbered item, infer the single calendar day the user meant (from the name/path: e.g. 1-30-2026.md, 1-30-26.md, 2026-02-03.md, journals/2026/January/2026-01-30.md). Two-digit years 00–69 mean 2000–2069; 70–99 mean 1970–1999. Use US month-day-year when a short date is ambiguous (first number = month). If you cannot infer a day, use null for that index.
+
+Reply with ONLY valid JSON: an object {"dates": [...]} where dates is an array of exactly N entries in order, each either a string "YYYY-MM-DD" or null. Use two-digit month and day (e.g. 2026-01-30). No markdown, no commentary. N is given in the user message."""
+
+
+def _normalize_filing_yyyy_mm_dd(raw: str) -> Optional[str]:
+    """Accept YYYY-MM-DD, YYYY-M-D, ISO datetime prefix, etc.; return canonical YYYY-MM-DD."""
+    s = (raw or "").strip().strip('"').strip("'")
+    if not s or s.lower() == "null":
+        return None
+    s = s.split()[0]
+    if "T" in s:
+        s = s.split("T", 1)[0].strip()
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        datetime(y, mo, d)
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    except ValueError:
+        return None
+
+
+def _year_from_filename_token(tok: str) -> Optional[int]:
+    """4-digit year, or 2-digit (00–69 → 20xx, 70–99 → 19xx)."""
+    t = (tok or "").strip()
+    if not t.isdigit():
+        return None
+    if len(t) == 4:
+        y = int(t)
+        return y if 1900 <= y <= 2100 else None
+    if len(t) == 2:
+        yy = int(t)
+        return 1900 + yy if yy >= 70 else 2000 + yy
+    return None
+
+
+def _journal_path_date_fallback(path: str) -> Optional[str]:
+    """Path/filename-only calendar day when the LLM returns null (no file contents)."""
+    if not (path or "").strip():
+        return None
+    normalized = path.replace("\\", "/").strip()
+    base = normalized.split("/")[-1] or normalized
+    stem = Path(base).stem if base else ""
+    if not stem:
+        return None
+
+    def _ok(y: int, mo: int, d: int) -> Optional[str]:
+        try:
+            datetime(y, mo, d)
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+        except ValueError:
+            return None
+
+    # US: M-D-YYYY or M-D-YY (e.g. 1-30-26.md)
+    m = re.match(r"^(\d{1,2})[-_.](\d{1,2})[-_.](\d{4}|\d{2})$", stem)
+    if m:
+        mo, da = int(m.group(1)), int(m.group(2))
+        y = _year_from_filename_token(m.group(3))
+        if y is not None:
+            hit = _ok(y, mo, da)
+            if hit:
+                return hit
+    # ISO-ish: YYYY-M-D or YY-M-D
+    m = re.match(r"^(\d{4}|\d{2})[-_.](\d{1,2})[-_.](\d{1,2})$", stem)
+    if m:
+        y = _year_from_filename_token(m.group(1))
+        if y is not None:
+            hit = _ok(y, int(m.group(2)), int(m.group(3)))
+            if hit:
+                return hit
+    # Compact YYYYMMDD or YYMMDD
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})$", stem)
+    if m:
+        hit = _ok(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if hit:
+            return hit
+    m = re.match(r"^(\d{2})(\d{2})(\d{2})$", stem)
+    if m:
+        y = _year_from_filename_token(m.group(1))
+        if y is not None:
+            hit = _ok(y, int(m.group(2)), int(m.group(3)))
+            if hit:
+                return hit
+    m = re.search(r"(?:^|[^\d])(\d{1,2})[-_.](\d{1,2})[-_.](\d{4}|\d{2})(?:[^\d]|$)", base)
+    if m:
+        y = _year_from_filename_token(m.group(3))
+        if y is not None:
+            hit = _ok(y, int(m.group(1)), int(m.group(2)))
+            if hit:
+                return hit
+    return None
+
+
+def _parse_journal_filename_dates_llm_json(text: str, expected_n: int) -> List[Optional[str]]:
+    out: List[Optional[str]] = [None] * expected_n
+    if expected_n <= 0 or not (text or "").strip():
+        return out
+    t = text.strip()
+    if "```" in t:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.I)
+        if m:
+            t = m.group(1).strip()
+    try:
+        data = json.loads(t)
+    except json.JSONDecodeError:
+        return out
+    arr = data.get("dates") if isinstance(data, dict) else None
+    if not isinstance(arr, list):
+        return out
+    for i in range(min(expected_n, len(arr))):
+        el = arr[i]
+        if el is None:
+            continue
+        if isinstance(el, str):
+            norm = _normalize_filing_yyyy_mm_dd(el)
+            if norm:
+                out[i] = norm
+    return out
+
+
 @api_router.post("/infer-entry-date", response_model=InferEntryDateResponse)
 async def infer_entry_date(req: InferEntryDateRequest):
     """
@@ -1658,6 +1799,52 @@ async def infer_entry_date(req: InferEntryDateRequest):
     except Exception as e:
         print("[backend] /infer-entry-date error:", e)
         return InferEntryDateResponse(date=None)
+
+
+@api_router.post("/infer-journal-filename-dates", response_model=InferJournalFilenameDatesResponse)
+async def infer_journal_filename_dates(req: InferJournalFilenameDatesRequest):
+    """
+    OpenRouter (default MiniMax M2.7): infer filing calendar day from paths/filenames only.
+    Returns YYYY-MM-DD per path; null when unclear. No file contents are sent or read.
+    """
+    paths = [(p or "").strip() for p in req.paths]
+    paths = [p for p in paths if p]
+    n = len(paths)
+    if n == 0:
+        return InferJournalFilenameDatesResponse(dates=[])
+    or_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not or_key:
+        fb_only = [_journal_path_date_fallback(paths[i]) for i in range(n)]
+        return InferJournalFilenameDatesResponse(dates=fb_only)
+    if n > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 paths per request.")
+    model = (os.getenv("OPENROUTER_JOURNAL_FILENAME_DATE_MODEL") or "minimax/minimax-m2.7").strip()
+    numbered = "\n".join(f"{i + 1}. {paths[i]}" for i in range(n))
+    user_msg = f"N={n}. Return JSON with key \"dates\" (array of length {n}).\n\n{numbered}"
+    prompt = JOURNAL_FILENAME_DATE_SYSTEM + "\n\n" + user_msg
+    try:
+
+        def _call():
+            return _openrouter_chat_completion(
+                prompt,
+                model=model,
+                temperature=0.0,
+                timeout_sec=120.0,
+                max_tokens=min(256 + n * 32, 4096),
+            )
+
+        raw = (await asyncio.to_thread(_call) or "").strip()
+        parsed = _parse_journal_filename_dates_llm_json(raw, n)
+        for i in range(n):
+            if parsed[i] is None:
+                fb = _journal_path_date_fallback(paths[i])
+                if fb:
+                    parsed[i] = fb
+        return InferJournalFilenameDatesResponse(dates=parsed)
+    except Exception as e:
+        print("[backend] /infer-journal-filename-dates error:", e)
+        fb_only = [_journal_path_date_fallback(paths[i]) for i in range(n)]
+        return InferJournalFilenameDatesResponse(dates=fb_only)
 
 
 @api_router.get("/memory-stats", response_model=MemoryStats)

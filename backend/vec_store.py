@@ -144,9 +144,15 @@ def _init_db(conn: sqlite3.Connection) -> None:
             entry_date TEXT NOT NULL,
             raw_text TEXT NOT NULL,
             char_count INTEGER,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            entry_source TEXT
         )
     """)
+    try:
+        conn.execute("ALTER TABLE journal_entries ADD COLUMN entry_source TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_journal_entries_instance ON journal_entries(instance_id)"
     )
@@ -669,14 +675,18 @@ def journal_entry_insert(
     session_id: str,
     entry_date: str,
     raw_text: str,
+    entry_source: str | None = None,
 ) -> int:
     """Insert journal entry row; returns id. Caller adds chunks + vec rows."""
     conn = _get_conn()
     ed = (entry_date or "")[:10]
+    es = (entry_source or "").strip() or None
+    if es is not None and es not in ("manual", "assisted"):
+        es = None
     conn.execute(
         """
-        INSERT INTO journal_entries (session_id, instance_id, entry_date, raw_text, char_count)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO journal_entries (session_id, instance_id, entry_date, raw_text, char_count, entry_source)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             session_id or "",
@@ -684,6 +694,7 @@ def journal_entry_insert(
             ed,
             raw_text or "",
             len(raw_text or ""),
+            es,
         ),
     )
     conn.commit()
@@ -966,6 +977,17 @@ def query_journal_timeline_by_topic(
     return out[:lim]
 
 
+def _journal_row_dict(r: tuple) -> dict:
+    return {
+        "id": r[0],
+        "document": r[1] or "",
+        "session_id": r[2] or "",
+        "timestamp": r[3] or "",
+        "created_at": r[4] if len(r) > 4 else None,
+        "entry_source": r[5] if len(r) > 5 else None,
+    }
+
+
 @_sqlite_serialized
 def list_journal_entries_with_ids(instance_id: str = "") -> list[dict]:
     """Journal entries for Memory UI (id, document=raw_text, session_id, timestamp=entry_date)."""
@@ -973,21 +995,28 @@ def list_journal_entries_with_ids(instance_id: str = "") -> list[dict]:
     where, params = _instance_where(instance_id)
     rows = conn.execute(
         f"""
-        SELECT id, raw_text, session_id, entry_date, created_at
+        SELECT id, raw_text, session_id, entry_date, created_at, entry_source
         FROM journal_entries WHERE {where} ORDER BY id DESC
         """,
         params,
     ).fetchall()
-    return [
-        {
-            "id": r[0],
-            "document": r[1] or "",
-            "session_id": r[2] or "",
-            "timestamp": r[3] or "",
-            "created_at": r[4] if len(r) > 4 else None,
-        }
-        for r in rows
-    ]
+    return [_journal_row_dict(r) for r in rows]
+
+
+@_sqlite_serialized
+def list_journal_entries_recent(instance_id: str = "", *, limit: int = 200) -> list[dict]:
+    """Newest journal rows by id, capped—avoids loading entire history for balanced picks."""
+    conn = _get_conn()
+    where, params = _instance_where(instance_id)
+    lim = max(1, min(int(limit), 500))
+    rows = conn.execute(
+        f"""
+        SELECT id, raw_text, session_id, entry_date, created_at, entry_source
+        FROM journal_entries WHERE {where} ORDER BY id DESC LIMIT ?
+        """,
+        [*params, lim],
+    ).fetchall()
+    return [_journal_row_dict(r) for r in rows]
 
 
 @_sqlite_serialized
@@ -996,7 +1025,7 @@ def journal_entry_get(entry_id: int, instance_id: str) -> dict | None:
     inst = instance_id or ""
     row = conn.execute(
         """
-        SELECT id, raw_text, session_id, entry_date, created_at
+        SELECT id, raw_text, session_id, entry_date, created_at, entry_source
         FROM journal_entries WHERE id = ?
         AND (instance_id = ? OR (? = '' AND (instance_id = '' OR instance_id IS NULL)))
         """,
@@ -1010,7 +1039,37 @@ def journal_entry_get(entry_id: int, instance_id: str) -> dict | None:
         "session_id": row[2] or "",
         "timestamp": row[3] or "",
         "created_at": row[4] if len(row) > 4 else None,
+        "entry_source": row[5] if len(row) > 5 else None,
     }
+
+
+@_sqlite_serialized
+def journal_entry_meta_batch(instance_id: str, entry_ids: list[int]) -> dict[int, dict]:
+    """Map entry_id -> {entry_source, document} for classification (instance-scoped)."""
+    if not entry_ids:
+        return {}
+    conn = _get_conn()
+    inst = instance_id or ""
+    uniq = sorted({int(x) for x in entry_ids if x})
+    if not uniq:
+        return {}
+    where, ip = _instance_where(instance_id)
+    out: dict[int, dict] = {}
+    chunk = 200
+    for i in range(0, len(uniq), chunk):
+        part = uniq[i : i + chunk]
+        ph = ",".join("?" * len(part))
+        rows = conn.execute(
+            f"""
+            SELECT id, entry_source, raw_text
+            FROM journal_entries WHERE id IN ({ph}) AND {where}
+            """,
+            [*part, *ip],
+        ).fetchall()
+        for r in rows:
+            eid = int(r[0])
+            out[eid] = {"entry_source": r[1], "document": r[2] or ""}
+    return out
 
 
 @_sqlite_serialized

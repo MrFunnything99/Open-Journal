@@ -1765,6 +1765,7 @@ def ingest_journal_entry(
     entry_date: str | None = None,
     instance_id: str = "",
     content_hash: str | None = None,
+    entry_source: str | None = None,
 ) -> dict:
     """
     Replace-by-session_id: delete prior rows for this journal session, chunk raw text, embed, store in vec_journal.
@@ -1804,6 +1805,7 @@ def ingest_journal_entry(
         session_id=session_id or "",
         entry_date=ed,
         raw_text=norm,
+        entry_source=entry_source,
     )
     embs: list[list[float]] = []
     if chunks:
@@ -1859,10 +1861,11 @@ def save_session_data(
     entry_date: str | None = None,
     instance_id: str = "",
     content_hash: str | None = None,
+    entry_source: str | None = None,
 ) -> dict:
     """Backward-compatible name for ingest_journal_entry."""
     return ingest_journal_entry(
-        session_id, transcript, entry_date, instance_id, content_hash
+        session_id, transcript, entry_date, instance_id, content_hash, entry_source=entry_source
     )
 
 
@@ -1960,6 +1963,50 @@ def _build_processed_context_block(instance_id: str) -> str:
     return "\n\n".join(parts).strip()
 
 
+def effective_journal_entry_kind(*, entry_source: str | None, document: str) -> str:
+    """
+    Classify a stored journal row as manual (solo writing) vs assisted (chat transcript).
+    Persisted entry_source wins; legacy rows infer assisted from User/Assistant transcript shape.
+    """
+    es = (entry_source or "").strip().lower()
+    if es == "assisted":
+        return "assisted"
+    if es == "manual":
+        return "manual"
+    doc = document or ""
+    if "Assistant:" in doc and ("User:" in doc or doc.lstrip().startswith("User:")):
+        return "assisted"
+    return "manual"
+
+
+def pick_latest_journal_entries_balanced(
+    instance_id: str,
+    *,
+    per_source: int = 3,
+) -> tuple[list[dict], list[dict]]:
+    """Newest-first up to `per_source` rows per kind (manual vs assisted), independent quotas."""
+    import vec_store
+
+    cap = max(1, min(int(per_source), 50))
+    # One bounded scan (newest-first) — avoids loading every journal row on large accounts.
+    window = min(500, max(120, cap * 40))
+    rows = vec_store.list_journal_entries_recent(instance_id or "", limit=window)
+    manual: list[dict] = []
+    assisted: list[dict] = []
+    for row in rows:
+        k = effective_journal_entry_kind(
+            entry_source=row.get("entry_source"),
+            document=(row.get("document") or ""),
+        )
+        if k == "manual" and len(manual) < cap:
+            manual.append(row)
+        elif k == "assisted" and len(assisted) < cap:
+            assisted.append(row)
+        if len(manual) >= cap and len(assisted) >= cap:
+            break
+    return manual, assisted
+
+
 def get_relevant_context_dual(
     query: str,
     top_k_gist: int = 8,
@@ -1968,6 +2015,7 @@ def get_relevant_context_dual(
     *,
     session_id: str | None = None,
     log: bool = True,
+    balance_journal_sources: bool = False,
 ) -> tuple[str, str]:
     """
     (processed_block, raw_block): prefs/on-this-day block + vector-retrieved journal chunk excerpts.
@@ -1997,12 +2045,11 @@ def get_relevant_context_dual(
     retrieved_log: list[dict] = []
     parts: list[str] = []
     used_sql_fallback = False
-    try:
-        rows = vec_store.query_journal_chunks(
-            query_emb, instance_id or "", k=k
-        )
-        lines: list[str] = []
-        for rank, ch in enumerate(rows):
+
+    def _append_chunk_lines(rows_in: list[dict], start_rank: int) -> tuple[list[str], int]:
+        lines_out: list[str] = []
+        rank = start_rank
+        for ch in rows_in:
             txt = (ch.get("chunk_text") or "").strip()
             ed = (ch.get("entry_date") or "").strip()
             dist = float(ch.get("distance") or 0.0)
@@ -2019,48 +2066,174 @@ def get_relevant_context_dual(
                     "rerank_order": rank,
                 }
             )
+            rank += 1
             if txt:
-                lines.append(f"[{ed}] {txt}" if ed else txt)
-        if lines:
-            parts.append(
-                "Relevant excerpts from the user's journals:\n" + "\n".join(f"- {ln}" for ln in lines)
+                lines_out.append(f"[{ed}] {txt}" if ed else txt)
+        return lines_out, rank
+
+    try:
+        if balance_journal_sources:
+            # Enough candidates to split manual vs assisted without oversized vec scans (latency).
+            fetch_k = min(max(k * 5, 24), 56)
+            rows_wide = vec_store.query_journal_chunks(
+                query_emb, instance_id or "", k=fetch_k
             )
+            eids = sorted(
+                {int(x) for x in (ch.get("entry_id") for ch in rows_wide) if x is not None}
+            )
+            meta = vec_store.journal_entry_meta_batch(instance_id or "", eids)
+
+            def _kind_for_chunk(ch: dict) -> str:
+                eid = int(ch.get("entry_id") or 0)
+                m = meta.get(eid) or {}
+                return effective_journal_entry_kind(
+                    entry_source=m.get("entry_source"),
+                    document=(m.get("document") or ""),
+                )
+
+            manual_chunks: list[dict] = []
+            assisted_chunks: list[dict] = []
+            for ch in rows_wide:
+                if _kind_for_chunk(ch) == "assisted":
+                    assisted_chunks.append(ch)
+                else:
+                    manual_chunks.append(ch)
+            n_m = k // 2
+            n_a = k - n_m
+            picked_m = manual_chunks[:n_m]
+            picked_a = assisted_chunks[:n_a]
+            used_cids = {c.get("chunk_id") for c in picked_m + picked_a}
+            rem = k - len(picked_m) - len(picked_a)
+            for ch in rows_wide:
+                if rem <= 0:
+                    break
+                cid = ch.get("chunk_id")
+                if cid in used_cids:
+                    continue
+                used_cids.add(cid)
+                if _kind_for_chunk(ch) == "assisted":
+                    picked_a.append(ch)
+                else:
+                    picked_m.append(ch)
+                rem -= 1
+            rnk = 0
+            lines_m, rnk = _append_chunk_lines(picked_m, rnk)
+            lines_a, _ = _append_chunk_lines(picked_a, rnk)
+            subparts: list[str] = []
+            if lines_m:
+                subparts.append(
+                    "Relevant excerpts — solo / manual journals (balanced retrieval, equal budget to assisted):\n"
+                    + "\n".join(f"- {ln}" for ln in lines_m)
+                )
+            if lines_a:
+                subparts.append(
+                    "Relevant excerpts — AI-assisted journal sessions (balanced retrieval, equal budget to manual):\n"
+                    + "\n".join(f"- {ln}" for ln in lines_a)
+                )
+            if subparts:
+                parts.append("\n\n".join(subparts))
+        else:
+            rows = vec_store.query_journal_chunks(query_emb, instance_id or "", k=k)
+            lines, _ = _append_chunk_lines(rows, 0)
+            if lines:
+                parts.append(
+                    "Relevant excerpts from the user's journals:\n" + "\n".join(f"- {ln}" for ln in lines)
+                )
     except Exception as e:
         print("[backend] get_relevant_context_dual journal chunks:", e)
     if not parts:
         try:
-            recent = vec_store.list_journal_entries_with_ids(instance_id or "")
-            lines_fb: list[str] = []
-            for row in recent[:8]:
-                doc = (row.get("document") or "").strip()
-                ts = (row.get("timestamp") or "").strip()
-                if not doc:
-                    continue
-                cap = 1500
-                snippet = doc[:cap] + ("…" if len(doc) > cap else "")
-                lines_fb.append(f"[{ts}] {snippet}" if ts else snippet)
-                retrieved_log.append(
-                    {
-                        "content": snippet[:2000],
-                        "score": 0.0,
-                        "similarity": 0.0,
-                        "source": "journal_entry_fallback",
-                        "entry_id": row.get("id"),
-                        "timestamp": ts,
-                    }
+            if balance_journal_sources:
+                man_rows, asst_rows = pick_latest_journal_entries_balanced(
+                    instance_id or "", per_source=3
                 )
-            if lines_fb:
-                used_sql_fallback = True
-                parts.append(
-                    "Recent journal entries (recency fallback when vector hits were empty; excerpts may be truncated):\n"
-                    + "\n".join(f"- {ln}" for ln in lines_fb)
-                )
+                lines_fb_m: list[str] = []
+                lines_fb_a: list[str] = []
+                for row in man_rows:
+                    doc = (row.get("document") or "").strip()
+                    ts = (row.get("timestamp") or "").strip()
+                    if not doc:
+                        continue
+                    cap = 1500
+                    snippet = doc[:cap] + ("…" if len(doc) > cap else "")
+                    lines_fb_m.append(f"[{ts}] {snippet}" if ts else snippet)
+                    retrieved_log.append(
+                        {
+                            "content": snippet[:2000],
+                            "score": 0.0,
+                            "similarity": 0.0,
+                            "source": "journal_entry_fallback_manual",
+                            "entry_id": row.get("id"),
+                            "timestamp": ts,
+                        }
+                    )
+                for row in asst_rows:
+                    doc = (row.get("document") or "").strip()
+                    ts = (row.get("timestamp") or "").strip()
+                    if not doc:
+                        continue
+                    cap = 1500
+                    snippet = doc[:cap] + ("…" if len(doc) > cap else "")
+                    lines_fb_a.append(f"[{ts}] {snippet}" if ts else snippet)
+                    retrieved_log.append(
+                        {
+                            "content": snippet[:2000],
+                            "score": 0.0,
+                            "similarity": 0.0,
+                            "source": "journal_entry_fallback_assisted",
+                            "entry_id": row.get("id"),
+                            "timestamp": ts,
+                        }
+                    )
+                fb_sections: list[str] = []
+                if lines_fb_m:
+                    fb_sections.append(
+                        "Recent solo / manual journal entries (balanced fallback; truncated):\n"
+                        + "\n".join(f"- {ln}" for ln in lines_fb_m)
+                    )
+                if lines_fb_a:
+                    fb_sections.append(
+                        "Recent AI-assisted journal sessions (balanced fallback; truncated):\n"
+                        + "\n".join(f"- {ln}" for ln in lines_fb_a)
+                    )
+                if fb_sections:
+                    used_sql_fallback = True
+                    parts.append("\n\n".join(fb_sections))
+            else:
+                recent = vec_store.list_journal_entries_with_ids(instance_id or "")
+                lines_fb: list[str] = []
+                for row in recent[:8]:
+                    doc = (row.get("document") or "").strip()
+                    ts = (row.get("timestamp") or "").strip()
+                    if not doc:
+                        continue
+                    cap = 1500
+                    snippet = doc[:cap] + ("…" if len(doc) > cap else "")
+                    lines_fb.append(f"[{ts}] {snippet}" if ts else snippet)
+                    retrieved_log.append(
+                        {
+                            "content": snippet[:2000],
+                            "score": 0.0,
+                            "similarity": 0.0,
+                            "source": "journal_entry_fallback",
+                            "entry_id": row.get("id"),
+                            "timestamp": ts,
+                        }
+                    )
+                if lines_fb:
+                    used_sql_fallback = True
+                    parts.append(
+                        "Recent journal entries (recency fallback when vector hits were empty; excerpts may be truncated):\n"
+                        + "\n".join(f"- {ln}" for ln in lines_fb)
+                    )
         except Exception as e:
             print("[backend] get_relevant_context_dual journal SQL fallback:", e)
     raw = "\n\n".join(parts) if parts else "None."
     ms = int((time.perf_counter() - t0) * 1000)
     if log:
         notes = "sqlite-vec journal chunks (cosine distance)"
+        if balance_journal_sources:
+            notes += "; manual+assisted balanced"
         if used_sql_fallback:
             notes += "; recent-entry SQL fallback"
         DecisionLogger.log_context_retrieval(
@@ -2073,6 +2246,75 @@ def get_relevant_context_dual(
             duration_ms=ms,
         )
     return processed, raw
+
+
+def get_assisted_journal_continuity_block(
+    instance_id: str,
+    *,
+    max_per_source: int = 3,
+    max_chars_per_entry: int = 3200,
+) -> str:
+    """
+    Latest manual (solo) and AI-assisted journal bodies with independent quotas so chat volume
+    does not crowd out manual writing. Used for Assisted Journal continuity openings.
+
+    The LATEST manual journal entry is separated with an explicit highest-priority label so the
+    LLM always starts from what the user most recently wrote by hand.
+    """
+    try:
+        manual_rows, assisted_rows = pick_latest_journal_entries_balanced(
+            instance_id or "", per_source=max_per_source
+        )
+    except Exception as e:
+        print("[backend] get_assisted_journal_continuity_block:", e)
+        return ""
+
+    cap = max(0, int(max_chars_per_entry))
+
+    def _fmt(row: dict) -> str:
+        doc = (row.get("document") or "").strip()
+        ts = (row.get("timestamp") or "").strip()
+        if not doc:
+            return ""
+        snippet = doc[:cap] + ("…" if len(doc) > cap else "")
+        return f"[entry_date {ts}]\n{snippet}" if ts else snippet
+
+    sections: list[str] = []
+
+    if manual_rows:
+        latest = _fmt(manual_rows[0])
+        if latest:
+            sections.append(
+                "### LATEST manual journal entry (HIGHEST PRIORITY for openers — start here)\n"
+                + latest
+            )
+        older = [_fmt(r) for r in manual_rows[1:] if _fmt(r)]
+        if older:
+            sections.append(
+                "### Older manual journals (recent, for recurring-theme context)\n"
+                + "\n\n---\n\n".join(older)
+            )
+
+    if assisted_rows:
+        assisted_chunks = [_fmt(r) for r in assisted_rows if _fmt(r)]
+        if assisted_chunks:
+            sections.append(
+                "### AI-assisted journal sessions (newest up to "
+                + str(len(assisted_chunks))
+                + " — secondary to latest manual entry for openers)\n"
+                + "\n\n---\n\n".join(assisted_chunks)
+            )
+
+    if not sections:
+        return ""
+    return (
+        "RECENCY-FIRST RULE FOR OPENERS: The user's latest manual journal entry is the primary anchor for opening turns. "
+        "Your opening MUST reference 1-2 specific concrete things from that latest manual entry before anything else. "
+        "Older entries and assisted sessions are supporting context only — use them to notice recurring themes, "
+        "but do NOT lead with older emotionally salient material unless the latest entry is empty or explicitly references it. "
+        "Never tell the user whether a detail came from manual writing or assisted chat.\n\n"
+        + "\n\n".join(sections)
+    )
 
 
 def get_relevant_context(query: str, top_k_gist: int = 8, top_k_episodic: int = 5, instance_id: str = "") -> str:
@@ -2215,7 +2457,13 @@ def _update_journal_entry_by_id(entry_id: int, document: str, instance_id: str =
     if not row:
         return False
     sid = row.get("session_id") or ""
-    ingest_journal_entry(sid, document, row.get("timestamp"), instance_id)
+    ingest_journal_entry(
+        sid,
+        document,
+        row.get("timestamp"),
+        instance_id,
+        entry_source=row.get("entry_source"),
+    )
     return True
 
 
@@ -2253,7 +2501,7 @@ def add_memory_fact(document: str, session_id: str | None = None, instance_id: s
     if not document or not document.strip():
         return None
     sid = session_id or f"user-{uuid.uuid4().hex[:12]}"
-    out = ingest_journal_entry(sid, document, None, instance_id)
+    out = ingest_journal_entry(sid, document, None, instance_id, entry_source="manual")
     eid = out.get("entry_id")
     return int(eid) if eid else None
 

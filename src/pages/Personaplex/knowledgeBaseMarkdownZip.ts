@@ -207,37 +207,6 @@ function parseSimpleFrontmatter(md: string): { front: SimpleFront; body: string 
   return { front, body };
 }
 
-/** YYYY-MM-DD (and common variants) anywhere in a relative path or file name. */
-function parseIsoLikeDateFromPath(rel: string): string | null {
-  const normalized = rel.replace(/\\/g, "/");
-  const patterns = [
-    /(20\d{2})-(\d{2})-(\d{2})/,
-    /(20\d{2})_(\d{2})_(\d{2})/,
-    /(20\d{2})\.(\d{2})\.(\d{2})/,
-  ];
-  for (const pat of patterns) {
-    const m = normalized.match(pat);
-    if (m) {
-      const iso = `${m[1]}-${m[2]}-${m[3]}T12:00:00.000Z`;
-      if (!Number.isNaN(Date.parse(iso))) return iso;
-    }
-  }
-  const compact = normalized.match(/(?:^|[^\d])(20\d{2})(\d{2})(\d{2})(?:[^\d]|$)/);
-  if (compact) {
-    const iso = `${compact[1]}-${compact[2]}-${compact[3]}T12:00:00.000Z`;
-    if (!Number.isNaN(Date.parse(iso))) return iso;
-  }
-  return null;
-}
-
-function parseRecordedLineDate(body: string): string | null {
-  const m = body.match(/\*\*Recorded:\*\*\s*([^\n]+)/);
-  if (!m) return null;
-  const parsed = Date.parse(m[1].trim());
-  if (Number.isNaN(parsed)) return null;
-  return new Date(parsed).toISOString();
-}
-
 /** When there is no ```json transcript block, use markdown body minus boilerplate. */
 function fallbackUserTranscriptFromBody(body: string): string {
   let b = body.replace(/^\s*\*\*Recorded:\*\*[^\n]*\n*/i, "").trim();
@@ -248,30 +217,24 @@ function fallbackUserTranscriptFromBody(body: string): string {
 
 /**
  * Parse one or more journal entries from a dumped .md file (folder upload).
- * Uses YAML `date:`, then **Recorded:**, then path/filename — same precedence as ZIP import.
+ * `entryDateIso` is the filing timestamp (from server filename inference); body is not used for dates.
  */
 export function extractJournalEntriesFromMarkdownDump(
-  relativePath: string,
-  rawText: string
+  _relativePath: string,
+  rawText: string,
+  entryDateIso: string
 ): Array<{ date: string | null; transcript: ChatMessage[] }> {
   const text = rawText.trim();
   if (!text) return [];
-  const pathDate = parseIsoLikeDateFromPath(relativePath);
+  const fileDate = entryDateIso;
   const segments = text.includes(KNOWLEDGE_BASE_ENTRY_BOUNDARY)
     ? text.split(KNOWLEDGE_BASE_ENTRY_BOUNDARY).map((s) => s.trim()).filter(Boolean)
     : [text];
   const out: Array<{ date: string | null; transcript: ChatMessage[] }> = [];
 
   for (const seg of segments) {
-    const { front, body } = parseSimpleFrontmatter(seg);
-    let dateStr: string | null = null;
-    if (typeof front.date === "string" && !Number.isNaN(Date.parse(front.date))) {
-      dateStr = front.date;
-    } else {
-      const rec = parseRecordedLineDate(body);
-      if (rec) dateStr = rec;
-      else if (pathDate) dateStr = pathDate;
-    }
+    const { body } = parseSimpleFrontmatter(seg);
+    const dateStr = fileDate;
     let transcript = parseTranscriptJson(body);
     if (!transcript) {
       const userText = fallbackUserTranscriptFromBody(body);
@@ -307,12 +270,13 @@ function parseTranscriptJson(body: string): ChatMessage[] | null {
 function journalEntryFromMarkdown(
   body: string,
   front: SimpleFront,
-  pathHint: "journal" | "conversation" | null
+  pathHint: "journal" | "conversation" | null,
+  entryDateIso: string
 ): JournalEntry | null {
   const transcript = parseTranscriptJson(body);
   if (!transcript) return null;
   const id = typeof front.id === "string" ? front.id : `import-${Date.now()}`;
-  const date = typeof front.date === "string" && !Number.isNaN(Date.parse(front.date)) ? front.date : new Date().toISOString();
+  const date = entryDateIso;
   let entrySource: "journal" | "conversation" | undefined;
   if (front.entry_source === "conversation") entrySource = "conversation";
   else if (front.entry_source === "journal") entrySource = "journal";
@@ -372,7 +336,29 @@ function libraryCategoryFromPath(rel: string): keyof KnowledgeBaseLibrarySnapsho
   return m[1] as keyof KnowledgeBaseLibrarySnapshot;
 }
 
-export async function parseKnowledgeBaseMarkdownZip(file: File): Promise<{
+/** Relative paths for journal/conversation `.md` files (for `/infer-journal-filename-dates`). */
+export async function listJournalPathsInKnowledgeBaseZip(file: File): Promise<string[]> {
+  try {
+    const zip = await JSZip.loadAsync(await file.arrayBuffer());
+    const out = new Set<string>();
+    for (const relPath of Object.keys(zip.files)) {
+      const z = zip.files[relPath];
+      if (!z || z.dir) continue;
+      const rel = stripRootPrefix(relPath);
+      if (!rel.toLowerCase().endsWith(".md")) continue;
+      const kind = pathEntryKind(rel);
+      if (kind === "journal" || kind === "conversation") out.add(rel);
+    }
+    return [...out];
+  } catch {
+    return [];
+  }
+}
+
+export async function parseKnowledgeBaseMarkdownZip(
+  file: File,
+  journalPathDates: Map<string, string>
+): Promise<{
   entries: JournalEntry[];
   library: KnowledgeBaseLibrarySnapshot;
 } | null> {
@@ -397,6 +383,7 @@ export async function parseKnowledgeBaseMarkdownZip(file: File): Promise<{
           const { front, body } = parseSimpleFrontmatter(text);
 
           if (kind === "journal" || kind === "conversation") {
+            const entryDateIso = journalPathDates.get(rel) ?? new Date().toISOString();
             const segments = text.includes(KNOWLEDGE_BASE_ENTRY_BOUNDARY)
               ? text
                   .split(KNOWLEDGE_BASE_ENTRY_BOUNDARY)
@@ -408,7 +395,8 @@ export async function parseKnowledgeBaseMarkdownZip(file: File): Promise<{
               const je = journalEntryFromMarkdown(
                 parsed.body,
                 parsed.front,
-                kind === "conversation" ? "conversation" : "journal"
+                kind === "conversation" ? "conversation" : "journal",
+                entryDateIso
               );
               if (je) entries.push(je);
             }

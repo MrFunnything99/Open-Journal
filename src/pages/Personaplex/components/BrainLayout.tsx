@@ -82,6 +82,8 @@ type BrainLayoutProps = {
   onPrepareKnowledgeBaseUpload?: () => boolean;
   onImportJournalDumpFolder?: (files: FileList) => void;
   onPrepareJournalDumpUpload?: () => boolean;
+  /** Wipe server vectors for this instance and clear local journals, caches, and in-progress chat (Start fresh). */
+  onStartFresh?: () => void | Promise<void>;
 };
 
 function countJournalText(entries: JournalEntry[], mode: "tokens" | "words"): number {
@@ -194,6 +196,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   onPrepareKnowledgeBaseUpload,
   onImportJournalDumpFolder,
   onPrepareJournalDumpUpload,
+  onStartFresh,
 }) => {
   type ExplorerTab = "journals" | "conversations" | "library" | "learning";
   const [explorerTab, setExplorerTab] = useState<ExplorerTab>("journals");
@@ -895,7 +898,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 type="button"
                 className={journalDumpBtnClass}
                 onClick={openJournalDumpFolderPicker}
-                title="Import a folder like Journal/YYYY-MM/YYYY-MM-DD.md"
+                title="Import a folder of .md/.txt files; filing dates are inferred from each path/name on the server (OpenRouter)"
               >
                 Journal dump upload
               </button>
@@ -903,11 +906,29 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 type="button"
                 className={journalDumpBtnClass}
                 onClick={openJournalDumpFilesPicker}
-                title="Pick one or more .md/.txt files; date comes from filename (e.g. YYYY-MM-DD.md) or file contents, same as folder import"
+                title="Pick one or more .md/.txt files; filing date is inferred from each path/name on the server (OpenRouter), not from file contents"
               >
                 Individual journal(s)
               </button>
             </div>
+            {onStartFresh && (
+              <div className="mt-3 rounded-xl border border-red-200/90 bg-red-50/80 p-3 dark:border-red-400/25 dark:bg-red-950/30">
+                <p className="mb-2 text-[0.6rem] font-semibold uppercase tracking-[0.15em] text-red-800/80 dark:text-red-300/90">
+                  Testing
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void onStartFresh()}
+                  className="w-full rounded-lg border border-red-300/80 bg-white px-3 py-2 text-left text-xs font-semibold text-red-900 shadow-sm transition-colors hover:bg-red-50 dark:border-red-400/35 dark:bg-red-500/15 dark:text-red-100 dark:hover:bg-red-500/25"
+                >
+                  Start fresh
+                </button>
+                <p className="mt-2 text-[0.65rem] leading-snug text-red-900/70 dark:text-red-200/65">
+                  Wipes the server database for this instance and clears local storage (journals, library, recommendations) plus the home chat workspace.
+                  Use between test runs; cannot be undone.
+                </p>
+              </div>
+            )}
           </div>
         )}
       </aside>
@@ -1463,7 +1484,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                   Import a Markdown <strong className="font-medium text-gray-700 dark:text-gray-300">.zip</strong> to load manual journals,
                   AI-assisted journals, and library items. Or use <strong className="font-medium text-gray-700 dark:text-gray-300">Journal dump upload</strong>{" "}
                   or <strong className="font-medium text-gray-700 dark:text-gray-300">Individual journal(s)</strong> in the sidebar — a folder or
-                  separate <code className="rounded bg-gray-200/80 px-1 text-xs dark:bg-black/30">.md</code> files (dates from names or file content).
+                  separate <code className="rounded bg-gray-200/80 px-1 text-xs dark:bg-black/30">.md</code> files (filing dates from path/name via the API).
                   New entries from AI-Assisted Journal Mode appear here after you save.
                 </p>
                 {onImportKnowledgeBaseFile ? (

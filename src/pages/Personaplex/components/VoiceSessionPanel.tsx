@@ -11,6 +11,8 @@ export type VoiceSessionPanelProps = {
   onToggleMute: () => void;
   /** Full teardown: stop audio/mic, reset to idle, return to composer (End + Close). */
   onExitVoiceMode: () => void;
+  /** Interrupt TTS playback and return to listening (skip current response). */
+  onSkipResponse?: () => void;
   latestAssistant?: PersonaplexChatMessage;
 };
 
@@ -134,6 +136,7 @@ export function VoiceSessionPanel({
   isMuted,
   onToggleMute,
   onExitVoiceMode,
+  onSkipResponse,
   latestAssistant,
 }: VoiceSessionPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -193,6 +196,21 @@ export function VoiceSessionPanel({
       </div>
 
       <div className="flex flex-col items-center gap-3 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-4">
+        {voiceState === "speaking" && onSkipResponse && (
+          <button
+            type="button"
+            onClick={onSkipResponse}
+            className="mb-1 flex items-center gap-2 rounded-full bg-white/10 px-5 py-2 text-xs font-medium text-white/70 transition hover:bg-white/20 hover:text-white/90 active:scale-95"
+            aria-label="Skip response and start talking"
+            title="Skip — stop the assistant and start talking"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 5l7 7-7 7" />
+            </svg>
+            Skip
+          </button>
+        )}
         <div className="flex items-center gap-6">
           <button
             type="button"

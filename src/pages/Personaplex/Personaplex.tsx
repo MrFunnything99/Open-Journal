@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { backendFetch } from "../../backendApi";
 import type { ChatMessage } from "./hooks/useJournalHistory";
-import { parseKnowledgeBaseFile, useJournalHistory } from "./hooks/useJournalHistory";
+import { JOURNAL_HISTORY_STORAGE_KEY, parseKnowledgeBaseFile, useJournalHistory } from "./hooks/useJournalHistory";
 import {
   buildKnowledgeBaseMarkdownZip,
   extractJournalEntriesFromMarkdownDump,
+  listJournalPathsInKnowledgeBaseZip,
   parseKnowledgeBaseMarkdownZip,
 } from "./knowledgeBaseMarkdownZip";
 import { BrainLayout, type BrainLibraryCategory } from "./components/BrainLayout";
@@ -36,6 +37,112 @@ const EMPTY_RECOMMENDATIONS: RecommendationsBundle = {
   research: [],
   news: [],
 };
+
+const JOURNAL_FILENAME_DATE_CHUNK = 80;
+
+/** Canonical YYYY-MM-DD from flexible string, or null. */
+function parseYyyyMmDdFlexible(raw: string | null | undefined): string | null {
+  if (raw == null || typeof raw !== "string") return null;
+  const s = raw.trim().split("T")[0].split(" ")[0];
+  const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!m) return null;
+  const y = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10);
+  const d = parseInt(m[3], 10);
+  const dt = new Date(y, mo - 1, d, 12, 0, 0, 0);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+  return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+/** Local-calendar noon ISO from YYYY-MM-DD. */
+function localNoonIsoFromYmd(ymd: string): string {
+  const m = ymd.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return new Date().toISOString();
+  const y = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10);
+  const d = parseInt(m[3], 10);
+  const dt = new Date(y, mo - 1, d, 12, 0, 0, 0);
+  return dt.toISOString();
+}
+
+/** 4-digit year or 2-digit (00–69 → 20xx, 70–99 → 19xx), aligned with backend. */
+function yearFromFilenameToken(t: string): number | null {
+  if (!/^\d+$/.test(t)) return null;
+  if (t.length === 4) {
+    const y = parseInt(t, 10);
+    return y >= 1900 && y <= 2100 ? y : null;
+  }
+  if (t.length === 2) {
+    const yy = parseInt(t, 10);
+    return yy >= 70 ? 1900 + yy : 2000 + yy;
+  }
+  return null;
+}
+
+/** Path/name-only date (matches backend fallback) when API is unreachable or returns null. */
+function journalPathYmdFallback(path: string): string | null {
+  const base = path.replace(/\\/g, "/").split("/").pop() ?? path;
+  const stem = base.replace(/\.(md|txt|markdown)$/i, "").trim();
+  let g = stem.match(/^(\d{1,2})[-_.](\d{1,2})[-_.](\d{4}|\d{2})$/);
+  if (g) {
+    const y = yearFromFilenameToken(g[3]);
+    if (y != null) return parseYyyyMmDdFlexible(`${y}-${g[1]}-${g[2]}`);
+  }
+  g = stem.match(/^(\d{4}|\d{2})[-_.](\d{1,2})[-_.](\d{1,2})$/);
+  if (g) {
+    const y = yearFromFilenameToken(g[1]);
+    if (y != null) return parseYyyyMmDdFlexible(`${y}-${g[2]}-${g[3]}`);
+  }
+  g = stem.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (g) return parseYyyyMmDdFlexible(`${g[1]}-${g[2]}-${g[3]}`);
+  g = stem.match(/^(\d{2})(\d{2})(\d{2})$/);
+  if (g) {
+    const y = yearFromFilenameToken(g[1]);
+    if (y != null) return parseYyyyMmDdFlexible(`${y}-${parseInt(g[2], 10)}-${parseInt(g[3], 10)}`);
+  }
+  const inBase = base.match(/(?:^|[^\d])(\d{1,2})[-_.](\d{1,2})[-_.](\d{4}|\d{2})(?:[^\d]|$)/);
+  if (inBase) {
+    const y = yearFromFilenameToken(inBase[3]);
+    if (y != null) return parseYyyyMmDdFlexible(`${y}-${inBase[1]}-${inBase[2]}`);
+  }
+  return null;
+}
+
+function resolveFilingIsoFromApiAndPath(apiDay: string | null | undefined, path: string, fallbackNow: string): string {
+  const fromApi = parseYyyyMmDdFlexible(
+    apiDay != null && String(apiDay).trim() !== "" && String(apiDay).toLowerCase() !== "null" ? String(apiDay) : null
+  );
+  if (fromApi) return localNoonIsoFromYmd(fromApi);
+  const fromPath = journalPathYmdFallback(path);
+  if (fromPath) return localNoonIsoFromYmd(fromPath);
+  return fallbackNow;
+}
+
+/** OpenRouter (MiniMax M2.7 by default): paths/filenames only — no file contents. */
+async function inferJournalPathDatesMap(paths: string[]): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (paths.length === 0) return map;
+  const fallback = new Date().toISOString();
+  const unique = [...new Set(paths)];
+  for (let i = 0; i < unique.length; i += JOURNAL_FILENAME_DATE_CHUNK) {
+    const slice = unique.slice(i, i + JOURNAL_FILENAME_DATE_CHUNK);
+    try {
+      const r = await backendFetch("/infer-journal-filename-dates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths: slice }),
+      });
+      const data = r.ok ? ((await r.json()) as { dates?: (string | null)[] }) : {};
+      const dates = Array.isArray(data.dates) ? data.dates : [];
+      slice.forEach((p, j) => {
+        map.set(p, resolveFilingIsoFromApiAndPath(j < dates.length ? dates[j] : null, p, fallback));
+      });
+    } catch {
+      slice.forEach((p) => map.set(p, resolveFilingIsoFromApiAndPath(null, p, fallback)));
+    }
+  }
+  return map;
+}
 
 function RecFeedbackLinks({
   category,
@@ -287,7 +394,10 @@ export const Personaplex = () => {
     updateJournalEntry,
     getFormattedDate,
     importEntriesReplaceAll,
+    clearHistory,
   } = useJournalHistory();
+
+  const chatWorkspaceResetRef = useRef<(() => void) | null>(null);
 
   const prepareKnowledgeBaseUpload = useCallback(() => window.confirm(KB_UPLOAD_CONFIRM_MESSAGE), []);
 
@@ -302,6 +412,53 @@ export const Personaplex = () => {
       return false;
     }
   }, []);
+
+  const handleStartFreshPersonaplex = useCallback(async () => {
+    if (
+      !window.confirm(
+        "Start fresh?\n\n" +
+          "• Server: deletes journal embeddings and library vectors for this device/instance.\n" +
+          "• This browser: clears saved journals, library and recommendations cache, library interview, and the in-progress home chat.\n\n" +
+          "This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    const ok = await resetServerKnowledgeBaseMemory();
+    if (!ok) {
+      setToastMessage("Could not wipe server memory. Your local data was not changed.");
+      setTimeout(() => setToastMessage(null), 5000);
+      return;
+    }
+    try {
+      localStorage.removeItem(JOURNAL_HISTORY_STORAGE_KEY);
+      localStorage.removeItem(LIBRARY_CACHE_KEY);
+      localStorage.removeItem(RECOMMENDATIONS_CACHE_KEY);
+    } catch {
+      /* ignore */
+    }
+    clearHistory();
+    setLibraryItems({ books: [], podcasts: [], articles: [], research: [] });
+    setRecommendations({ ...EMPTY_RECOMMENDATIONS });
+    setConsumedIds(new Set());
+    setRemovingKeys(new Set());
+    setLibraryInterviewSessionId(null);
+    setLibraryInterviewMessages([]);
+    setLibraryInterviewInput("");
+    setLibraryAddCategory(null);
+    setLibraryDraftText("");
+    setLibraryEditingId(null);
+    setLibraryEditDate("");
+    setLibraryEditNote("");
+    setShowLibraryInterview(false);
+    setCalendarSelectedDate(null);
+    setCalendarDaySummary(null);
+    setCalendarDaySummaryLoading(false);
+    chatWorkspaceResetRef.current?.();
+    void fetchLibrary();
+    setToastMessage("Started fresh: server memory wiped and local Personaplex data cleared.");
+    setTimeout(() => setToastMessage(null), 5000);
+  }, [clearHistory, resetServerKnowledgeBaseMemory, fetchLibrary]);
 
   const pushLibraryBulkToServer = useCallback(async (items: LibraryBulkImportPayloadItem[]) => {
     if (items.length === 0) return true;
@@ -416,7 +573,9 @@ export const Personaplex = () => {
           file.type === "application/x-zip-compressed";
 
         if (looksZip) {
-          const parsed = await parseKnowledgeBaseMarkdownZip(file);
+          const journalPaths = await listJournalPathsInKnowledgeBaseZip(file);
+          const dateMap = await inferJournalPathDatesMap(journalPaths);
+          const parsed = await parseKnowledgeBaseMarkdownZip(file, dateMap);
           if (!parsed) {
             setToastMessage("That ZIP isn’t a valid Markdown knowledge base (expected journals/, conversations/, library/).");
             setTimeout(() => setToastMessage(null), 5000);
@@ -470,13 +629,17 @@ export const Personaplex = () => {
         return;
       }
 
+      const paths = list.map((f) => (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name);
+      const dateMap = await inferJournalPathDatesMap(paths);
+
       type Row = { date: string | null; transcript: ChatMessage[] };
       const rows: Row[] = [];
       for (const f of list) {
-        const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath ?? f.name;
+        const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
         const text = (await f.text()).trim();
         if (!text) continue;
-        for (const item of extractJournalEntriesFromMarkdownDump(rel, text)) {
+        const entryDateIso = dateMap.get(rel) ?? new Date().toISOString();
+        for (const item of extractJournalEntriesFromMarkdownDump(rel, text, entryDateIso)) {
           rows.push(item);
         }
       }
@@ -674,7 +837,7 @@ export const Personaplex = () => {
   );
 
   return (
-    <PersonaplexChatProvider onToast={chatToast} onAgentAction={handleChatAgentAction}>
+    <PersonaplexChatProvider onToast={chatToast} onAgentAction={handleChatAgentAction} chatWorkspaceResetRef={chatWorkspaceResetRef}>
       <AssistedJournalUnloadSync />
     <div className="relative flex h-screen w-full flex-row overflow-hidden bg-[#0a0a12] font-sans text-white antialiased">
       {/* Ethereal mesh + animated ambient orbs (pointer-events none on layer) */}
@@ -905,6 +1068,7 @@ export const Personaplex = () => {
                   onPrepareKnowledgeBaseUpload={prepareKnowledgeBaseUpload}
                   onImportJournalDumpFolder={handleImportJournalDumpFolder}
                   onPrepareJournalDumpUpload={prepareJournalDumpUpload}
+                  onStartFresh={handleStartFreshPersonaplex}
                 />
               </div>
               ) : (

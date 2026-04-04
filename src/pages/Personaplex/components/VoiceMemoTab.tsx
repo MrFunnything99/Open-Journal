@@ -1092,6 +1092,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
             isMuted={voiceSession.isMuted}
             onToggleMute={voiceSession.toggleMute}
             onExitVoiceMode={exitVoiceMode}
+            onSkipResponse={voiceSession.skipResponse}
             latestAssistant={latestAssistant}
           />
         )}

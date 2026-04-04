@@ -17,7 +17,9 @@ export type JournalEntry = {
   entrySource?: "journal" | "conversation";
 };
 
-const STORAGE_KEY = "openjournal-history";
+/** Local journal / Brain entries (also cleared by Start fresh). */
+export const JOURNAL_HISTORY_STORAGE_KEY = "openjournal-history";
+const STORAGE_KEY = JOURNAL_HISTORY_STORAGE_KEY;
 
 function loadFromStorage(): JournalEntry[] {
   try {
@@ -298,6 +300,7 @@ export const useJournalHistory = () => {
             text: text.trim(),
             entry_date: entry.date,
             session_id: entry.id,
+            entry_source: entry.entrySource === "conversation" ? "assisted" : "manual",
           }),
         });
         const data = r.ok ? await r.json().catch(() => ({})) : { ok: false };

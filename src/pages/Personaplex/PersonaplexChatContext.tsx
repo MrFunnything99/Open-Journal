@@ -2,10 +2,12 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useId,
   useMemo,
   useRef,
   useState,
+  type MutableRefObject,
   type ReactNode,
 } from "react";
 
@@ -52,6 +54,23 @@ import { blobToBase64, blobToWavBase64 } from "./utils/audioToWav";
 const CHAT_TIMEOUT_MS = 190_000;
 /** Sent for API compatibility; server always uses full memory retrieval (1.0) for graph /chat. */
 const CHAT_PERSONALIZATION_FULL = 1;
+
+/** Local time + daypart for Assisted Journal (/chat autobiography) secondary check-ins. */
+function buildAssistedJournalClientTimeContext(): string {
+  const now = new Date();
+  const h = now.getHours();
+  const daypart =
+    h >= 5 && h < 12 ? "morning" : h >= 12 && h < 17 ? "afternoon" : h >= 17 && h < 21 ? "evening" : "night";
+  const local = new Intl.DateTimeFormat(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(now);
+  return `User local: ${local}. For optional secondary check-ins, treat this as ${daypart}.`;
+}
 
 export type PersonaplexChatMessage = {
   id: string;
@@ -183,11 +202,14 @@ export function PersonaplexChatProvider({
   children,
   onToast,
   onAgentAction,
+  chatWorkspaceResetRef,
 }: {
   children: ReactNode;
   onToast: (msg: string) => void;
   /** Runs after a successful /chat when the server returned allowlisted UI actions (e.g. navigate). */
   onAgentAction?: (actions: PersonaplexNavigateAction[]) => void;
+  /** Parent can call ref.current() to clear in-memory chat / assisted journal workspace (e.g. Start fresh). */
+  chatWorkspaceResetRef?: MutableRefObject<(() => void) | null>;
 }) {
   const idPrefix = useId();
   const onAgentActionRef = useRef(onAgentAction);
@@ -401,6 +423,7 @@ export function PersonaplexChatProvider({
       };
       if (chatInteractionMode === "autobiography") {
         payload.openrouter_model = userChatModel;
+        payload.client_time_context = buildAssistedJournalClientTimeContext();
       }
       const res = await backendFetch("/chat", {
         method: "POST",
@@ -535,6 +558,7 @@ export function PersonaplexChatProvider({
         intrusiveness: 0.5,
         mode: "autobiography",
         openrouter_model: userChatModel,
+        client_time_context: buildAssistedJournalClientTimeContext(),
       };
       const res = await backendFetch("/chat", {
         method: "POST",
@@ -734,6 +758,23 @@ export function PersonaplexChatProvider({
     setChatError(null);
     setPendingAudioFile(null);
   }, []);
+
+  const resetChatWorkspaceForStartFresh = useCallback(() => {
+    resetAssistedWorkspace();
+    setJournalFileToProcess(null);
+    setJournalTextToProcess(null);
+    setMicPhase("idle");
+    stopSpeechRecognition();
+    setActivityLog([]);
+  }, [resetAssistedWorkspace, stopSpeechRecognition]);
+
+  useEffect(() => {
+    if (!chatWorkspaceResetRef) return;
+    chatWorkspaceResetRef.current = resetChatWorkspaceForStartFresh;
+    return () => {
+      chatWorkspaceResetRef.current = null;
+    };
+  }, [chatWorkspaceResetRef, resetChatWorkspaceForStartFresh]);
 
   const value = useMemo(
     () => ({

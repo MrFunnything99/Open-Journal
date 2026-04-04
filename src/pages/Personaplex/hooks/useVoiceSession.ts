@@ -41,15 +41,15 @@ function getSpeechRecCtor(): (new () => SpeechRecInstance) | undefined {
 // ---------------------------------------------------------------------------
 
 /** Min time RMS stays above threshold before it counts toward barge-in. */
-const BARGE_IN_RMS_MS = 400;
+const BARGE_IN_RMS_MS = 900;
 /** Min time we have considered “confident” speech hypothesis before stopping TTS. */
-const BARGE_IN_SPEECH_MS = 450;
+const BARGE_IN_SPEECH_MS = 1000;
 /** After TTS starts, ignore barge-in briefly (transients / echo). */
-const BARGE_IN_COOLDOWN_MS = 500;
+const BARGE_IN_COOLDOWN_MS = 1500;
 /** Chrome exposes confidence on alternatives; require this when present. */
-const BARGE_IN_CONFIDENCE = 0.85;
+const BARGE_IN_CONFIDENCE = 0.9;
 /** RMS ~ average normalized sample magnitude; tune for quiet rooms vs noisy. */
-const RMS_THRESHOLD = 0.018;
+const RMS_THRESHOLD = 0.03;
 const RMS_HYSTERESIS = 0.65;
 
 function rmsFromTimeDomain(data: Uint8Array): number {
@@ -72,16 +72,16 @@ function speechHypothesisQualifiesForBargeIn(
   isFinal: boolean,
 ): boolean {
   const t = transcript.trim();
-  if (t.length < 5) return false;
+  if (t.length < 12) return false;
 
   if (confidence !== undefined && !Number.isNaN(confidence)) {
     if (confidence < BARGE_IN_CONFIDENCE) return false;
-    return isFinal || t.length >= 10;
+    return isFinal || t.length >= 18;
   }
 
   // No confidence (e.g. Safari): require stronger text signal
-  if (isFinal) return t.length >= 8;
-  return t.length >= 22;
+  if (isFinal) return t.length >= 15;
+  return t.length >= 30;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +160,8 @@ export type UseVoiceSessionReturn = {
   startSession: () => void;
   endSession: () => void;
   toggleMute: () => void;
+  /** Interrupt TTS playback and return to listening (manual skip button). */
+  skipResponse: () => void;
   isMuted: boolean;
   speakResponse: (text: string) => Promise<void>;
 };
@@ -570,6 +572,15 @@ export function useVoiceSession({
     setVoiceState("idle");
   }, [clearSilenceTimer, releaseMicStream, stopSpeechRec, stopTts]);
 
+  const skipResponse = useCallback(() => {
+    if (!activeRef.current || stateRef.current !== "speaking") return;
+    stopTts();
+    accumulatedFinalRef.current = "";
+    setPartialTranscript("");
+    setVoiceState("listening");
+    startSpeechRec();
+  }, [startSpeechRec, stopTts]);
+
   const toggleMute = useCallback(() => {
     if (!activeRef.current) return;
     setIsMuted((prev) => {
@@ -605,6 +616,7 @@ export function useVoiceSession({
     startSession,
     endSession,
     toggleMute,
+    skipResponse,
     isMuted,
     speakResponse,
   };
