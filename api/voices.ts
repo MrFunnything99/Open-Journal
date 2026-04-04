@@ -1,18 +1,9 @@
 /// <reference types="node" />
 
-const ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices";
+const MISTRAL_VOICES_URL = "https://api.mistral.ai/v1/audio/voices?limit=50&offset=0";
 
-/** Fallback premade voices if API fails */
 const FALLBACK_VOICES: Array<{ voice_id: string; name: string }> = [
-  { voice_id: "21m00Tcm4TlvDq8ikWAM", name: "Rachel" },
-  { voice_id: "pNInz6obpgDQGcFmaJgB", name: "Adam" },
-  { voice_id: "EXAVITQu4vr4xnSDxMaL", name: "Bella" },
-  { voice_id: "ErXwobaYiN019PkySvjV", name: "Antoni" },
-  { voice_id: "MF3mGyEYCl7XYWbV9V6O", name: "Elli" },
-  { voice_id: "TxGEqnHWrfWFTfGW9XjX", name: "Josh" },
-  { voice_id: "VR6AewLTigWG4xSOukaG", name: "Arnold" },
-  { voice_id: "onwK4e9ZLuTAKqWW03F9", name: "Domi" },
-  { voice_id: "N2lVS1w4EtoT3dr4eOWO", name: "Sam" },
+  { voice_id: "en_paul_neutral", name: "Paul (neutral)" },
 ];
 
 export async function GET() {
@@ -23,37 +14,31 @@ export async function GET() {
     });
 
   try {
-    const apiKey = process.env.ELEVENLABS_API_KEY;
+    const apiKey = process.env.MISTRAL_API_KEY?.trim();
     if (!apiKey) {
-      return jsonResponse({ voices: FALLBACK_VOICES }, 200);
+      return jsonResponse({ voices: FALLBACK_VOICES, provider: "fallback" }, 200);
     }
 
-    const res = await fetch(ELEVENLABS_VOICES_URL, {
-      headers: { "xi-api-key": apiKey },
+    const res = await fetch(MISTRAL_VOICES_URL, {
+      headers: { Authorization: `Bearer ${apiKey}` },
     });
 
     if (!res.ok) {
-      return jsonResponse({ voices: FALLBACK_VOICES }, 200);
+      return jsonResponse({ voices: FALLBACK_VOICES, provider: "fallback" }, 200);
     }
 
-    const data = (await res.json()) as {
-      voices?: Array<{ voice_id?: string; id?: string; name: string }>;
-    };
-    const rawVoices = data.voices ?? FALLBACK_VOICES;
-    const voices = rawVoices
-      .map((v) => ({
-        voice_id: v.voice_id ?? v.id ?? "",
-        name: v.name,
-      }))
-      .filter((v) => v.voice_id);
+    const data = (await res.json()) as { items?: Array<{ id?: string; name?: string }> };
+    const items = data.items ?? [];
+    const voices = items
+      .filter((v) => v && typeof v.id === "string" && v.id.trim())
+      .map((v) => ({ voice_id: v.id!.trim(), name: (v.name || "Voice").trim() || "Voice" }));
 
-    const hasRachel = voices.some((v) => v.voice_id === "21m00Tcm4TlvDq8ikWAM");
-    const voicesWithDefault = hasRachel
-      ? voices
-      : [{ voice_id: "21m00Tcm4TlvDq8ikWAM", name: "Rachel" }, ...voices];
+    if (voices.length === 0) {
+      return jsonResponse({ voices: FALLBACK_VOICES, provider: "fallback" }, 200);
+    }
 
-    return jsonResponse({ voices: voicesWithDefault }, 200);
+    return jsonResponse({ voices, provider: "mistral" }, 200);
   } catch {
-    return jsonResponse({ voices: FALLBACK_VOICES }, 200);
+    return jsonResponse({ voices: FALLBACK_VOICES, provider: "fallback" }, 200);
   }
 }

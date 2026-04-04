@@ -87,23 +87,6 @@ async function handleRequest(
     return;
   }
 
-  if (pathname === "/api/scribe-token" && method === "GET") {
-    try {
-      const { GET } = await import("../api/scribe-token");
-      const request = new Request(`http://localhost${url}`);
-      const response = await GET(request);
-      res.writeHead(response.status, {
-        "Content-Type": response.headers.get("Content-Type") ?? "application/json",
-      });
-      res.end(await response.text());
-    } catch (err) {
-      console.error("[api-server] /api/scribe-token error:", err);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String(err) }));
-    }
-    return;
-  }
-
   if (pathname === "/api/transcribe" && method === "POST") {
     try {
       const { POST } = await import("../api/transcribe");

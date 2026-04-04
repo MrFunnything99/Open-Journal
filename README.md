@@ -53,7 +53,7 @@ If you want the implementation and deployment details, jump to:
 
 ## Core Features
 
-- **Voice journaling**: Speak naturally using ElevenLabs speech-to-text and text-to-speech.
+- **Voice journaling**: Browser speech recognition and dictation; server STT via OpenRouter; TTS via Mistral Voxtral when `MISTRAL_API_KEY` is set.
 - **Text journaling**: Type messages directly to the AI assistant.
 - **Automatic memory sync**: Journal entries in History are synced to backend memory so recommendations and later chats can use them.
 - **Memory view**: Inspect or edit stored facts and summaries.
@@ -90,7 +90,6 @@ When a user journals:
 ```mermaid
 flowchart LR
     U[User] --> FE[React Frontend]
-    FE --> VOICE[ElevenLabs Voice APIs]
     FE --> API[FastAPI Backend]
     API --> CHAT[OpenRouter for chat]
     API --> GEM[Gemini for extraction only]
@@ -130,7 +129,7 @@ sequenceDiagram
 | Layer | Main Tools | What It Does |
 |---|---|---|
 | Frontend | React, Vite, Tailwind, React Router | UI, session controls, history, memory, recommendations |
-| Voice | ElevenLabs | Speech-to-text and text-to-speech |
+| Voice / TTS | Mistral Voxtral, OpenRouter STT | Read-aloud and Assisted Journal voice mode (TTS); transcription via OpenRouter |
 | Main backend | FastAPI, LangGraph | Chat routes, memory sync, recommendations, auth, ingest |
 | Memory layer | SQLite, sqlite-vec | Persistent journal memory and vector search |
 | AI models | Perplexity, Gemini, OpenRouter | Perplexity for vector embeddings; Gemini or OpenRouter for extraction/helpers; OpenRouter for `/chat` (default GPT 5.4) |
@@ -152,7 +151,7 @@ sequenceDiagram
 - API keys for:
   - `OPENROUTER_API_KEY`
   - `GEMINI_API_KEY` (or rely on OpenRouter for extraction if configured)
-  - `ELEVENLABS_API_KEY`
+  - `MISTRAL_API_KEY` (for `/api/voice` TTS)
 
 Python 3.11 is strongly recommended because some optional libraries are awkward on Python 3.9.
 
@@ -173,7 +172,7 @@ Minimum useful setup:
 ```env
 OPENROUTER_API_KEY=your_openrouter_key
 GEMINI_API_KEY=your_gemini_key
-ELEVENLABS_API_KEY=your_elevenlabs_key
+MISTRAL_API_KEY=your_mistral_key
 ```
 
 If you want login support:
@@ -274,7 +273,7 @@ flowchart TD
     Routes --> SQLite[(SQLite + sqlite-vec)]
     Routes --> Gemini[Gemini APIs]
     Routes --> OpenRouter[OpenRouter API]
-    Routes --> ElevenLabs[ElevenLabs API]
+    Routes --> Mistral[Mistral API TTS]
 ```
 
 ### Key architectural ideas
@@ -312,7 +311,6 @@ flowchart TD
 ├── api/
 │   ├── voice.ts
 │   ├── voices.ts
-│   ├── scribe-token.ts
 │   ├── transcribe.ts
 │   └── reformat.ts
 ├── scripts/
@@ -354,7 +352,7 @@ More backend-only detail (run, endpoints, Fly volume) is in **`backend/README.md
 | `GEMINI_API_KEY` | Extraction and Gemini helpers when using direct Google SDK (not embeddings) |
 | `PERPLEXITY_API_KEY` | Vector embeddings for gist / episodic / library (sqlite-vec) |
 | `OPENROUTER_API_KEY` | Chat (`/api/chat`), journal validation; optional `OPENROUTER_CHAT_MODEL` (default `openai/gpt-5.4`) |
-| `ELEVENLABS_API_KEY` | Voice transcription and voice playback |
+| `MISTRAL_API_KEY` | Text-to-speech (`/api/voice`) via Mistral Voxtral |
 
 ### Common optional variables
 
@@ -502,7 +500,7 @@ If recommendations seem generic, it usually means one of these is true:
 - **OpenRouter**: journal `/chat` conversation (default `openai/gpt-5.4`), journal validation, optional extraction
 - **Perplexity**: vector embeddings for sqlite-vec (gist, episodic, library)
 - **Gemini**: extraction, date inference, and helper generation when not routed via OpenRouter (not embeddings)
-- **ElevenLabs**: speech input/output
+- **Mistral Voxtral**: text-to-speech for read-aloud and voice mode (`MISTRAL_API_KEY`)
 
 ### Optional or experimental pieces
 - **LightRAG**: optional enrichment layer, not required for core memory sync

@@ -40,7 +40,7 @@ export type PlayChatReadAloudOptions = {
 };
 
 /**
- * Play assistant/user text via backend TTS (Mistral Voxtral when configured, else ElevenLabs).
+ * Play assistant/user text via backend TTS (Mistral Voxtral; requires MISTRAL_API_KEY on the server).
  */
 export async function playChatReadAloud(
   text: string,

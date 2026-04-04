@@ -142,6 +142,8 @@ type AskAnythingComposerProps = {
   onExpandRail?: () => void;
   /** Home — AI-Assisted Journal Mode: hide + menu and mode chip (mode is chosen above). */
   assistedJournalMinimal?: boolean;
+  /** Callback to launch voice conversation mode (only shown in autobiography + assistedJournalMinimal). */
+  onStartVoiceSession?: () => void;
 };
 
 type PlusPlacement = "above" | "below" | "right";
@@ -295,6 +297,7 @@ export function AskAnythingComposer({
   railNarrow = false,
   onExpandRail,
   assistedJournalMinimal = false,
+  onStartVoiceSession,
 }: AskAnythingComposerProps) {
   const {
     idPrefix,
@@ -576,6 +579,24 @@ export function AskAnythingComposer({
               strokeLinejoin="round"
               d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
             />
+          </svg>
+        </button>
+      )}
+
+      {/* Voice conversation mode (autobiography + assistedJournalMinimal only) */}
+      {assistedJournalMinimal && chatInteractionMode === "autobiography" && onStartVoiceSession && micPhase === "idle" && (
+        <button
+          type="button"
+          onClick={onStartVoiceSession}
+          disabled={composerDisabled}
+          className={`flex shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500/20 to-emerald-500/20 text-white/90 ring-1 ring-white/15 transition hover:from-indigo-500/30 hover:to-emerald-500/30 hover:ring-white/25 disabled:opacity-40 ${
+            layout === "rail" ? "h-9 w-9" : "h-11 w-11"
+          }`}
+          aria-label="Start voice conversation"
+          title="Voice conversation"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className={layout === "rail" ? "h-5 w-5" : "h-[1.35rem] w-[1.35rem]"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072M17.95 6.05a8 8 0 010 11.9M6.5 8H4a1 1 0 00-1 1v6a1 1 0 001 1h2.5l4.5 4V4l-4.5 4z" />
           </svg>
         </button>
       )}

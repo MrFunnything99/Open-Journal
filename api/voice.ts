@@ -1,29 +1,26 @@
 /// <reference types="node" />
 
-const ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/text-to-speech";
-const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Rachel
-const DEFAULT_MODEL = "eleven_multilingual_v2";
-const OUTPUT_FORMAT = "mp3_44100_128";
-
-function clamp(n: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, n));
-}
+const MISTRAL_SPEECH_URL = "https://api.mistral.ai/v1/audio/speech";
+const DEFAULT_VOICE = "en_paul_neutral";
+const DEFAULT_MODEL = "voxtral-mini-tts-2603";
 
 export async function POST(request: Request) {
-  const jsonResponse = (body: { error?: string; audio?: string }, status: number) =>
+  const jsonResponse = (
+    body: { error?: string; audio?: string; format?: string; provider?: string; playback_rate?: number },
+    status: number
+  ) =>
     new Response(JSON.stringify(body), {
       status,
       headers: { "Content-Type": "application/json" },
     });
 
   try {
-    const apiKey = process.env.ELEVENLABS_API_KEY;
+    const apiKey = process.env.MISTRAL_API_KEY?.trim();
     if (!apiKey) {
-      return jsonResponse({ error: "ELEVENLABS_API_KEY is not configured" }, 500);
+      return jsonResponse({ error: "MISTRAL_API_KEY is not configured" }, 500);
     }
 
-    type VoiceSettings = { stability?: number; similarity_boost?: number; style?: number; speed?: number };
-    let body: { text?: string; voiceId?: string; voice_settings?: VoiceSettings };
+    let body: { text?: string; voiceId?: string };
     try {
       body = (await request.json()) as typeof body;
     } catch {
@@ -35,62 +32,72 @@ export async function POST(request: Request) {
       return jsonResponse({ error: "text is required" }, 400);
     }
 
-    const voiceId = body?.voiceId ?? DEFAULT_VOICE_ID;
+    const inp = text.trim().slice(0, 12_000);
+    const voiceId =
+      (body?.voiceId && String(body.voiceId).trim()) ||
+      process.env.MISTRAL_TTS_VOICE_ID?.trim() ||
+      DEFAULT_VOICE;
+    const model = process.env.MISTRAL_TTS_MODEL?.trim() || DEFAULT_MODEL;
+    let fmt = (process.env.MISTRAL_TTS_RESPONSE_FORMAT || "opus").toLowerCase();
+    if (!["opus", "mp3", "wav", "flac", "pcm"].includes(fmt)) fmt = "opus";
 
-    const raw = body?.voice_settings ?? {};
-    const stability = clamp(
-      typeof raw.stability === "number" ? raw.stability : 0.5,
-      0,
-      1
-    );
-    const similarity_boost = clamp(
-      typeof raw.similarity_boost === "number" ? raw.similarity_boost : 0.75,
-      0,
-      1
-    );
-    const style = clamp(typeof raw.style === "number" ? raw.style : 0,
-      0,
-      1
-    );
-    const speed = clamp(
-      typeof raw.speed === "number" ? raw.speed : 1,
-      0.5,
-      2
-    );
-
-    const res = await fetch(`${ELEVENLABS_API_URL}/${voiceId}`, {
+    const res = await fetch(MISTRAL_SPEECH_URL, {
       method: "POST",
       headers: {
-        "xi-api-key": apiKey,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
-        Accept: "audio/mpeg",
       },
       body: JSON.stringify({
-        text: text.trim(),
-        model_id: DEFAULT_MODEL,
-        output_format: OUTPUT_FORMAT,
-        voice_settings: { stability, similarity_boost, style, speed },
+        model,
+        input: inp,
+        voice_id: voiceId,
+        response_format: fmt,
       }),
     });
 
-    if (!res.ok) {
-      const rawText = await res.text();
-      let errMsg = `ElevenLabs request failed (${res.status})`;
-      if (rawText.trim()) {
-        try {
-          const err = JSON.parse(rawText) as { detail?: { message?: string }; message?: string };
-          errMsg = err.detail?.message ?? err.message ?? rawText.slice(0, 200);
-        } catch {
-          errMsg = rawText.slice(0, 200);
-        }
+    const rawText = await res.text();
+    let data: { audio_data?: string; detail?: unknown; message?: string } = {};
+    if (rawText.trim()) {
+      try {
+        data = JSON.parse(rawText) as typeof data;
+      } catch {
+        return jsonResponse({ error: rawText.slice(0, 200) || `Mistral TTS failed (${res.status})` }, 500);
       }
-      return jsonResponse({ error: errMsg }, 500);
     }
 
-    const arrayBuffer = await res.arrayBuffer();
-    const base64 = Buffer.from(arrayBuffer).toString("base64");
+    if (!res.ok) {
+      const d = data.detail;
+      const msg =
+        typeof d === "string"
+          ? d
+          : d && typeof d === "object" && "message" in d
+            ? String((d as { message?: string }).message)
+            : data.message || rawText.slice(0, 200) || `Mistral TTS failed (${res.status})`;
+      return jsonResponse({ error: msg }, 500);
+    }
 
-    return jsonResponse({ audio: base64, format: "mp3" }, 200);
+    const audioB64 = data.audio_data;
+    if (!audioB64 || typeof audioB64 !== "string") {
+      return jsonResponse({ error: "Mistral TTS returned no audio_data" }, 500);
+    }
+
+    let playbackRate = 1.05;
+    try {
+      const r = parseFloat(process.env.MISTRAL_TTS_PLAYBACK_RATE || "1.05");
+      if (!Number.isNaN(r) && r >= 0.25 && r <= 4) playbackRate = r;
+    } catch {
+      /* keep default */
+    }
+
+    return jsonResponse(
+      {
+        audio: audioB64,
+        format: fmt,
+        provider: "mistral",
+        playback_rate: playbackRate,
+      },
+      200
+    );
   } catch (err) {
     console.error("[voice] Error:", err);
     const message = err instanceof Error ? err.message : "Unknown error";

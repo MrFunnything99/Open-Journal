@@ -141,6 +141,8 @@ type PersonaplexChatContextValue = {
   setChatError: (v: string | null) => void;
   isChatActive: boolean;
   sendChat: () => Promise<void>;
+  /** Send arbitrary text directly (bypasses draft state). Used by voice mode. */
+  sendChatWithText: (text: string) => Promise<void>;
   transcribeBlob: (blob: Blob, mimeType: string) => Promise<{ polished: string; raw: string } | null>;
   startRecording: () => Promise<void>;
   stopRecording: () => void;
@@ -512,6 +514,130 @@ export function PersonaplexChatProvider({
     userChatModel,
   ]);
 
+  const sendChatWithText = useCallback(async (text: string) => {
+    const t = text.trim();
+    if (!t || sending) return;
+
+    setIsChatActive(true);
+    setChatError(null);
+    setMessages((m) => [...m, { id: `u_${Date.now()}`, role: "user", content: t }]);
+    pushActivity({ kind: "user", summary: `You: ${t.length > 120 ? `${t.slice(0, 120)}…` : t}` });
+    setSending(true);
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), CHAT_TIMEOUT_MS);
+
+    try {
+      const payload: Record<string, unknown> = {
+        text: t,
+        session_id: chatSessionId,
+        personalization: CHAT_PERSONALIZATION_FULL,
+        intrusiveness: 0.5,
+        mode: "autobiography",
+        openrouter_model: userChatModel,
+      };
+      const res = await backendFetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      const rawText = await res.text();
+      let data: {
+        error?: string;
+        detail?: string;
+        response?: string;
+        session_id?: string;
+        library_items_added?: number;
+        retrieval_log?: string;
+        agent_steps?: Array<{ kind?: string; name?: string; summary?: string }>;
+        actions?: unknown[];
+      } = {};
+      if (rawText.trim()) {
+        try {
+          data = JSON.parse(rawText) as typeof data;
+        } catch {
+          throw new Error(res.ok ? "Invalid response from server" : `Server error (${res.status})`);
+        }
+      }
+      if (!res.ok) {
+        throw new Error(data.detail || data.error || `Chat failed (${res.status})`);
+      }
+      if (!data.response || typeof data.response !== "string" || !data.session_id) {
+        throw new Error(data.error || "Invalid chat response");
+      }
+      setChatSessionId(data.session_id);
+
+      const steps = Array.isArray(data.agent_steps) ? data.agent_steps : [];
+      for (const s of steps) {
+        const kind = (s.kind || "").toLowerCase();
+        const summary = typeof s.summary === "string" ? s.summary : "";
+        if (!summary) continue;
+        if (kind === "retrieval") {
+          pushActivity({ kind: "retrieval", summary });
+        } else if (kind === "tool") {
+          const name = typeof s.name === "string" ? s.name : "tool";
+          pushActivity({ kind: "tool", summary, detail: name });
+        } else {
+          pushActivity({ kind: "system", summary });
+        }
+      }
+
+      const retrievalLog =
+        typeof data.retrieval_log === "string" && data.retrieval_log.trim() ? data.retrieval_log.trim() : undefined;
+
+      const navActions = parseNavigateActions(data.actions);
+      setMessages((m) => [
+        ...m,
+        {
+          id: `a_${Date.now()}`,
+          role: "assistant",
+          content: data.response!,
+          retrievalLog,
+          agentSteps: steps.length > 0 ? steps : undefined,
+          actions: navActions.length > 0 ? navActions : undefined,
+        },
+      ]);
+
+      const replyPreview =
+        data.response!.length > 160 ? `${data.response!.slice(0, 160)}…` : data.response!;
+      pushActivity({ kind: "assistant", summary: `Assistant: ${replyPreview}` });
+
+      const libN =
+        typeof data.library_items_added === "number" && data.library_items_added > 0
+          ? Math.floor(data.library_items_added)
+          : 0;
+      if (libN > 0) {
+        onToast(libN === 1 ? "Added 1 item to your Library." : `Added ${libN} items to your Library.`);
+      }
+
+      if (navActions.length > 0) {
+        onAgentActionRef.current?.(navActions);
+        for (const na of navActions) {
+          if (na.type === "navigate") {
+            pushActivity({
+              kind: "system",
+              summary: `Opened ${na.view}${na.brainSection ? ` · ${na.brainSection}` : ""}`,
+            });
+          }
+        }
+      }
+    } catch (e) {
+      const msg =
+        e instanceof Error && e.name === "AbortError"
+          ? "Request timed out. Try again."
+          : e instanceof Error
+            ? e.message
+            : "Something went wrong";
+      setChatError(msg);
+      onToast(msg);
+      pushActivity({ kind: "system", summary: `Error: ${msg}` });
+    } finally {
+      setSending(false);
+    }
+  }, [sending, chatSessionId, onToast, pushActivity, userChatModel]);
+
   const startRecording = useCallback(async () => {
     if (micPhase !== "idle" || sending) return;
     setChatError(null);
@@ -624,6 +750,7 @@ export function PersonaplexChatProvider({
       setChatError,
       isChatActive,
       sendChat,
+      sendChatWithText,
       transcribeBlob,
       startRecording,
       stopRecording,
@@ -656,6 +783,7 @@ export function PersonaplexChatProvider({
       chatError,
       isChatActive,
       sendChat,
+      sendChatWithText,
       transcribeBlob,
       startRecording,
       stopRecording,

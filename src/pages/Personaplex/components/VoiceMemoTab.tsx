@@ -2,10 +2,12 @@ import { FC, useCallback, useEffect, useId, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
 import { CHAT_INTERACTION_MODE_META } from "../chatInteractionModes";
 import type { ChatMessage } from "../hooks/useJournalHistory";
+import { useVoiceSession } from "../hooks/useVoiceSession";
 import { personaplexChatToJournalTranscript, usePersonaplexChat } from "../PersonaplexChatContext";
 import { blobToBase64, blobToWavBase64 } from "../utils/audioToWav";
 import { AskAnythingComposer, LiveDictationBubble } from "./GlobalAskAnythingBar";
 import { playChatReadAloud } from "../utils/chatReadAloud";
+import { VoiceSessionPanel } from "./VoiceSessionPanel";
 
 type Props = {
   onToast: (msg: string) => void;
@@ -82,11 +84,13 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     chatError,
     chatInteractionMode,
     setChatInteractionMode,
+    sendChatWithText,
     journalFileToProcess,
     clearJournalFileToProcess,
     journalTextToProcess,
     clearJournalTextToProcess,
     resetAssistedWorkspace,
+    idPrefix: chatComposerIdPrefix,
   } = usePersonaplexChat();
   const idPrefix = useId();
   const [journalMicPhase, setJournalMicPhase] = useState<"idle" | "recording" | "processing">("idle");
@@ -121,6 +125,40 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const journalVoiceInsertPosRef = useRef<number | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+
+  // --- Voice conversation mode ---
+  const voiceSession = useVoiceSession({
+    onSendTranscript: sendChatWithText,
+  });
+  const { voiceState, startSession: startVoiceSession, endSession: endVoiceSession, speakResponse } = voiceSession;
+  const voiceActive = voiceState !== "idle";
+
+  const exitVoiceMode = useCallback(() => {
+    endVoiceSession();
+    requestAnimationFrame(() => {
+      document.getElementById(`${chatComposerIdPrefix}-global-composer`)?.focus();
+    });
+  }, [endVoiceSession, chatComposerIdPrefix]);
+
+  // Auto-speak new assistant messages when voice session is active
+  const prevMsgCountRef = useRef(messages.length);
+  useEffect(() => {
+    if (!voiceActive) {
+      prevMsgCountRef.current = messages.length;
+      return;
+    }
+    if (messages.length > prevMsgCountRef.current) {
+      const last = messages[messages.length - 1];
+      if (last?.role === "assistant" && last.content) {
+        void speakResponse(last.content);
+      }
+    }
+    prevMsgCountRef.current = messages.length;
+  }, [messages, voiceActive, speakResponse]);
+
+  const latestAssistant = voiceActive
+    ? [...messages].reverse().find((m) => m.role === "assistant")
+    : undefined;
 
   const captureJournalVoiceInsertPosition = useCallback(() => {
     const ta = journalTextareaRef.current;
@@ -895,7 +933,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
               </p>
               <div className="w-full max-w-2xl space-y-1.5 text-left">
                 <LiveDictationBubble />
-                <AskAnythingComposer layout="center" assistedJournalMinimal />
+                <AskAnythingComposer layout="center" assistedJournalMinimal onStartVoiceSession={startVoiceSession} />
               </div>
             </div>
           )}
@@ -1039,9 +1077,23 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                 </button>
               )}
               <LiveDictationBubble />
-              <AskAnythingComposer layout="center" assistedJournalMinimal />
+              <AskAnythingComposer layout="center" assistedJournalMinimal onStartVoiceSession={startVoiceSession} />
             </div>
           </div>
+        )}
+
+        {/* Voice conversation overlay */}
+        {voiceActive && chatInteractionMode === "autobiography" && (
+          <VoiceSessionPanel
+            voiceState={voiceSession.voiceState}
+            partialTranscript={voiceSession.partialTranscript}
+            fullTranscript={voiceSession.fullTranscript}
+            assistantText={voiceSession.assistantText}
+            isMuted={voiceSession.isMuted}
+            onToggleMute={voiceSession.toggleMute}
+            onExitVoiceMode={exitVoiceMode}
+            latestAssistant={latestAssistant}
+          />
         )}
       </div>
     </div>

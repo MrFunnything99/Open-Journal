@@ -144,10 +144,8 @@ async def lifespan(app: FastAPI):
         )
     elif (os.getenv("OPENAI_API_KEY") or "").strip():
         print("[backend] Speech-to-text: OpenAI direct (OPENAI_TRANSCRIPTION_MODEL / gpt-4o-mini-transcribe)")
-    elif (os.getenv("ELEVENLABS_API_KEY") or "").strip():
-        print("[backend] Speech-to-text: ElevenLabs scribe_v2")
     else:
-        print("[backend] WARNING: Set OPENROUTER_API_KEY (recommended for STT), or OPENAI_API_KEY, or ELEVENLABS_API_KEY — transcription routes need one of these.")
+        print("[backend] WARNING: Set OPENROUTER_API_KEY (recommended for STT) or OPENAI_API_KEY — transcription routes need one of these.")
     if not or_key:
         print(
             "[backend] WARNING: OPENROUTER_API_KEY missing — /chat interviewer and journal validation will not work until set."
@@ -469,22 +467,9 @@ class MemoryDiagramResponse(BaseModel):
     mermaid: str
 
 
-# --- ElevenLabs proxy: TTS and voices (no auth required; used by session UI) ---
-ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
-ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
-ELEVENLABS_SCRIBE_TOKEN_URL = "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe"
-ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
-DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
-FALLBACK_VOICES = [
-    {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
-    {"voice_id": "pNInz6obpgDQGcFmaJgB", "name": "Adam"},
-    {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Bella"},
-    {"voice_id": "ErXwobaYiN019PkySvjV", "name": "Antoni"},
-    {"voice_id": "MF3mGyEYCl7XYWbV9V6O", "name": "Elli"},
-    {"voice_id": "TxGEqnHWrfWFTfGW9XjX", "name": "Josh"},
-    {"voice_id": "VR6AewLTigWG4xSOukaG", "name": "Arnold"},
-    {"voice_id": "onwK4e9ZLuTAKqWW03F9", "name": "Domi"},
-    {"voice_id": "N2lVS1w4EtoT3dr4eOWO", "name": "Sam"},
+# --- TTS voice list fallback when Mistral list API fails (catalog slugs) ---
+MISTRAL_TTS_FALLBACK_VOICES = [
+    {"voice_id": "en_paul_neutral", "name": "Paul (neutral)"},
 ]
 
 _MISTRAL_VOICE_UUID_RE = re.compile(
@@ -634,7 +619,7 @@ class TranscribeRequest(BaseModel):
 
 
 class VoiceMemoRequest(BaseModel):
-    """Voice Memo tab: base64 audio → OpenRouter gpt-audio-mini (preferred) or OpenAI / ElevenLabs → optional OpenRouter text polish."""
+    """Voice Memo tab: base64 audio → OpenRouter gpt-audio-mini → optional OpenRouter text polish."""
     audio: str
     filename: Optional[str] = None
     mime_type: Optional[str] = None
@@ -928,65 +913,6 @@ def _openai_speech_to_text(audio_bytes: bytes, filename: str) -> str:
     return str(text).strip() if text is not None else ""
 
 
-def _elevenlabs_transcribe_bytes(audio_bytes: bytes) -> str:
-    """Same wire format as /api/transcribe (ElevenLabs scribe_v2)."""
-    import urllib.error
-    import urllib.request
-
-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("ELEVENLABS_API_KEY is not configured")
-    model_id = "scribe_v2"
-    boundary = f"----SelfmeridianBoundary{uuid.uuid4().hex[:24]}"
-    body = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="model_id"\r\n\r\n'
-        f"{model_id}\r\n"
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
-        "Content-Type: audio/wav\r\n\r\n"
-    ).encode("utf-8") + audio_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
-    content_type = f"multipart/form-data; boundary={boundary}"
-    request = urllib.request.Request(
-        ELEVENLABS_STT_URL,
-        data=body,
-        method="POST",
-        headers={
-            "xi-api-key": api_key,
-            "Content-Type": content_type,
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as resp:
-            raw_text = resp.read().decode("utf-8")
-            status_code = resp.status
-    except urllib.error.HTTPError as e:
-        status_code = e.code
-        try:
-            raw_text = e.read().decode("utf-8")
-        except Exception:
-            raw_text = ""
-    except Exception as e:
-        raise ValueError(f"ElevenLabs STT failed: {e}") from e
-    data: dict = {}
-    if raw_text.strip():
-        try:
-            data = json.loads(raw_text)
-        except json.JSONDecodeError:
-            pass
-    if status_code < 200 or status_code >= 300:
-        err_detail = data.get("detail")
-        if isinstance(err_detail, dict):
-            msg = err_detail.get("message") or str(err_detail)
-        elif isinstance(err_detail, str):
-            msg = err_detail
-        else:
-            msg = data.get("message") or (raw_text.strip()[:300] if raw_text.strip() else None) or f"ElevenLabs STT failed ({status_code})"
-        raise ValueError(str(msg))
-    text = data.get("text")
-    return str(text).strip() if text is not None else ""
-
-
 async def _polish_voice_memo_openrouter(raw: str, model_override: Optional[str] = None) -> str:
     """Single LLM call: clean up filler words, fix STT errors, polish into readable prose."""
     text = (raw or "").strip()
@@ -1111,87 +1037,43 @@ async def _validate_journal_openrouter(raw: str, model_override: Optional[str] =
 @api_router.post("/voice")
 async def api_voice(req: VoiceRequest):
     """
-    Text-to-speech: Mistral Voxtral when MISTRAL_API_KEY is set, else ElevenLabs.
+    Text-to-speech: Mistral Voxtral (requires MISTRAL_API_KEY).
     Returns { audio: base64, format: \"opus\" | \"mp3\" | ... }.
-    Voxtral: https://docs.mistral.ai/capabilities/audio/text_to_speech
     """
     import base64 as b64
-    import urllib.request
-    import urllib.error
 
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
     mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
-    if mistral_key:
-        vid = _resolve_mistral_voice_id(req.voiceId)
-        tts_fmt = _mistral_tts_response_format()
-        try:
-            audio_bytes = await asyncio.to_thread(_mistral_tts_speech, text, vid, tts_fmt)
-        except ValueError as e:
-            print("[backend] Mistral TTS:", e)
-            raise HTTPException(status_code=500, detail=str(e))
-        except Exception as e:
-            print("[backend] Mistral TTS error:", e)
-            raise HTTPException(status_code=500, detail=str(e))
-        rate = _mistral_tts_playback_rate()
-        return {
-            "audio": b64.b64encode(audio_bytes).decode("ascii"),
-            "format": tts_fmt,
-            "provider": "mistral",
-            "playback_rate": rate,
-        }
-
-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not api_key:
+    if not mistral_key:
         raise HTTPException(
             status_code=500,
-            detail="No TTS configured: set MISTRAL_API_KEY for Voxtral (default voice en_paul_neutral), or ELEVENLABS_API_KEY.",
+            detail="TTS requires MISTRAL_API_KEY (Mistral Voxtral).",
         )
-    voice_id = req.voiceId or DEFAULT_VOICE_ID
-    raw = req.voice_settings or {}
-    stability = max(0, min(1, raw.get("stability", 0.5) if isinstance(raw.get("stability"), (int, float)) else 0.5))
-    similarity_boost = max(0, min(1, raw.get("similarity_boost", 0.75) if isinstance(raw.get("similarity_boost"), (int, float)) else 0.75))
-    style = max(0, min(1, raw.get("style", 0) if isinstance(raw.get("style"), (int, float)) else 0))
-    speed = max(0.5, min(2, raw.get("speed", 1) if isinstance(raw.get("speed"), (int, float)) else 1))
-    body = json.dumps({
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "output_format": "mp3_44100_128",
-        "voice_settings": {"stability": stability, "similarity_boost": similarity_boost, "style": style, "speed": speed},
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        f"{ELEVENLABS_TTS_URL}/{voice_id}",
-        data=body,
-        method="POST",
-        headers={
-            "xi-api-key": api_key,
-            "Content-Type": "application/json",
-            "Accept": "audio/mpeg",
-        },
-    )
+    vid = _resolve_mistral_voice_id(req.voiceId)
+    tts_fmt = _mistral_tts_response_format()
     try:
-        with urllib.request.urlopen(request, timeout=60) as resp:
-            audio_bytes = resp.read()
-        b64_audio = b64.b64encode(audio_bytes).decode("ascii")
-        return {"audio": b64_audio, "format": "mp3"}
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8")
-            err_json = json.loads(err_body) if err_body.strip() else {}
-            msg = (err_json.get("detail") or {}).get("message") if isinstance(err_json.get("detail"), dict) else err_json.get("message") or err_body[:200]
-        except Exception:
-            msg = str(e)
-        raise HTTPException(status_code=500, detail=msg or f"ElevenLabs TTS failed ({e.code})")
-    except Exception as e:
-        print("[backend] /api/voice error:", e)
+        audio_bytes = await asyncio.to_thread(_mistral_tts_speech, text, vid, tts_fmt)
+    except ValueError as e:
+        print("[backend] Mistral TTS:", e)
         raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print("[backend] Mistral TTS error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    rate = _mistral_tts_playback_rate()
+    return {
+        "audio": b64.b64encode(audio_bytes).decode("ascii"),
+        "format": tts_fmt,
+        "provider": "mistral",
+        "playback_rate": rate,
+    }
 
 
 @api_router.get("/voices")
 async def api_voices():
-    """Voices for TTS UI: Mistral when MISTRAL_API_KEY is set, else ElevenLabs. Returns { voices: [{ voice_id, name }], provider? }."""
+    """Voices for TTS UI (Mistral Voxtral catalog). Returns { voices: [{ voice_id, name }], provider? }."""
     import urllib.request
     import urllib.error
 
@@ -1215,59 +1097,7 @@ async def api_voices():
         except Exception as e:
             print("[backend] Mistral /voices list:", e)
 
-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not api_key:
-        return {"voices": FALLBACK_VOICES, "provider": "fallback"}
-    request = urllib.request.Request(
-        ELEVENLABS_VOICES_URL,
-        headers={"xi-api-key": api_key},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.HTTPError, OSError, json.JSONDecodeError):
-        return {"voices": FALLBACK_VOICES}
-    raw = data.get("voices") or FALLBACK_VOICES
-    voices = [
-        {"voice_id": (v.get("voice_id") or v.get("id") or ""), "name": v.get("name", "?")}
-        for v in raw
-    ]
-    voices = [v for v in voices if v["voice_id"]]
-    if not any(v["voice_id"] == DEFAULT_VOICE_ID for v in voices):
-        voices.insert(0, {"voice_id": DEFAULT_VOICE_ID, "name": "Rachel"})
-    return {"voices": voices, "provider": "elevenlabs"}
-
-
-@api_router.get("/scribe-token")
-async def api_scribe_token():
-    """Return a single-use token for ElevenLabs Realtime Speech-to-Text WebSocket."""
-    import urllib.request
-    import urllib.error
-
-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY is not configured")
-    request = urllib.request.Request(
-        ELEVENLABS_SCRIBE_TOKEN_URL,
-        data=b"{}",
-        method="POST",
-        headers={"xi-api-key": api_key, "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8")
-            err_json = json.loads(err_body) if err_body.strip() else {}
-            msg = (err_json.get("detail") or {}).get("message") if isinstance(err_json.get("detail"), dict) else err_json.get("message") or err_body[:200]
-        except Exception:
-            msg = str(e)
-        raise HTTPException(status_code=500, detail=msg or f"ElevenLabs token failed ({e.code})")
-    token = data.get("token")
-    if not token:
-        raise HTTPException(status_code=500, detail="No token in response")
-    return {"token": token}
+    return {"voices": MISTRAL_TTS_FALLBACK_VOICES, "provider": "fallback"}
 
 
 @api_router.get("/memory-diagram", response_model=MemoryDiagramResponse)
@@ -2441,19 +2271,17 @@ def serve_decision_logs_html():
 @app.post("/api/transcribe", include_in_schema=False)
 async def api_transcribe(req: TranscribeRequest):
     """
-    Speech-to-text: OpenRouter `openai/gpt-audio-mini` when OPENROUTER_API_KEY is set, else OpenAI, else ElevenLabs.
+    Speech-to-text: OpenRouter `openai/gpt-audio-mini` (requires OPENROUTER_API_KEY).
     Registered on the main app (not only APIRouter) so POST is never shadowed by the SPA
     catch-all GET /{full_path} (which would otherwise yield 405 Method Not Allowed).
     """
     import base64 as b64
 
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    el_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not or_key and not openai_key and not el_key:
+    if not or_key:
         raise HTTPException(
             status_code=500,
-            detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini), or OPENAI_API_KEY, or ELEVENLABS_API_KEY.",
+            detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini).",
         )
     audio_b64 = (req.audio or "").strip()
     if not audio_b64:
@@ -2478,7 +2306,7 @@ async def api_transcribe(req: TranscribeRequest):
 @app.post("/api/voice-memo", include_in_schema=False)
 async def api_voice_memo(req: VoiceMemoRequest):
     """
-    Voice Memo tab: transcribe via OpenRouter openai/gpt-audio-mini when OPENROUTER_API_KEY is set, else OpenAI, else ElevenLabs.
+    Voice Memo tab: transcribe via OpenRouter openai/gpt-audio-mini (requires OPENROUTER_API_KEY).
     Optionally polish transcript via OpenRouter (OPENROUTER_VOICE_MEMO_POLISH_MODEL, default openai/gpt-4.1-mini).
     """
     import base64 as b64
@@ -2498,12 +2326,10 @@ async def api_voice_memo(req: VoiceMemoRequest):
 
     fname = _guess_audio_filename(req.filename, req.mime_type)
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    el_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not or_key and not openai_key and not el_key:
+    if not or_key:
         raise HTTPException(
             status_code=500,
-            detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini), or OPENAI_API_KEY, or ELEVENLABS_API_KEY.",
+            detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini).",
         )
     audio_kb = len(raw_audio) / 1024
     print(f"[backend] voice-memo: transcribing {audio_kb:.0f} KB audio ({fname})")
