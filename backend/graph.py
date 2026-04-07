@@ -22,21 +22,13 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
 from library import (
-    apply_library_tool_items,
     get_assisted_journal_continuity_block,
     get_relevant_context_dual,
     ingest_journal_entry,
-    resolve_books_via_openlibrary,
-    save_resolved_books,
 )
 from agent_site_tools import (
     log_tool_invocation,
-    tool_mark_recommendation_consumed,
     tool_navigate_ui,
-    tool_request_focused_recommendation,
-    tool_submit_content_feedback,
-    tool_update_content_preferences,
-    tool_update_library_item,
 )
 
 # State: list of messages + session_id for Librarian + personalization + intrusiveness + mode + optional retrieval log + instance_id
@@ -53,7 +45,6 @@ class JournalState(TypedDict):
     last_summary: NotRequired[str]
     last_facts: NotRequired[list]
     instance_id: NotRequired[str]  # X-Instance-ID for per-device data isolation
-    library_items_added: NotRequired[int]  # chat agent saved N items to Library (journal mode)
     agent_steps: NotRequired[list]  # UI: retrieval + tool summaries for this turn
     client_actions: NotRequired[list]  # UI: allowlisted navigate actions from navigate_ui tool
     # Optional: browser-built local time + daypart for Assisted Journal secondary check-ins
@@ -127,149 +118,21 @@ def _openrouter_chat_client_models():
     return client, primary, fallback
 
 
-LIBRARY_ITEMS_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "add_library_items",
-        "description": (
-            "Save podcasts, articles, or research papers the user has finished (or wants logged) into their "
-            "Library for recommendations. For BOOKS, always use extract_books_read instead — it normalizes "
-            "title/author via the same LLM stack as chat. Use this tool when they paste a list, enumerate several titles, or ask to "
-            "add/track what they listened to or read (non-book). Use correct type per item. "
-            "Leave url empty unless they gave a real link. "
-            "Do NOT use for hypothetical picks, things they might read later, or casual single mentions unless "
-            "they clearly want them saved."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "type": {
-                                "type": "string",
-                                "enum": ["book", "podcast", "article", "research"],
-                                "description": "Media category",
-                            },
-                            "title": {"type": "string", "description": "Title of the work or episode"},
-                            "author": {
-                                "type": "string",
-                                "description": "Author, show name, venue, or first author for papers; omit or empty if unknown",
-                            },
-                            "url": {
-                                "type": "string",
-                                "description": "Canonical URL if the user provided one; otherwise empty string",
-                            },
-                            "liked": {
-                                "type": "boolean",
-                                "description": "True if they enjoyed or neutral; false if they disliked",
-                            },
-                            "note": {
-                                "type": "string",
-                                "description": "Optional short note from the user",
-                            },
-                        },
-                        "required": ["type", "title"],
-                    },
-                }
-            },
-            "required": ["items"],
-        },
-    },
-}
-
-UPDATE_LIBRARY_ITEM_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "update_library_item",
-        "description": (
-            "Update an existing Library item's metadata (note, completion date, title, author, url). Use when the user asks to change a note, "
-            "fix a mistaken title/author, rename an item, or set completion date for something already in their library "
-            "(books, podcasts, articles, research already consumed). Provide item_id if known; otherwise use "
-            "title_query to find the best match by title."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "item_id": {
-                    "type": "string",
-                    "description": "Exact library item id from the app if the user pasted it or it is in context",
-                },
-                "title_query": {
-                    "type": "string",
-                    "description": "Substring or full title to search when item_id is unknown",
-                },
-                "note": {
-                    "type": "string",
-                    "description": "New note text; include only if updating the note",
-                },
-                "date_completed": {
-                    "type": "string",
-                    "description": "YYYY-MM-DD; include only if updating completion date",
-                },
-                "new_title": {
-                    "type": "string",
-                    "description": "Corrected title to store for this item; include only if changing the title",
-                },
-                "new_author": {
-                    "type": "string",
-                    "description": "Corrected author/creator; include only if changing the author",
-                },
-                "new_url": {
-                    "type": "string",
-                    "description": "Corrected canonical URL; include only if changing the URL",
-                },
-            },
-        },
-    },
-}
-
-MARK_RECOMMENDATION_CONSUMED_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "mark_recommendation_consumed",
-        "description": (
-            "Record that the user finished or consumed a recommended book, podcast, article, or research item "
-            "(same as marking read/listened in Recommendations). Use when they say they finished, read, or listened to something."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": ["book", "podcast", "article", "research"],
-                    "description": "Media category",
-                },
-                "title": {"type": "string", "description": "Title of the work"},
-                "author": {"type": "string", "description": "Author or show name if known; omit if unknown"},
-                "url": {"type": "string", "description": "URL if the user provided one"},
-                "liked": {
-                    "type": "boolean",
-                    "description": "True if they enjoyed; false if they disliked",
-                },
-            },
-            "required": ["type", "title"],
-        },
-    },
-}
-
 NAVIGATE_UI_TOOL = {
     "type": "function",
     "function": {
         "name": "navigate_ui",
         "description": (
-            "Switch the user's main app screen when they ask to open a section (e.g. open Recommendations, "
-            "go to Brain, open Chat). Does not change server data."
+            "Switch the user's main app screen when they ask to open a section (e.g. go to Brain, open Chat). "
+            "Does not change server data."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "view": {
                     "type": "string",
-                    "enum": ["home", "chat", "brain", "recommendations"],
-                    "description": "home=journal home; chat=full chat; brain=knowledge/calendar hub; recommendations",
+                    "enum": ["home", "chat", "brain"],
+                    "description": "home=journal home; chat=full chat; brain=knowledge/calendar hub",
                 },
                 "brain_section": {
                     "type": "string",
@@ -282,138 +145,8 @@ NAVIGATE_UI_TOOL = {
     },
 }
 
-UPDATE_CONTENT_PREFERENCES_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "update_content_preferences",
-        "description": (
-            "Update subscriptions, paywall policy, and preferred/avoided content types when the user "
-            "mentions sources they subscribe to, paywalls, or what formats they want more/less of."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "add_subscriptions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Domains e.g. nytimes.com",
-                },
-                "remove_subscriptions": {"type": "array", "items": {"type": "string"}},
-                "paywall_policy": {
-                    "type": "string",
-                    "enum": ["only_subscribed", "allow_all", "no_paywalled"],
-                },
-                "preferred_types": {"type": "array", "items": {"type": "string"}},
-                "avoid_types": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-    },
-}
-
-SUBMIT_CONTENT_FEEDBACK_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "submit_content_feedback",
-        "description": (
-            "Record feedback on content they consumed (articles, books, podcasts). Capture why in user_notes when they explain."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "content_title": {"type": "string"},
-                "content_type": {
-                    "type": "string",
-                    "enum": ["article", "book", "podcast", "video", "paper"],
-                },
-                "feedback": {
-                    "type": "string",
-                    "enum": ["liked", "disliked", "loved", "not_relevant"],
-                },
-                "user_notes": {"type": "string"},
-                "content_url": {"type": "string"},
-            },
-            "required": ["content_title", "feedback"],
-        },
-    },
-}
-
-REQUEST_FOCUSED_REC_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "request_focused_recommendation",
-        "description": (
-            "Search for real links on a topic the user asks about. Returns URLs from search APIs only."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "topic": {"type": "string"},
-                "content_type": {
-                    "type": "string",
-                    "enum": ["article", "podcast", "book", "research", "any"],
-                    "default": "any",
-                },
-            },
-            "required": ["topic"],
-        },
-    },
-}
-
-EXTRACT_BOOKS_READ_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "extract_books_read",
-        "description": (
-            "Extract books the user mentions having read, finished, or consumed during conversation. "
-            "Use this when the user says they read a book, finished a book, loved a book, etc. — even if "
-            "mentioned casually or indirectly (e.g. 'I just finished Dune' or 'that Brené Brown book was great'). "
-            "Extract the raw title and author as the user said them; the backend will normalize title/author with the LLM. "
-            "Include any opinion or short comment the user expressed as a note (e.g. 'it was good', 'didn't love the ending'). "
-            "Do NOT use add_library_items for books — always use this tool instead."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "books": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "raw_title": {
-                                "type": "string",
-                                "description": "Book title as the user said it (may have typos or be informal)",
-                            },
-                            "raw_author": {
-                                "type": "string",
-                                "description": "Author name as the user said it; null or empty if not mentioned",
-                            },
-                            "liked": {
-                                "type": "boolean",
-                                "description": "True if the user enjoyed or was neutral; false if they disliked",
-                            },
-                            "note": {
-                                "type": "string",
-                                "description": "Any short opinion or comment the user expressed about the book",
-                            },
-                        },
-                        "required": ["raw_title"],
-                    },
-                },
-            },
-            "required": ["books"],
-        },
-    },
-}
-
 _CHAT_TOOLS = [
-    LIBRARY_ITEMS_TOOL,
-    UPDATE_LIBRARY_ITEM_TOOL,
-    MARK_RECOMMENDATION_CONSUMED_TOOL,
-    EXTRACT_BOOKS_READ_TOOL,
     NAVIGATE_UI_TOOL,
-    UPDATE_CONTENT_PREFERENCES_TOOL,
-    SUBMIT_CONTENT_FEEDBACK_TOOL,
-    REQUEST_FOCUSED_REC_TOOL,
 ]
 
 
@@ -467,12 +200,11 @@ def _interviewer_run_with_tools(
     *,
     max_tool_rounds: int = 5,
     extra_body: dict | None = None,
-) -> tuple[AIMessage, int, list[dict], list[dict]]:
+) -> tuple[AIMessage, list[dict], list[dict]]:
     """
     Multi-turn chat completion (OpenRouter) with allowlisted site tools.
-    Returns (assistant message, total library items saved from add_library_items, agent_steps, client_actions).
+    Returns (assistant message, agent_steps, client_actions).
     """
-    total_saved = 0
     agent_steps: list[dict] = []
     client_actions: list[dict] = []
     rounds = 0
@@ -510,7 +242,7 @@ def _interviewer_run_with_tools(
         msg = resp.choices[0].message
         if not getattr(msg, "tool_calls", None):
             text = (msg.content or "").strip()
-            return AIMessage(content=text), total_saved, agent_steps, client_actions
+            return AIMessage(content=text), agent_steps, client_actions
 
         oai_messages.append(_assistant_message_to_dict(msg))
         for tc in msg.tool_calls:
@@ -521,69 +253,11 @@ def _interviewer_run_with_tools(
                 args = {}
             log_tool_invocation(name, instance_id, json.dumps(args)[:400])
 
-            if name == "add_library_items":
-                try:
-                    items = args.get("items", [])
-                    n, labels = apply_library_tool_items(items, instance_id)
-                    total_saved += n
-                    result = {"ok": True, "items_added": n, "saved": labels[:24]}
-                    preview = ", ".join(labels[:4]) if labels else ""
-                    if n > 0:
-                        summ = f"Saved {n} item(s) to Library"
-                        if preview:
-                            summ += f": {preview}{'…' if len(labels) > 4 else ''}"
-                    else:
-                        summ = "Library tool ran (no new items)"
-                    agent_steps.append({"kind": "tool", "name": name, "summary": summ})
-                except Exception as e:
-                    result = {"ok": False, "error": str(e)[:240]}
-                    agent_steps.append({
-                        "kind": "tool",
-                        "name": name,
-                        "summary": f"Library save error: {str(e)[:80]}",
-                    })
-            elif name == "update_library_item":
-                result, summ = tool_update_library_item(args, instance_id)
-                agent_steps.append({"kind": "tool", "name": name, "summary": summ})
-            elif name == "mark_recommendation_consumed":
-                result, summ = tool_mark_recommendation_consumed(args, instance_id)
-                agent_steps.append({"kind": "tool", "name": name, "summary": summ})
-            elif name == "extract_books_read":
-                try:
-                    raw_books = args.get("books", [])
-                    resolved = resolve_books_via_openlibrary(raw_books)
-                    n, labels = save_resolved_books(resolved, instance_id)
-                    total_saved += n
-                    result = {"ok": True, "books_saved": n, "saved": labels[:24]}
-                    preview = ", ".join(labels[:4]) if labels else ""
-                    if n > 0:
-                        summ = f"Verified & saved {n} book(s) to Library"
-                        if preview:
-                            summ += f": {preview}{'…' if len(labels) > 4 else ''}"
-                    else:
-                        summ = "Book extraction ran (no new items)"
-                    agent_steps.append({"kind": "tool", "name": name, "summary": summ})
-                except Exception as e:
-                    result = {"ok": False, "error": str(e)[:240]}
-                    agent_steps.append({
-                        "kind": "tool",
-                        "name": name,
-                        "summary": f"Book extraction error: {str(e)[:80]}",
-                    })
-            elif name == "navigate_ui":
+            if name == "navigate_ui":
                 result, summ, action = tool_navigate_ui(args)
                 agent_steps.append({"kind": "tool", "name": name, "summary": summ})
                 if action:
                     client_actions.append(action)
-            elif name == "update_content_preferences":
-                result, summ = tool_update_content_preferences(args, instance_id)
-                agent_steps.append({"kind": "tool", "name": name, "summary": summ})
-            elif name == "submit_content_feedback":
-                result, summ = tool_submit_content_feedback(args, instance_id)
-                agent_steps.append({"kind": "tool", "name": name, "summary": summ})
-            elif name == "request_focused_recommendation":
-                result, summ = tool_request_focused_recommendation(args, instance_id)
-                agent_steps.append({"kind": "tool", "name": name, "summary": summ})
             else:
                 result = {"ok": False, "error": f"unknown_tool:{name}"}
                 agent_steps.append({
@@ -597,7 +271,6 @@ def _interviewer_run_with_tools(
 
     return (
         AIMessage(content="I've done what I could in this turn. Want to continue?"),
-        total_saved,
         agent_steps,
         client_actions,
     )
@@ -701,7 +374,6 @@ def interviewer_node(state: JournalState) -> JournalState:
     if _client_tc:
         date_context = f"{date_context} (server UTC calendar day). {_client_tc}"
     mode_raw = (state.get("mode") or "").strip().lower()
-    # Only journal mode uses this interviewer; recommendations uses library_interview in main.py
     _kb_intro = ""
     if mode_raw == "autobiography":
         _kb_intro = (
@@ -720,32 +392,24 @@ def interviewer_node(state: JournalState) -> JournalState:
         _memory_personalization = (
             "At 0%, do not use memory; keep questions general and present-focused only. "
             "At higher levels, treat Continuity anchor (if present) and Relevant Context as ground truth for prior journal text. "
-            "Memory is intentionally balanced: solo written journals and AI-assisted sessions are equally weighted—do not anchor only on chat fragments. "
-            "You may blend a thread that shows up in both (e.g. sleep in their written journal and again in a recent chat) without naming the source. "
+            "Memory is intentionally balanced: manual journals and AI-assisted sessions are equally valid; do not treat one as more real. "
+            "Default recency window for openings is yesterday + today; use older memory only when it clearly helps the live thread. "
             "\n\nRECENCY-FIRST OPENING RULE (critical for first replies / check-in openers like 'hey', 'how's it going', 'what should we talk about'):\n"
             "Priority order — always follow this:\n"
-            "1. LATEST MANUAL JOURNAL ENTRY (highest priority) — reference 1 specific concrete thing from it.\n"
-            "2. Latest assisted journal session — only if more recent than the latest manual entry.\n"
-            "3. Recurring theme from last 2-3 entries — only as a brief secondary offer.\n"
-            "4. Older high-salience memory — ONLY if repeated recently. Do NOT lead with older emotionally dramatic material.\n\n"
-            "OPENING BREVITY (this is spoken aloud — optimize for natural speech cadence):\n"
-            "- 1-2 short sentences MAX, ideally under 25 words total.\n"
-            "- ONE direct question, no menus or multiple-choice lists.\n"
-            "- Use time-of-day awareness naturally (morning/afternoon/evening) when the client local time is available.\n"
-            "- Prefer emotional phrasing over analytical framing: 'what's still sitting with you?' not 'the thing that's been taking up the most space in your head.'\n"
-            "- Remove setup phrases. Get to the question fast.\n"
-            "- Sound like a calm therapist speaking, not a generated prompt.\n\n"
-            "Good openers (study these):\n"
-            "- 'How's the evening going — still thinking about [concrete detail], or has the day shifted things?'\n"
-            "- 'You wrote about [detail] earlier. Still feel the same way tonight?'\n"
-            "- 'Good morning. How'd you sleep after [thing from latest journal]?'\n"
-            "- 'Last time you mentioned [detail]. What's that been like since?'\n\n"
-            "Bad openers (avoid):\n"
-            "- 'Since it's evening, do you want to start with a recap of the day, or with the thing that's been taking up the most space in your head?' (too long, menu-like)\n"
-            "- 'Hey, in your last journal you talked about X and Y. Want to start there, or would it feel better to zoom out and talk about the bigger theme?' (over-constructed)\n\n"
+            "1. Yesterday + today entries first (manual and assisted together) — reference concrete details and current-day reality.\n"
+            "2. Live unresolved thread from the same window — include only if genuinely pickup-able.\n"
+            "3. Older repeated pattern only when user language implies recurrence (again/still/every time) or asks for deeper context.\n\n"
+            "OPENING SHAPE (this is spoken aloud — optimize for natural speech cadence):\n"
+            "- Write 2-4 short sentences, prose only (no bullets, no menu framing).\n"
+            "- Offer 2-3 possible doors naturally inside prose; at least one door must be about RIGHT NOW.\n"
+            "- If there was heavy material recently, acknowledge briefly in one short clause and include an explicit off-ramp door.\n"
+            "- End with ONE real open question.\n"
+            "- Use time-of-day awareness naturally (morning/afternoon/evening) when local time is available.\n"
+            "- Sound like a thoughtful companion who's good at asking the next question, not a therapist, intake form, or assistant.\n\n"
             "Do NOT invent people, events, or outcomes not clearly supported by Continuity or Relevant Context. "
             "Banned first-reply openers (always): "
             "A couple threads seem alive; There are a few themes; What feels most present?; What should we talk about?; How are you?; What's on your mind? "
+            "Do not use clinical labels unless the user explicitly used them first. Avoid defaulting to therapist phrases like 'it sounds like...' or 'I notice that...'. "
             "If Continuity anchor and Relevant Context are both empty or bare None, use the reflective fallback style from the Assisted Journal section — "
             "warm, time-aware, psychologically evocative, 1-2 sentences. Never mention missing context.\n"
             "When the user explicitly requests inspiration, a journal scan, surprise me, you pick, etc., follow the Inspiration Scan rules in the Assisted Journal section for that turn instead. "
@@ -777,15 +441,7 @@ def interviewer_node(state: JournalState) -> JournalState:
             "At low levels, ask sparingly and avoid probing. "
             "At high levels, you may ask more direct questions when it feels supportive, while still respecting boundaries. ",
             _menu_explore_hint,
-            "When the user mentions a **book** they read, finished, or enjoyed (even casually), call **extract_books_read** — "
-            "the backend will normalize title/author with the configured OpenRouter model and save to the library. "
-            "Use **add_library_items** only for non-book media (podcasts, articles, research). "
-            "Use **update_library_item** to change an existing library item's **note** or **date_completed** when they ask to edit, rename phrasing in a note, or fix metadata (prefer **title_query** if you don't have an id). "
-            "Use **mark_recommendation_consumed** when they say they finished or consumed a recommendation. "
-            "Use **navigate_ui** when they explicitly ask to open another main screen (Recommendations, Brain, Chat, Home). "
-            "Use **update_content_preferences** when they mention subscriptions, outlets, paywalls, or types of media they want more/less of. "
-            "Use **submit_content_feedback** when they share how they felt about something they read, watched, or listened to — capture why in user_notes. "
-            "Use **request_focused_recommendation** when they want links on a specific topic; it returns verified URLs from search. "
+            "Use **navigate_ui** when they explicitly ask to open another main screen (Brain, Chat, Home). "
             "Never claim you changed data unless the corresponding tool returned ok. Do not offer **navigate_ui** for destructive operations. "
             "After tool success, reply briefly and warmly. ",
     ]
@@ -829,7 +485,7 @@ def interviewer_node(state: JournalState) -> JournalState:
                     instance_id=instance_id,
                     session_id=state.get("session_id"),
                     log=True,
-                    balance_journal_sources=_balance_sources,
+                    balance_journal_sources=True,
                 )
                 if (raw2 or "").strip() not in ("None.", ""):
                     processed, raw = processed2, raw2
@@ -873,18 +529,45 @@ def interviewer_node(state: JournalState) -> JournalState:
     if mode_raw == "autobiography":
         system_parts.append(
             "\n\nAssisted Journal — you always use this mode's dedicated model\n"
-            "Steer from the user's latest message. Default to warm, concise replies (1-2 sentences for openings, 2-4 for follow-ups) unless they explicitly asked for a broad "
+            "Steer from the user's latest message. Default to warm, concise replies (2-4 sentences for openings, 2-4 for follow-ups) unless they explicitly asked for a broad "
             "journal inspiration scan (section C).\n\n"
+            "Core stance: be a thoughtful companion who's good at asking the next question. Not therapist voice, not assistant voice.\n"
+            "When opening a session, treat yesterday + today as primary context and treat manual + assisted entries as equally valid sources.\n\n"
             "User-facing formatting (mandatory): The chat surface is plain text. Do not use Markdown in your reply: no asterisks for bold, "
             "no hash headings, no fenced code blocks. Use normal sentences, commas, and em dashes. Prefer emphasis through wording, not formatting.\n\n"
+            "Reflection over validation:\n"
+            "You are a journaling companion, not a friend. The friendly tone is real, but it serves a specific job: helping the user reflect on their day, "
+            "get specific about what happened and what it meant, and understand themselves more clearly than when they started typing. "
+            "Mirroring and validation are occasional tools, not your default mode.\n"
+            "The user does not need routine reassurance that their feeling makes sense. They need help getting specific. "
+            "Ask for detail under summaries. Ask what they noticed, what surprised them, what they almost left out. Ask the second question, not only the first.\n"
+            "Before sending, run this test: are you helping them see their day more clearly, or just telling them it sounds nice? "
+            "If it's the second, rewrite.\n\n"
+            "Gentle pushback:\n"
+            "Roughly one in seven or eight turns, offer gentle pushback: a light alternate framing, a tension they didn't name, or a question that complicates "
+            "the story instead of smoothing it. Pushback is never criticism and never contradiction for its own sake.\n"
+            "Pushback is in service of reflection: something they can take or leave. "
+            "Never tell them they are wrong about their feelings or experience. Never extrapolate from one detail to a sweeping character claim. "
+            "If you don't have grounded reason, do not push back. Default to curiosity, not diagnosis.\n"
+            "Avoid therapist-voice pushback like 'well, have you considered...'. Use natural, thoughtful noticing instead.\n\n"
+            "Anti-patterns to avoid:\n"
+            "- Do not validate before responding (skip warm-up lines like 'that sounds ...').\n"
+            "- Do not use a fixed turn template (validate -> observe -> pivot -> question). Vary turn shape.\n"
+            "- Avoid filler-insights that sound deep but say nothing specific.\n"
+            "- Not every turn needs a question at the end.\n"
+            "- Never infer recurring patterns from a single data point unless retrieval evidence supports it.\n"
+            "- Do not ask 'how did that make you feel' (or variants); ask concretely and let feelings emerge.\n\n"
             "Opening and continuity (when they did NOT just trigger an inspiration scan):\n"
-            "STRICT RECENCY-FIRST: Ground in the LATEST MANUAL JOURNAL ENTRY. Reference ONE concrete detail. "
-            "Do NOT jump to older memories unless the latest entry is empty, the older memory is repeated recently, or the user references it.\n"
-            "BREVITY: 1-2 sentences, under 25 words, ONE question. This is spoken aloud — write for natural speech rhythm. "
-            "Blend time-of-day naturally. No menus, no multiple-choice, no setup phrases. Sound like a calm therapist, not a generated menu.\n\n"
+            "STRICT RECENCY-FIRST: Ground in yesterday + today first. Weave 2-3 possible doors naturally in prose (never as a menu), with at least one door about right now.\n"
+            "If a heavy thread appears in recent context, acknowledge gently in one short clause and include an off-ramp door.\n"
+            "End with one real open question. Blend time-of-day naturally. No setup phrases.\n\n"
             "Banned first-sentence patterns (always banned): "
             "A couple threads seem alive; There are a few themes; What feels most present?; What should we talk about?; How are you?; What's on your mind? "
             "When context is empty, use the reflective fallback openers defined in section E below.\n\n"
+            "Language guardrails: avoid clinical categories and therapy-register wording by default. "
+            "Do not use terms like depression, anxiety, suicidal ideation, depressive episode, mental health, crisis, spiral, trauma, triggered, processing, or holding space unless the user used them first and mirroring once helps clarity.\n\n"
+            "Search/retrieval behavior: retrieval is available; use richer historical echoes only when it truly helps (patterns, recurrence, unresolved references), not every turn. "
+            "Do not quote old entries verbatim. Integrate naturally so they feel remembered, not catalogued.\n\n"
             "C) Inspiration from their journals — When they explicitly choose inspiration (look at journals, surprise me, you pick, scan, etc.), "
             "ignore the single-hook opening rule for that turn. Treat Relevant Context as the scan result (already balanced between solo-written and assisted-chat excerpts). "
             "Write about 100–185 words total (stay compact). "
@@ -931,7 +614,6 @@ def interviewer_node(state: JournalState) -> JournalState:
     lc_messages = [system] + state["messages"]
     oai_messages = _messages_to_openai_dicts(lc_messages)
     instance_id = state.get("instance_id") or ""
-    library_added = 0
     agent_steps: list[dict] = []
     client_actions: list[dict] = []
     response: AIMessage
@@ -948,7 +630,7 @@ def interviewer_node(state: JournalState) -> JournalState:
         elif mode_raw == "autobiography":
             model = (os.getenv("OPENROUTER_ASSISTED_JOURNAL_MODEL") or DEFAULT_ASSISTED_JOURNAL_MODEL).strip()
             extra_body = _reasoning_extra_body_for_model(model)
-        response, library_added, tool_steps, nav_actions = _interviewer_run_with_tools(
+        response, tool_steps, nav_actions = _interviewer_run_with_tools(
             client, model, oai_messages, instance_id, extra_body=extra_body
         )
         agent_steps = list(tool_steps)
@@ -956,7 +638,6 @@ def interviewer_node(state: JournalState) -> JournalState:
     except Exception as e:
         print("[backend] interviewer tool path failed; plain OpenRouter chat fallback:", e)
         response = llm.invoke(lc_messages)
-        library_added = 0
         agent_steps = []
         client_actions = []
 
@@ -975,8 +656,6 @@ def interviewer_node(state: JournalState) -> JournalState:
     out: dict = {"messages": [response], "agent_steps": agent_steps}
     if retrieval_log is not None:
         out["retrieval_log"] = retrieval_log
-    if library_added > 0:
-        out["library_items_added"] = library_added
     if client_actions:
         out["client_actions"] = client_actions
     return out

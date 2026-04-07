@@ -1,5 +1,5 @@
 """
-SQLite + sqlite-vec storage for Selfmeridian: journal chunks (vec_journal), consumed_content, people, auth.
+SQLite + sqlite-vec storage for Selfmeridian: journal chunks (vec_journal), people, auth.
 Journal memory is raw text chunked + embedded; no separate gist/episodic tables.
 """
 from __future__ import annotations
@@ -110,7 +110,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
         row is None and vec_journal_exists
     )
     if need_recreate:
-        for tbl in ("vec_journal", "vec_consumed"):
+        for tbl in ("vec_journal",):
             try:
                 conn.execute(f"DROP TABLE IF EXISTS {tbl}")
             except Exception:
@@ -203,52 +203,6 @@ def _init_db(conn: sqlite3.Connection) -> None:
         )
     """)
 
-    # Consumed content: id_original for lookup, embedding, metadata, document
-    conn.execute(f"""
-        CREATE VIRTUAL TABLE IF NOT EXISTS vec_consumed USING vec0(
-            row_id INTEGER PRIMARY KEY,
-            id_original TEXT,
-            embedding float[{EMBEDDING_DIM}] distance_metric=cosine,
-            type TEXT,
-            title TEXT,
-            author TEXT,
-            url TEXT,
-            liked BOOLEAN,
-            timestamp TEXT,
-            note TEXT,
-            date_completed TEXT,
-            +document TEXT
-        )
-    """)
-
-    # Source of truth for consumed listing/context (avoids full-scan of vec0)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS consumed_meta (
-            id_original TEXT PRIMARY KEY,
-            type TEXT,
-            title TEXT,
-            author TEXT,
-            url TEXT,
-            liked INTEGER,
-            timestamp TEXT,
-            date_completed TEXT,
-            note TEXT
-        )
-    """)
-
-    for col_def in [
-        "instance_id TEXT NOT NULL DEFAULT ''",
-        "isbn TEXT DEFAULT ''",
-        "publish_year TEXT DEFAULT ''",
-        "openlibrary_key TEXT DEFAULT ''",
-        "cover_url TEXT DEFAULT ''",
-        "subjects TEXT DEFAULT ''",
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE consumed_meta ADD COLUMN {col_def}")
-        except sqlite3.OperationalError:
-            pass
-
     # Simple login (no email): username + password_hash for persistent data (legacy)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS auth_users (
@@ -332,20 +286,8 @@ def _init_db(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_extraction_and_ingest_schema(conn: sqlite3.Connection) -> None:
-    """Migrations: rec feedback, decision log, content feedback."""
+    """Migrations: decision log, daily articles."""
     for tbl in (
-        """
-        CREATE TABLE IF NOT EXISTS rec_feedback_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            instance_id TEXT NOT NULL DEFAULT '',
-            action TEXT NOT NULL,
-            content_type TEXT,
-            topic_tags TEXT,
-            intent_context TEXT,
-            item_title TEXT,
-            created_at TEXT NOT NULL
-        )
-        """,
         """
         CREATE TABLE IF NOT EXISTS decision_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -362,21 +304,6 @@ def _ensure_extraction_and_ingest_schema(conn: sqlite3.Connection) -> None:
             duration_ms INTEGER,
             model_used TEXT,
             search_api_calls TEXT
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS content_feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-            instance_id TEXT NOT NULL DEFAULT '',
-            content_url TEXT,
-            content_title TEXT,
-            content_type TEXT,
-            feedback TEXT NOT NULL,
-            user_notes TEXT,
-            extracted_tags TEXT,
-            extracted_reasoning TEXT,
-            connected_journal_themes TEXT
         )
         """,
         """
@@ -406,12 +333,6 @@ def _ensure_extraction_and_ingest_schema(conn: sqlite3.Connection) -> None:
         pass
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_log_action ON decision_log(action_type)")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_content_feedback_instance ON content_feedback(instance_id, timestamp)"
-        )
     except sqlite3.OperationalError:
         pass
     try:
@@ -1156,36 +1077,6 @@ def wipe_journal_memory_for_instance(instance_id: str) -> None:
     conn.commit()
 
 
-@_sqlite_serialized
-def rec_feedback_record(
-    instance_id: str,
-    action: str,
-    *,
-    content_type: str | None = None,
-    topic_tags: str | None = None,
-    intent_context: str | None = None,
-    item_title: str | None = None,
-) -> None:
-    conn = _get_conn()
-    now = datetime.datetime.utcnow().isoformat() + "Z"
-    conn.execute(
-        """
-        INSERT INTO rec_feedback_events (instance_id, action, content_type, topic_tags, intent_context, item_title, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            instance_id or "",
-            action,
-            content_type,
-            topic_tags,
-            intent_context,
-            item_title[:500] if item_title else None,
-            now,
-        ),
-    )
-    conn.commit()
-
-
 _DECISION_LOG_INSERTS_SINCE_ROTATE = 0
 
 
@@ -1340,90 +1231,6 @@ def decision_log_get(log_id: int, instance_id: str) -> dict | None:
         "model_used": row[12],
         "search_api_calls": row[13],
     }
-
-
-@_sqlite_serialized
-def content_feedback_list_recent(instance_id: str, limit: int = 30) -> list[dict]:
-    import json as _json
-
-    conn = _get_conn()
-    lim = max(1, min(int(limit), 80))
-    rows = conn.execute(
-        """
-        SELECT id, timestamp, content_url, content_title, content_type, feedback, user_notes,
-               extracted_tags, extracted_reasoning, connected_journal_themes
-        FROM content_feedback WHERE instance_id = ? ORDER BY id DESC LIMIT ?
-        """,
-        (instance_id or "", lim),
-    ).fetchall()
-    out: list[dict] = []
-    for r in rows:
-        tags = None
-        themes = None
-        try:
-            if r[7]:
-                tags = _json.loads(r[7])
-        except Exception:
-            pass
-        try:
-            if r[9]:
-                themes = _json.loads(r[9])
-        except Exception:
-            pass
-        out.append(
-            {
-                "id": r[0],
-                "timestamp": r[1] or "",
-                "content_url": r[2],
-                "content_title": r[3] or "",
-                "content_type": r[4],
-                "feedback": r[5] or "",
-                "user_notes": r[6],
-                "extracted_tags": tags,
-                "extracted_reasoning": r[8],
-                "connected_journal_themes": themes,
-            }
-        )
-    return out
-
-
-@_sqlite_serialized
-def content_feedback_insert(
-    instance_id: str,
-    *,
-    content_url: str | None = None,
-    content_title: str | None = None,
-    content_type: str | None = None,
-    feedback: str,
-    user_notes: str | None = None,
-    extracted_tags: str | None = None,
-    extracted_reasoning: str | None = None,
-    connected_journal_themes: str | None = None,
-) -> int | None:
-    conn = _get_conn()
-    conn.execute(
-        """
-        INSERT INTO content_feedback (
-            instance_id, content_url, content_title, content_type, feedback,
-            user_notes, extracted_tags, extracted_reasoning, connected_journal_themes
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            instance_id or "",
-            content_url,
-            content_title,
-            content_type,
-            feedback,
-            user_notes,
-            extracted_tags,
-            extracted_reasoning,
-            connected_journal_themes,
-        ),
-    )
-    conn.commit()
-    row = conn.execute("SELECT last_insert_rowid()").fetchone()
-    return int(row[0]) if row and row[0] else None
 
 
 @_sqlite_serialized
@@ -1719,311 +1526,15 @@ def replace_person_facts(person_id: int, facts: list[dict]) -> None:
         )
     conn.commit()
 
-@_sqlite_serialized
-def add_consumed(
-    item_id: str,
-    document: str,
-    embedding: list[float],
-    *,
-    type_: str,
-    title: str,
-    author: str = "",
-    url: str = "",
-    liked: bool = True,
-    timestamp: str = "",
-    note: str = "",
-    date_completed: str = "",
-    instance_id: str = "",
-    isbn: str = "",
-    publish_year: str = "",
-    openlibrary_key: str = "",
-    cover_url: str = "",
-    subjects: str = "",
-) -> None:
-    conn = _get_conn()
-    blob = _blob_from_floats(embedding)
-    r = conn.execute("SELECT COALESCE(MAX(row_id), 0) + 1 FROM vec_consumed").fetchone()
-    row_id = r[0] if r else 1
-    conn.execute(
-        """
-        INSERT INTO vec_consumed (
-            row_id, id_original, embedding, type, title, author, url,
-            liked, timestamp, note, date_completed, document
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            row_id, item_id, blob, type_, title[:500], author[:300], url[:500],
-            1 if liked else 0, timestamp, note[:2000], date_completed[:50], document,
-        ),
-    )
-    try:
-        conn.execute(
-            """INSERT OR REPLACE INTO consumed_meta (
-                id_original, type, title, author, url, liked, timestamp, date_completed, note,
-                instance_id, isbn, publish_year, openlibrary_key, cover_url, subjects
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                item_id, type_, title[:500], author[:300], url[:500],
-                1 if liked else 0, timestamp, date_completed[:50], note[:2000],
-                instance_id or "", isbn[:20], publish_year[:10],
-                openlibrary_key[:100], cover_url[:300], subjects[:1000],
-            ),
-        )
-    except sqlite3.OperationalError:
-        conn.execute(
-            """INSERT OR REPLACE INTO consumed_meta (
-                id_original, type, title, author, url, liked, timestamp, date_completed, note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                item_id, type_, title[:500], author[:300], url[:500],
-                1 if liked else 0, timestamp, date_completed[:50], note[:2000],
-            ),
-        )
-    conn.commit()
-
-
-@_sqlite_serialized
-def consumed_book_exists(isbn: str = "", title: str = "", author: str = "", instance_id: str = "") -> bool:
-    """Check if a book already exists in consumed_meta by ISBN (preferred) or normalized title+author."""
-    conn = _get_conn()
-    where_base, params_base = _instance_where(instance_id, "consumed_meta")
-    if isbn:
-        try:
-            row = conn.execute(
-                f"SELECT 1 FROM consumed_meta WHERE {where_base} AND type='book' AND isbn=? LIMIT 1",
-                params_base + [isbn],
-            ).fetchone()
-            if row:
-                return True
-        except sqlite3.OperationalError:
-            pass
-    if title:
-        title_norm = title.strip().lower()
-        try:
-            rows = conn.execute(
-                f"SELECT title, author FROM consumed_meta WHERE {where_base} AND type='book'",
-                params_base,
-            ).fetchall()
-        except sqlite3.OperationalError:
-            rows = conn.execute(
-                "SELECT title, author FROM consumed_meta WHERE type='book'",
-            ).fetchall()
-        for r in rows:
-            existing_title = (r[0] or "").strip().lower()
-            existing_author = (r[1] or "").strip().lower()
-            if existing_title == title_norm:
-                if not author or existing_author == author.strip().lower():
-                    return True
-    return False
-
-
-@_sqlite_serialized
-def list_consumed_rows(max_items: int = 200, instance_id: str = "") -> list[dict]:
-    """Return all consumed rows from consumed_meta (source of truth for listing)."""
-    conn = _get_conn()
-    where, params = _instance_where(instance_id, "consumed_meta")
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT id_original, type, title, author, date_completed, note,
-                   isbn, publish_year, openlibrary_key, cover_url, subjects
-            FROM consumed_meta
-            WHERE {where}
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            params + [max_items],
-        ).fetchall()
-        has_extra = True
-    except sqlite3.OperationalError:
-        rows = conn.execute(
-            """
-            SELECT id_original, type, title, author, date_completed, note
-            FROM consumed_meta
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            (max_items,),
-        ).fetchall()
-        has_extra = False
-    result = []
-    for r in rows:
-        item = {
-            "id": r[0] or "",
-            "type": (r[1] or "article").lower(),
-            "title": (r[2] or "?").strip(),
-            "author": (r[3] or "").strip(),
-            "date_completed": (r[4] or "").strip(),
-            "note": (r[5] or "").strip(),
-        }
-        if has_extra:
-            item["isbn"] = (r[6] or "").strip()
-            item["publish_year"] = (r[7] or "").strip()
-            item["openlibrary_key"] = (r[8] or "").strip()
-            item["cover_url"] = (r[9] or "").strip()
-            item["subjects"] = (r[10] or "").strip()
-        result.append(item)
-    return result
-
-
-@_sqlite_serialized
-def update_consumed(
-    item_id: str,
-    *,
-    date_completed: str | None = None,
-    note: str | None = None,
-    title: str | None = None,
-    author: str | None = None,
-    url: str | None = None,
-    instance_id: str = "",
-) -> bool:
-    """Update consumed metadata by id_original. When instance_id is set, only update consumed_meta rows for that instance."""
-    conn = _get_conn()
-    if instance_id:
-        cur = conn.execute("SELECT 1 FROM consumed_meta WHERE id_original = ? AND instance_id = ?", (item_id, instance_id))
-    else:
-        try:
-            cur = conn.execute(
-                "SELECT 1 FROM consumed_meta WHERE id_original = ? AND (instance_id = '' OR instance_id IS NULL)",
-                (item_id,),
-            )
-        except sqlite3.OperationalError:
-            cur = conn.execute("SELECT 1 FROM consumed_meta WHERE id_original = ?", (item_id,))
-    if not cur.fetchone():
-        return False
-    updates = []
-    params = []
-    if date_completed is not None:
-        updates.append("date_completed = ?")
-        params.append((date_completed or "")[:50])
-    if note is not None:
-        updates.append("note = ?")
-        params.append((note or "")[:2000])
-    if title is not None:
-        updates.append("title = ?")
-        params.append((title or "")[:500])
-    if author is not None:
-        updates.append("author = ?")
-        params.append((author or "")[:300])
-    if url is not None:
-        updates.append("url = ?")
-        params.append((url or "")[:500])
-    if not updates:
-        return True
-    params.append(item_id)
-    if instance_id:
-        conn.execute(
-            f"UPDATE consumed_meta SET {', '.join(updates)} WHERE id_original = ? AND instance_id = ?",
-            params + [instance_id],
-        )
-    else:
-        try:
-            conn.execute(
-                f"UPDATE consumed_meta SET {', '.join(updates)} WHERE id_original = ? AND (instance_id = '' OR instance_id IS NULL)",
-                params,
-            )
-        except sqlite3.OperationalError:
-            conn.execute(
-                f"UPDATE consumed_meta SET {', '.join(updates)} WHERE id_original = ?",
-                params,
-            )
-    # Keep vec_consumed metadata in sync (vec table has no instance_id column).
-    # This does not re-embed; it only updates displayed metadata/document fields for consistency.
-    vec_updates = []
-    vec_params: list[Any] = []
-    if title is not None:
-        vec_updates.append("title = ?")
-        vec_params.append((title or "")[:500])
-    if author is not None:
-        vec_updates.append("author = ?")
-        vec_params.append((author or "")[:300])
-    if url is not None:
-        vec_updates.append("url = ?")
-        vec_params.append((url or "")[:500])
-    if note is not None:
-        vec_updates.append("note = ?")
-        vec_params.append((note or "")[:2000])
-    if date_completed is not None:
-        vec_updates.append("date_completed = ?")
-        vec_params.append((date_completed or "")[:50])
-    if vec_updates:
-        conn.execute(
-            f"UPDATE vec_consumed SET {', '.join(vec_updates)} WHERE id_original = ?",
-            vec_params + [item_id],
-        )
-    conn.commit()
-    return True
-
-
-@_sqlite_serialized
-def delete_consumed(item_id: str, instance_id: str = "") -> bool:
-    """Remove consumed item by id_original from both vec_consumed and consumed_meta. When instance_id is set, only delete rows for that instance."""
-    conn = _get_conn()
-    try:
-        cur = conn.execute("SELECT row_id FROM vec_consumed WHERE id_original = ?", (item_id,))
-        row = cur.fetchone()
-        if row:
-            conn.execute("DELETE FROM vec_consumed WHERE row_id = ?", (row[0],))
-        if instance_id:
-            cur = conn.execute("DELETE FROM consumed_meta WHERE id_original = ? AND instance_id = ?", (item_id, instance_id))
-        else:
-            try:
-                conn.execute("DELETE FROM consumed_meta WHERE id_original = ? AND (instance_id = '' OR instance_id IS NULL)", (item_id,))
-            except sqlite3.OperationalError:
-                conn.execute("DELETE FROM consumed_meta WHERE id_original = ?", (item_id,))
-        conn.commit()
-        return True
-    except Exception:
-        return False
-
-
-@_sqlite_serialized
-def get_consumed_context_rows(max_items: int = 80, instance_id: str = "") -> list[dict]:
-    """Return consumed rows with type, title, author, liked, note from consumed_meta."""
-    conn = _get_conn()
-    where, params = _instance_where(instance_id, "consumed_meta")
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT type, title, author, liked, note
-            FROM consumed_meta
-            WHERE {where}
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            params + [max_items],
-        ).fetchall()
-    except sqlite3.OperationalError:
-        rows = conn.execute(
-            """
-            SELECT type, title, author, liked, note
-            FROM consumed_meta
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            (max_items,),
-        ).fetchall()
-    return [
-        {
-            "type": (r[0] or "item").lower(),
-            "title": (r[1] or "?").strip(),
-            "author": (r[2] or "").strip(),
-            "liked": bool(r[3]) if r[3] is not None else True,
-            "note": (r[4] or "").strip(),
-        }
-        for r in rows
-    ]
-
 
 @_sqlite_serialized
 def wipe_memory() -> None:
-    """Clear journal memory, instance prefs, and rec feedback; keep consumed and people."""
+    """Clear journal memory and instance prefs; keep people."""
     conn = _get_conn()
     conn.execute("DELETE FROM vec_journal")
     conn.execute("DELETE FROM journal_chunks")
     conn.execute("DELETE FROM journal_entries")
     conn.execute("DELETE FROM instance_settings")
-    conn.execute("DELETE FROM rec_feedback_events")
     conn.commit()
 
 
@@ -2034,45 +1545,19 @@ def wipe_memory_for_instance(instance_id: str) -> None:
     conn = _get_conn()
     wipe_journal_memory_for_instance(instance_id)
     conn.execute("DELETE FROM instance_settings WHERE instance_id = ?", (instance_id,))
-    conn.execute("DELETE FROM rec_feedback_events WHERE instance_id = ?", (instance_id,))
-    conn.commit()
-
-
-@_sqlite_serialized
-def wipe_consumed_for_instance(instance_id: str) -> None:
-    """Remove consumed library rows and embeddings for this instance (or legacy unscoped rows if instance_id is '')."""
-    conn = _get_conn()
-    where, params = _instance_where(instance_id, "consumed_meta")
-    try:
-        rows = conn.execute(
-            f"SELECT id_original FROM consumed_meta WHERE {where}",
-            params,
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return
-    for (oid,) in rows:
-        if not oid:
-            continue
-        conn.execute("DELETE FROM vec_consumed WHERE id_original = ?", (oid,))
-    try:
-        conn.execute(f"DELETE FROM consumed_meta WHERE {where}", params)
-    except sqlite3.OperationalError:
-        pass
     conn.commit()
 
 
 @_sqlite_serialized
 def wipe_all_vector_memory_for_instance(instance_id: str) -> None:
     """
-    Clear gist, episodic, and consumed vectors for one instance (full knowledge-base reset before re-import).
-    When instance_id is empty, clears global gist/episodic (legacy) and legacy consumed rows.
+    Clear journal memory and instance settings for one instance (full knowledge-base reset before re-import).
+    When instance_id is empty, clears global journal memory (legacy) and instance_settings.
     """
     if instance_id:
         wipe_memory_for_instance(instance_id)
-        wipe_consumed_for_instance(instance_id)
     else:
         wipe_memory()
-        wipe_consumed_for_instance("")
 
 
 @_sqlite_serialized
@@ -2085,7 +1570,7 @@ def memory_count_for_instance(instance_id: str) -> tuple[int, int]:
 
 @_sqlite_serialized
 def merge_instance_memory(from_instance_id: str, to_instance_id: str) -> None:
-    """Copy journal memory, instance prefs, and consumed from from_instance_id to to_instance_id."""
+    """Copy journal memory and instance prefs from from_instance_id to to_instance_id."""
     if not from_instance_id or not to_instance_id or from_instance_id == to_instance_id:
         return
     conn = _get_conn()
@@ -2153,42 +1638,6 @@ def merge_instance_memory(from_instance_id: str, to_instance_id: str) -> None:
     patch = instance_settings_get(from_instance_id)
     if patch:
         instance_settings_merge_json(to_instance_id, patch)
-    # Copy consumed_meta + vec_consumed (by id_original from consumed_meta for from_id)
-    try:
-        crows = conn.execute(
-            """SELECT id_original, type, title, author, url, liked, timestamp, date_completed, note
-               FROM consumed_meta WHERE instance_id = ?""",
-            (from_instance_id,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        crows = []
-    for c in crows:
-        id_orig, type_, title, author, url, liked, ts, date_completed, note = c
-        vrow = conn.execute(
-            "SELECT embedding, document FROM vec_consumed WHERE id_original = ? LIMIT 1",
-            (id_orig,),
-        ).fetchone()
-        if not vrow:
-            continue
-        r = conn.execute("SELECT COALESCE(MAX(row_id), 0) + 1 FROM vec_consumed").fetchone()
-        new_row_id = r[0] if r else 1
-        conn.execute(
-            """INSERT INTO vec_consumed (row_id, id_original, embedding, type, title, author, url, liked, timestamp, note, date_completed, document)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (new_row_id, id_orig, vrow[0], type_ or "article", (title or "?")[:500], (author or "")[:300], (url or "")[:500], liked or 1, ts or "", (note or "")[:2000], (date_completed or "")[:50], vrow[1] or ""),
-        )
-        try:
-            conn.execute(
-                """INSERT OR REPLACE INTO consumed_meta (id_original, type, title, author, url, liked, timestamp, date_completed, note, instance_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (id_orig, type_, title, author, url, liked, ts, date_completed, note, to_instance_id),
-            )
-        except sqlite3.OperationalError:
-            conn.execute(
-                """INSERT OR REPLACE INTO consumed_meta (id_original, type, title, author, url, liked, timestamp, date_completed, note)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (id_orig, type_, title, author, url, liked, ts, date_completed, note),
-            )
     conn.commit()
 
 

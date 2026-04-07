@@ -8,7 +8,7 @@ import {
   listJournalPathsInKnowledgeBaseZip,
   parseKnowledgeBaseMarkdownZip,
 } from "./knowledgeBaseMarkdownZip";
-import { BrainLayout, type BrainLibraryCategory } from "./components/BrainLayout";
+import { BrainLayout } from "./components/BrainLayout";
 import { VoiceMemoTab } from "./components/VoiceMemoTab";
 
 import { BrainCalendarPanel } from "./components/BrainCalendarPanel";
@@ -18,25 +18,6 @@ import { AboutTab } from "./components/AboutTab";
 import { PersonaplexGithubLink } from "./components/PersonaplexGithubLink";
 import { PersonaplexLeftRail, type PersonaplexView } from "./components/PersonaplexLeftRail";
 import { AssistedJournalUnloadSync } from "./components/AssistedJournalUnloadSync";
-
-const RECOMMENDATIONS_CACHE_KEY = "openjournal-recommendations-cache";
-const LIBRARY_CACHE_KEY = "openjournal-library-cache";
-
-type RecItem = { title: string; author?: string; reason?: string; url?: string };
-type RecommendationsBundle = {
-  books: RecItem[];
-  podcasts: RecItem[];
-  articles: RecItem[];
-  research: RecItem[];
-  news: RecItem[];
-};
-const EMPTY_RECOMMENDATIONS: RecommendationsBundle = {
-  books: [],
-  podcasts: [],
-  articles: [],
-  research: [],
-  news: [],
-};
 
 const JOURNAL_FILENAME_DATE_CHUNK = 80;
 
@@ -144,114 +125,30 @@ async function inferJournalPathDatesMap(paths: string[]): Promise<Map<string, st
   return map;
 }
 
-function RecFeedbackLinks({
-  category,
-  item,
-}: {
-  category: "book" | "podcast" | "article" | "research" | "news";
-  item: RecItem;
-}) {
-  const send = (action: "like" | "dislike") => {
-    void backendFetch("/recommendations/feedback", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action,
-        content_type: category,
-        item_title: item.title,
-        topic_tags: [item.title, item.author].filter(Boolean).join(" · ").slice(0, 200),
-      }),
-    });
-  };
-  return (
-    <div className="mt-1.5 flex flex-wrap gap-3 text-[11px]">
-      <button
-        type="button"
-        className="text-gray-500 hover:text-[#10a37f] dark:text-gray-400 dark:hover:text-emerald-400"
-        onClick={() => send("like")}
-      >
-        More like this
-      </button>
-            <button
-              type="button"
-        className="text-gray-500 hover:text-amber-800 dark:text-gray-400 dark:hover:text-amber-400/90"
-        onClick={() => send("dislike")}
-            >
-        Not for me
-            </button>
-    </div>
-  );
-}
-
-function readRecommendationsCache(): RecommendationsBundle {
-  try {
-    const raw = localStorage.getItem(RECOMMENDATIONS_CACHE_KEY);
-    if (!raw) return { ...EMPTY_RECOMMENDATIONS };
-    const parsed = JSON.parse(raw) as Partial<RecommendationsBundle>;
-    return {
-      books: Array.isArray(parsed.books) ? parsed.books : [],
-      podcasts: Array.isArray(parsed.podcasts) ? parsed.podcasts : [],
-      articles: Array.isArray(parsed.articles) ? parsed.articles : [],
-      research: Array.isArray(parsed.research) ? parsed.research : [],
-      news: Array.isArray(parsed.news) ? parsed.news : [],
-    };
-  } catch {
-    return { ...EMPTY_RECOMMENDATIONS };
-  }
-}
-
 const KB_UPLOAD_CONFIRM_MESSAGE =
   "Uploading a knowledge base replaces everything for this session.\n\n" +
-  "• Server: all journal embeddings and your library vector index are deleted, then rebuilt from this file.\n" +
-  "• This device: manual journals, AI-assisted journals, and library are replaced by the import (not merged).\n" +
-  "• Cached recommendations are cleared.\n\n" +
+  "• Server: all journal embeddings are deleted, then rebuilt from this file.\n" +
+  "• This device: manual journals and AI-assisted journals are replaced by the import (not merged).\n\n" +
   "Stay online until syncing finishes. This cannot be undone.\n\n" +
   "Continue?";
 
 const JOURNAL_FOLDER_UPLOAD_CONFIRM_MESSAGE =
   "Import journal files from the selected folder or chosen files? New entries will be added to your knowledge base.";
 
-type LibraryBulkImportPayloadItem = {
-  id: string;
-  type: "book" | "podcast" | "article" | "research";
-  title: string;
-  author?: string;
-  note?: string;
-  date_completed?: string;
-  url?: string;
-  liked: boolean;
-};
-
-function librarySnapshotToBulkPayload(next: {
-  books: Array<{ id: string; title: string; author?: string; note?: string; date_completed?: string }>;
-  podcasts: Array<{ id: string; title: string; author?: string; note?: string; date_completed?: string }>;
-  articles: Array<{ id: string; title: string; author?: string; note?: string; date_completed?: string }>;
-  research: Array<{ id: string; title: string; author?: string; note?: string; date_completed?: string }>;
-}): LibraryBulkImportPayloadItem[] {
-  const items: LibraryBulkImportPayloadItem[] = [];
-  const push = (row: (typeof next.books)[number], type: LibraryBulkImportPayloadItem["type"]) => {
-    items.push({
-      id: row.id,
-      type,
-      title: row.title,
-      author: row.author,
-      note: row.note,
-      date_completed: row.date_completed,
-      liked: true,
-    });
-  };
-  next.books.forEach((r) => push(r, "book"));
-  next.podcasts.forEach((r) => push(r, "podcast"));
-  next.articles.forEach((r) => push(r, "article"));
-  next.research.forEach((r) => push(r, "research"));
-  return items;
-}
-
 export const Personaplex = () => {
   const [view, setView] = useState<PersonaplexView>("voice_memo");
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [railExpanded, setRailExpanded] = useState(true);
   const [mobileRailOpen, setMobileRailOpen] = useState(false);
+  const [calendarMonth, setCalendarMonth] = useState(() => {
+    const d = new Date();
+    return { year: d.getFullYear(), month: d.getMonth() };
+  });
+  const [calendarSelectedDate, setCalendarSelectedDate] = useState<string | null>(null);
+  const [calendarDaySummary, setCalendarDaySummary] = useState<string | null>(null);
+  const [calendarDaySummaryLoading, setCalendarDaySummaryLoading] = useState(false);
+  /** Left sidebar: Knowledge base vs Calendar */
+  const [brainSection, setBrainSection] = useState<"knowledgeBase" | "calendar">("knowledgeBase");
   const chatToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 4000);
@@ -269,121 +166,6 @@ export const Personaplex = () => {
       if (navigated) chatToast("Opened the screen you asked for.");
     },
     [chatToast]
-  );
-  const [recommendations, setRecommendations] = useState<RecommendationsBundle>(() => readRecommendationsCache());
-  const [recommendationsLoading, setRecommendationsLoading] = useState(false);
-  const recommendationsInFlightRef = useRef(false);
-  const [recColumnLoading, setRecColumnLoading] = useState<Partial<Record<keyof RecommendationsBundle, boolean>>>({});
-  const recColumnInFlightRef = useRef<Set<string>>(new Set());
-  const [consumedIds, setConsumedIds] = useState<Set<string>>(new Set());
-  const [removingKeys, setRemovingKeys] = useState<Set<string>>(new Set());
-  const [libraryAddCategory, setLibraryAddCategory] = useState<"book" | "podcast" | "article" | "research" | null>(null);
-  const [libraryDraftText, setLibraryDraftText] = useState("");
-  const [librarySubmitting, setLibrarySubmitting] = useState(false);
-  type LibraryItem = { id: string; title: string; author?: string; date_completed?: string; note?: string };
-  const [libraryItems, setLibraryItems] = useState<{ books: LibraryItem[]; podcasts: LibraryItem[]; articles: LibraryItem[]; research: LibraryItem[] }>({
-    books: [], podcasts: [], articles: [], research: [],
-  });
-  const [libraryEditingId, setLibraryEditingId] = useState<string | null>(null);
-  const [libraryEditDate, setLibraryEditDate] = useState("");
-  const [libraryEditNote, setLibraryEditNote] = useState("");
-  const [libraryUpdateSaving, setLibraryUpdateSaving] = useState(false);
-  const [libraryLoading, setLibraryLoading] = useState(false);
-  const [showLibraryInterview, setShowLibraryInterview] = useState(false);
-  const [libraryInterviewMessages, setLibraryInterviewMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
-  const [libraryInterviewSessionId, setLibraryInterviewSessionId] = useState<string | null>(null);
-  const [libraryInterviewLoading, setLibraryInterviewLoading] = useState(false);
-  const [libraryInterviewInput, setLibraryInterviewInput] = useState("");
-  const [calendarMonth, setCalendarMonth] = useState(() => {
-    const d = new Date();
-    return { year: d.getFullYear(), month: d.getMonth() };
-  });
-  const [calendarSelectedDate, setCalendarSelectedDate] = useState<string | null>(null);
-  const [calendarDaySummary, setCalendarDaySummary] = useState<string | null>(null);
-  const [calendarDaySummaryLoading, setCalendarDaySummaryLoading] = useState(false);
-  /** Left sidebar: Knowledge base (manual + AI-assisted journals, library) vs Calendar */
-  const [brainSection, setBrainSection] = useState<"knowledgeBase" | "calendar">("knowledgeBase");
-  const fetchLibrary = useCallback((showCachedFirst = false): Promise<void> => {
-    if (showCachedFirst) {
-      try {
-        const cached = localStorage.getItem(LIBRARY_CACHE_KEY);
-        if (cached) {
-          const parsed = JSON.parse(cached) as { books?: unknown; podcasts?: unknown; articles?: unknown; research?: unknown };
-          if (parsed && typeof parsed === "object") {
-            setLibraryItems({
-              books: Array.isArray(parsed.books) ? parsed.books as LibraryItem[] : [],
-              podcasts: Array.isArray(parsed.podcasts) ? parsed.podcasts as LibraryItem[] : [],
-              articles: Array.isArray(parsed.articles) ? parsed.articles as LibraryItem[] : [],
-              research: Array.isArray(parsed.research) ? parsed.research as LibraryItem[] : [],
-            });
-          }
-        }
-      } catch {
-        /* ignore cache parse errors */
-      }
-    }
-    return backendFetch("/library")
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load library"))))
-      .then((data: { books?: LibraryItem[]; podcasts?: LibraryItem[]; articles?: LibraryItem[]; research?: LibraryItem[] }) => {
-        const next = {
-          books: Array.isArray(data.books) ? data.books : [],
-          podcasts: Array.isArray(data.podcasts) ? data.podcasts : [],
-          articles: Array.isArray(data.articles) ? data.articles : [],
-          research: Array.isArray(data.research) ? data.research : [],
-        };
-        setLibraryItems(next);
-        try {
-          localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(next));
-        } catch {
-          /* ignore */
-        }
-      })
-      .catch(() => {
-        if (!showCachedFirst) setLibraryItems({ books: [], podcasts: [], articles: [], research: [] });
-      });
-  }, []);
-  useEffect(() => {
-    if (view !== "brain") return;
-    setLibraryLoading(true);
-    fetchLibrary(true).finally(() => setLibraryLoading(false));
-  }, [view, fetchLibrary]);
-
-  const sendLibraryInterviewMessage = useCallback(
-    (msg: string) => {
-      if (!msg.trim() || libraryInterviewLoading) return;
-      setLibraryInterviewMessages((prev) => [...prev, { role: "user", content: msg.trim() }]);
-      setLibraryInterviewInput("");
-      setLibraryInterviewLoading(true);
-      const snapshot = libraryItems.books.map((b) => ({ id: b.id, title: b.title, author: b.author ?? undefined, note: b.note ?? undefined }));
-      backendFetch("/library-interview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: msg.trim(),
-          session_id: libraryInterviewSessionId ?? undefined,
-          library_snapshot: snapshot,
-        }),
-      })
-        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Interview failed"))))
-        .then((data: { response?: string; session_id?: string; notes_saved?: { item_id: string; note: string }[] }) => {
-          setLibraryInterviewSessionId(data.session_id ?? null);
-          setLibraryInterviewMessages((prev) => [...prev, { role: "assistant", content: data.response ?? "" }]);
-          if (data.notes_saved?.length) {
-            fetchLibrary();
-            const first = data.notes_saved[0];
-            const title = libraryItems.books.find((b) => b.id === first.item_id)?.title ?? "a book";
-            setToastMessage(`Note saved for ${title}.`);
-            setTimeout(() => setToastMessage(null), 3000);
-          }
-        })
-        .catch(() => {
-          setLibraryInterviewMessages((prev) => [...prev, { role: "assistant", content: "Something went wrong. Please try again." }]);
-          setToastMessage("Interview request failed.");
-          setTimeout(() => setToastMessage(null), 3000);
-        })
-        .finally(() => setLibraryInterviewLoading(false));
-    },
-    [libraryInterviewLoading, libraryInterviewSessionId, libraryItems.books, fetchLibrary]
   );
 
   const {
@@ -417,8 +199,8 @@ export const Personaplex = () => {
     if (
       !window.confirm(
         "Start fresh?\n\n" +
-          "• Server: deletes journal embeddings and library vectors for this device/instance.\n" +
-          "• This browser: clears saved journals, library and recommendations cache, library interview, and the in-progress home chat.\n\n" +
+          "• Server: deletes journal embeddings for this device/instance.\n" +
+          "• This browser: clears saved journals and the in-progress home chat.\n\n" +
           "This cannot be undone.",
       )
     ) {
@@ -432,137 +214,68 @@ export const Personaplex = () => {
     }
     try {
       localStorage.removeItem(JOURNAL_HISTORY_STORAGE_KEY);
-      localStorage.removeItem(LIBRARY_CACHE_KEY);
-      localStorage.removeItem(RECOMMENDATIONS_CACHE_KEY);
     } catch {
       /* ignore */
     }
     clearHistory();
-    setLibraryItems({ books: [], podcasts: [], articles: [], research: [] });
-    setRecommendations({ ...EMPTY_RECOMMENDATIONS });
-    setConsumedIds(new Set());
-    setRemovingKeys(new Set());
-    setLibraryInterviewSessionId(null);
-    setLibraryInterviewMessages([]);
-    setLibraryInterviewInput("");
-    setLibraryAddCategory(null);
-    setLibraryDraftText("");
-    setLibraryEditingId(null);
-    setLibraryEditDate("");
-    setLibraryEditNote("");
-    setShowLibraryInterview(false);
     setCalendarSelectedDate(null);
     setCalendarDaySummary(null);
     setCalendarDaySummaryLoading(false);
     chatWorkspaceResetRef.current?.();
-    void fetchLibrary();
     setToastMessage("Started fresh: server memory wiped and local Personaplex data cleared.");
     setTimeout(() => setToastMessage(null), 5000);
-  }, [clearHistory, resetServerKnowledgeBaseMemory, fetchLibrary]);
-
-  const pushLibraryBulkToServer = useCallback(async (items: LibraryBulkImportPayloadItem[]) => {
-    if (items.length === 0) return true;
-    try {
-      const r = await backendFetch("/library/bulk-import", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items }),
-      });
-      const data = (await r.json().catch(() => ({}))) as { ok?: boolean };
-      return r.ok && data.ok !== false;
-    } catch {
-      return false;
-    }
-  }, []);
+  }, [clearHistory, resetServerKnowledgeBaseMemory]);
 
   const handleDownloadKnowledgeBase = useCallback(async () => {
     try {
-      const blob = await buildKnowledgeBaseMarkdownZip(entries, libraryItems);
+      const blob = await buildKnowledgeBaseMarkdownZip(entries);
       const a = document.createElement("a");
       const url = URL.createObjectURL(blob);
       a.href = url;
       a.download = `selfmeridian-knowledge-base-${new Date().toISOString().slice(0, 10)}.zip`;
       a.click();
       URL.revokeObjectURL(url);
-      setToastMessage("Downloaded Markdown folder (.zip). Unzip to browse manual journals, AI-assisted journals, and library.");
+      setToastMessage("Downloaded Markdown folder (.zip). Unzip to browse manual and AI-assisted journals.");
       setTimeout(() => setToastMessage(null), 4000);
     } catch {
       setToastMessage("Download failed.");
       setTimeout(() => setToastMessage(null), 3000);
     }
-  }, [entries, libraryItems]);
-
-  const replaceImportedLibrary = useCallback(
-    (lib: {
-      books: (typeof libraryItems.books)[number][];
-      podcasts: (typeof libraryItems.podcasts)[number][];
-      articles: (typeof libraryItems.articles)[number][];
-      research: (typeof libraryItems.research)[number][];
-    }) => {
-      const base = Date.now();
-      const remap = (items: (typeof libraryItems.books)[number][], tag: string) =>
-        items.map((item, i) => ({
-          ...item,
-          id: `lib-${base}-${tag}-${i}-${Math.random().toString(36).slice(2, 8)}`,
-        }));
-      const next = {
-        books: remap(lib.books, "book"),
-        podcasts: remap(lib.podcasts, "podcast"),
-        articles: remap(lib.articles, "article"),
-        research: remap(lib.research, "research"),
-      };
-      setLibraryItems(next);
-      try {
-        localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    },
-    []
-  );
+  }, [entries]);
 
   const handleImportKnowledgeBaseFile = useCallback(
     async (file: File) => {
-      const applyKnowledgeBaseImport = async (
-        exportPayload: { version: number; exportedAt: string; entries: (typeof entries)[number][] },
-        lib: {
-          books: (typeof libraryItems.books)[number][];
-          podcasts: (typeof libraryItems.podcasts)[number][];
-          articles: (typeof libraryItems.articles)[number][];
-          research: (typeof libraryItems.research)[number][];
-        }
-      ) => {
+      const applyKnowledgeBaseImport = async (exportPayload: {
+        version: number;
+        exportedAt: string;
+        entries: (typeof entries)[number][];
+      }) => {
         if (!(await resetServerKnowledgeBaseMemory())) {
           setToastMessage("Could not reset server memory. Check your connection and try again.");
           setTimeout(() => setToastMessage(null), 6000);
           return;
         }
-        try {
-          localStorage.removeItem(RECOMMENDATIONS_CACHE_KEY);
-        } catch {
-          /* ignore */
-        }
-        setRecommendations({ ...EMPTY_RECOMMENDATIONS });
         const nEntries = importEntriesReplaceAll({
           version: exportPayload.version,
           exportedAt: exportPayload.exportedAt,
           entries: exportPayload.entries,
         });
-        const nextLib = replaceImportedLibrary(lib);
-        const bulk = librarySnapshotToBulkPayload(nextLib);
-        const libOk = await pushLibraryBulkToServer(bulk);
-        if (!libOk) {
-          setToastMessage("Journal entries updated locally; library sync failed. Check the API and try uploading again.");
-          setTimeout(() => setToastMessage(null), 6000);
+        let synced = await syncUnsyncedEntries();
+        // Retry once after a brief delay to smooth over transient backend restarts.
+        if (synced < nEntries) {
+          await new Promise((resolve) => setTimeout(resolve, 900));
+          synced += await syncUnsyncedEntries();
         }
-        const synced = await syncUnsyncedEntries();
-        void fetchLibrary();
-        const nLib = bulk.length;
-        setToastMessage(
-          `Knowledge base replaced: ${nEntries} journal entr${nEntries === 1 ? "y" : "ies"}, ${nLib} library item${nLib === 1 ? "" : "s"}. ` +
-            `${synced} synced to server memory.`
-        );
+        if (synced < nEntries) {
+          const pending = Math.max(0, nEntries - synced);
+          setToastMessage(
+            `Knowledge base replaced: ${nEntries} journal entr${nEntries === 1 ? "y" : "ies"} saved locally; ${synced} synced to server, ${pending} pending. Keep backend running and re-import or add/edit an entry to trigger another sync.`
+          );
+        } else {
+          setToastMessage(
+            `Knowledge base replaced: ${nEntries} journal entr${nEntries === 1 ? "y" : "ies"}. ${synced} synced to server memory.`
+          );
+        }
         setTimeout(() => setToastMessage(null), 6500);
       };
 
@@ -577,14 +290,11 @@ export const Personaplex = () => {
           const dateMap = await inferJournalPathDatesMap(journalPaths);
           const parsed = await parseKnowledgeBaseMarkdownZip(file, dateMap);
           if (!parsed) {
-            setToastMessage("That ZIP isn’t a valid Markdown knowledge base (expected journals/, conversations/, library/).");
+            setToastMessage("That ZIP isn’t a valid Markdown knowledge base (expected journals/ and conversations/).");
             setTimeout(() => setToastMessage(null), 5000);
             return;
           }
-          await applyKnowledgeBaseImport(
-            { version: 1, exportedAt: new Date().toISOString(), entries: parsed.entries },
-            parsed.library
-          );
+          await applyKnowledgeBaseImport({ version: 1, exportedAt: new Date().toISOString(), entries: parsed.entries });
           return;
         }
 
@@ -596,28 +306,20 @@ export const Personaplex = () => {
           return;
         }
         if (parsed.kind === "journalsOnly") {
-          await applyKnowledgeBaseImport(parsed.data, {
-            books: [],
-            podcasts: [],
-            articles: [],
-            research: [],
-          });
+          await applyKnowledgeBaseImport(parsed.data);
           return;
         }
-        await applyKnowledgeBaseImport(
-          {
-            version: parsed.data.version,
-            exportedAt: parsed.data.exportedAt,
-            entries: parsed.data.entries,
-          },
-          parsed.data.library
-        );
+        await applyKnowledgeBaseImport({
+          version: parsed.data.version,
+          exportedAt: parsed.data.exportedAt,
+          entries: parsed.data.entries,
+        });
       } catch {
         setToastMessage("Could not read that file.");
         setTimeout(() => setToastMessage(null), 4000);
       }
     },
-    [fetchLibrary, importEntriesReplaceAll, pushLibraryBulkToServer, replaceImportedLibrary, resetServerKnowledgeBaseMemory, syncUnsyncedEntries]
+    [importEntriesReplaceAll, resetServerKnowledgeBaseMemory, syncUnsyncedEntries]
   );
 
   const handleImportJournalDumpFolder = useCallback(
@@ -672,169 +374,6 @@ export const Personaplex = () => {
     hasRunInitialSyncRef.current = true;
     syncUnsyncedEntries();
   }, [entries.length, syncUnsyncedEntries]);
-
-  /** Network fetch only — user clicks "Refresh recommendations". Cached lists stay until then. */
-  const refreshRecommendationsFromApi = useCallback((retryCount = 0) => {
-    if (recommendationsInFlightRef.current) return;
-    const doFetch = (isRetry: boolean) => {
-      const ac = new AbortController();
-      const timeoutId = setTimeout(() => ac.abort(), 125000);
-      recommendationsInFlightRef.current = true;
-      backendFetch("/recommendations", { signal: ac.signal })
-        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
-        .then((data: Partial<RecommendationsBundle>) => {
-          const next: RecommendationsBundle = {
-            books: data.books ?? [],
-            podcasts: data.podcasts ?? [],
-            articles: data.articles ?? [],
-            research: data.research ?? [],
-            news: data.news ?? [],
-          };
-          setRecommendations(next);
-          try {
-            localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
-          } catch {
-            /* ignore */
-          }
-        })
-        .catch(() => {
-          if (!isRetry && retryCount < 1) {
-            setTimeout(() => refreshRecommendationsFromApi(1), 2500);
-            return;
-          }
-          setRecommendations(readRecommendationsCache());
-        })
-        .finally(() => {
-          clearTimeout(timeoutId);
-          recommendationsInFlightRef.current = false;
-          setRecommendationsLoading(false);
-        });
-    };
-    setRecommendationsLoading(true);
-    doFetch(retryCount >= 1);
-  }, []);
-
-  const recColumnBtnClass =
-    "shrink-0 px-2 py-1 rounded-md text-[11px] font-medium bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-[#404040] dark:text-gray-400 dark:hover:bg-[#505050] disabled:opacity-50 disabled:cursor-not-allowed transition-colors";
-
-  const refreshRecommendationsColumn = useCallback((cat: keyof RecommendationsBundle) => {
-    if (recommendationsInFlightRef.current || recColumnInFlightRef.current.has(cat)) return;
-    recColumnInFlightRef.current.add(cat);
-    setRecColumnLoading((s) => ({ ...s, [cat]: true }));
-    const ac = new AbortController();
-    const timeoutId = setTimeout(() => ac.abort(), 125000);
-    backendFetch(`/recommendations?category=${encodeURIComponent(cat)}`, { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load"))))
-      .then((data: Partial<RecommendationsBundle>) => {
-        const slice = data[cat];
-        if (!Array.isArray(slice)) return;
-        setRecommendations((prev) => {
-          const next = { ...prev, [cat]: slice };
-          try {
-            localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(next));
-          } catch {
-            /* ignore */
-          }
-          return next;
-        });
-      })
-      .catch(() => {
-        setToastMessage("Could not refresh this column. Try again.");
-        setTimeout(() => setToastMessage(null), 4000);
-      })
-      .finally(() => {
-        clearTimeout(timeoutId);
-        recColumnInFlightRef.current.delete(cat);
-        setRecColumnLoading((s) => ({ ...s, [cat]: false }));
-      });
-  }, []);
-
-  useEffect(() => {
-    if (view !== "recommendations") return;
-    void syncUnsyncedEntries();
-    setRecommendations((prev) => {
-      const hasAny =
-        prev.books.length > 0 ||
-        prev.podcasts.length > 0 ||
-        prev.articles.length > 0 ||
-        prev.research.length > 0 ||
-        prev.news.length > 0;
-      if (hasAny) return prev;
-      return readRecommendationsCache();
-    });
-  }, [view, syncUnsyncedEntries]);
-
-  useEffect(() => {
-    if (
-      view === "recommendations" &&
-      (recommendations.books.length > 0 ||
-        recommendations.podcasts.length > 0 ||
-        recommendations.articles.length > 0 ||
-        recommendations.research.length > 0 ||
-        recommendations.news.length > 0)
-    ) {
-      try {
-        localStorage.setItem(RECOMMENDATIONS_CACHE_KEY, JSON.stringify(recommendations));
-      } catch {
-        /* ignore */
-      }
-    }
-  }, [view, recommendations]);
-
-  const markConsumed = useCallback(
-    (type: "book" | "podcast" | "article" | "research" | "news", item: RecItem) => {
-      const key = `${type}:${item.title}`;
-      if (consumedIds.has(key)) return;
-      backendFetch("/recommendations/consumed", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type,
-          title: item.title ?? "",
-          author: item.author ?? undefined,
-          url: item.url ?? undefined,
-          liked: true,
-        }),
-      })
-        .then(async (r) => {
-          const data = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(typeof data?.detail === "string" ? data.detail : "Failed to save.");
-          if (data && data.ok === false) throw new Error("Failed to save.");
-          return data;
-        })
-        .then(() => {
-          setConsumedIds((prev) => new Set(prev).add(key));
-          setToastMessage(
-            type === "podcast"
-              ? "Marked as listened."
-              : "Marked as read.",
-          );
-          setTimeout(() => setToastMessage(null), 2500);
-          setRemovingKeys((prev) => new Set(prev).add(key));
-          const removeAfter = 320;
-          setTimeout(() => {
-            setRecommendations((prev) => ({
-              ...prev,
-              books: type === "book" ? prev.books.filter((x) => x.title !== item.title) : prev.books,
-              podcasts: type === "podcast" ? prev.podcasts.filter((x) => x.title !== item.title) : prev.podcasts,
-              articles: type === "article" ? prev.articles.filter((x) => x.title !== item.title) : prev.articles,
-              research: type === "research" ? prev.research.filter((x) => x.title !== item.title) : prev.research,
-              news: type === "news" ? prev.news.filter((x) => x.title !== item.title) : prev.news,
-            }));
-            setRemovingKeys((prev) => {
-              const next = new Set(prev);
-              next.delete(key);
-              return next;
-            });
-          }, removeAfter);
-        })
-        .catch((err) => {
-          setToastMessage(err?.message === "Failed to save." ? "Failed to save." : "Could not mark as read. Try again.");
-          setTimeout(() => setToastMessage(null), 4000);
-        });
-    },
-    [consumedIds]
-  );
 
   return (
     <PersonaplexChatProvider onToast={chatToast} onAgentAction={handleChatAgentAction} chatWorkspaceResetRef={chatWorkspaceResetRef}>
@@ -929,8 +468,6 @@ export const Personaplex = () => {
           className={`flex-1 flex flex-col min-h-0 transition-opacity duration-300 ${
             view === "brain" ||
               view === "voice_memo" ||
-              view === "recommendations" ||
-              
               view === "about"
               ? "overflow-hidden"
               : "overflow-y-auto"
@@ -949,7 +486,7 @@ export const Personaplex = () => {
                 </h2>
                     <p className="mt-1 text-xs text-white/50 md:text-sm">
                       {brainSection === "knowledgeBase"
-                        ? "Manual journals, AI-assisted journals, and your books & media library."
+                        ? "Manual journals and AI-assisted journals."
                         : "Click a date for an AI summary of that day (journal entries + memory)."}
                     </p>
                         </div>
@@ -1004,65 +541,6 @@ export const Personaplex = () => {
                     setToastMessage(msg);
                     setTimeout(() => setToastMessage(null), 3000);
                   }}
-                  libraryItems={libraryItems}
-                  libraryLoading={libraryLoading}
-                  libraryAddCategory={libraryAddCategory}
-                  libraryDraftText={libraryDraftText}
-                  setLibraryDraftText={setLibraryDraftText}
-                  librarySubmitting={librarySubmitting}
-                  onSubmitLibraryAdd={() => {
-                    if (!libraryDraftText.trim() || librarySubmitting || !libraryAddCategory) return;
-                                    setLibrarySubmitting(true);
-                                    const payload = libraryDraftText.trim();
-                                    backendFetch("/library-notes", {
-                                      method: "POST",
-                                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ text: payload, type: libraryAddCategory }),
-                                    })
-                                      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Library update failed"))))
-                                      .then((data: { ok?: boolean; items_added?: number }) => {
-                                        const added = data?.items_added ?? 0;
-                                        setLibraryDraftText("");
-                        setLibraryAddCategory(null);
-                                        if (added > 0) fetchLibrary();
-                        setToastMessage(added > 0 ? `Added ${added} item(s).` : "No items recognized; try clearer titles.");
-                                        setTimeout(() => setToastMessage(null), 4000);
-                                      })
-                                      .catch(() => {
-                                        setToastMessage("Library update failed.");
-                                        setTimeout(() => setToastMessage(null), 4000);
-                                      })
-                                      .finally(() => setLibrarySubmitting(false));
-                                  }}
-                  onCancelLibraryAdd={() => {
-                    setLibraryAddCategory(null);
-                                    setLibraryDraftText("");
-                                  }}
-                  onClickAddLibrary={(cat: BrainLibraryCategory) => {
-                    setLibraryAddCategory((prev) => (prev === cat ? null : cat));
-                    setLibraryDraftText("");
-                  }}
-                  onEditLibraryItem={(_cat, id) => {
-                    setLibraryEditingId(id);
-                    const e = [...libraryItems.books, ...libraryItems.podcasts, ...libraryItems.articles, ...libraryItems.research].find((x) => x.id === id);
-                    setLibraryEditDate(e?.date_completed ?? "");
-                    setLibraryEditNote(e?.note ?? "");
-                  }}
-                  onDeleteLibraryItem={(_cat, id) => {
-                    backendFetch(`/library/${encodeURIComponent(id)}`, { method: "DELETE" })
-                                  .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Delete failed"))))
-                                  .then((data: { ok?: boolean }) => {
-                                    if (data?.ok !== false) {
-                                      fetchLibrary();
-                          setToastMessage("Removed from library.");
-                                      setTimeout(() => setToastMessage(null), 2000);
-                                    }
-                                  })
-                                  .catch(() => {
-                                    setToastMessage("Failed to remove.");
-                                    setTimeout(() => setToastMessage(null), 3000);
-                      });
-                  }}
                   onDownloadKnowledgeBase={handleDownloadKnowledgeBase}
                   onImportKnowledgeBaseFile={handleImportKnowledgeBaseFile}
                   onPrepareKnowledgeBaseUpload={prepareKnowledgeBaseUpload}
@@ -1086,458 +564,6 @@ export const Personaplex = () => {
               )}
             </div>
           )}
-          {view === "recommendations" && (
-            <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden px-3 pb-3 pt-2 sm:px-4 sm:pb-4 sm:pt-3 md:px-6">
-              <div className="mb-3 flex flex-shrink-0 flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-lg font-medium text-gray-800 dark:text-gray-200 uppercase tracking-wider">
-                    Recommendations
-                  </h2>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">
-                    Based on your journal memory and what you’ve already read or listened to. Suggestions are kept on this
-                    device until you refresh. Use <strong className="font-medium text-gray-600 dark:text-gray-300">Refresh</strong> in a
-                    column to update only that category (faster). Mark items as read/listened so future runs get better.
-                  </p>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                              <button
-                                type="button"
-                    onClick={() => refreshRecommendationsFromApi()}
-                    disabled={recommendationsLoading}
-                    className="px-3 py-2 rounded-lg bg-gray-100 text-gray-600 text-sm font-medium hover:bg-gray-200 dark:bg-[#404040] dark:text-gray-400 dark:hover:bg-[#505050] disabled:opacity-50 transition-colors"
-                  >
-                    {recommendationsLoading ? "Updating…" : "Refresh recommendations"}
-                              </button>
-                            </div>
-                          </div>
-              <div className="min-h-0 flex-1 overflow-hidden">
-              {recommendationsLoading &&
-              !recommendations.books.length &&
-              !recommendations.podcasts.length &&
-              !recommendations.articles.length &&
-              !recommendations.research.length &&
-              !recommendations.news.length ? (
-                <div className="h-full min-h-0 overflow-y-auto pr-1">
-                <p className="text-gray-500 dark:text-gray-400 text-sm">
-                  Loading recommendations… This can take up to ~90 seconds.
-                </p>
-                        </div>
-              ) : !recommendationsLoading &&
-                !recommendations.books.length &&
-                !recommendations.podcasts.length &&
-                !recommendations.articles.length &&
-                !recommendations.research.length &&
-                !recommendations.news.length ? (
-                <div className="h-full min-h-0 overflow-y-auto pr-1">
-                <p className="text-gray-500 dark:text-gray-400 text-sm">
-                  No cached suggestions yet. Click <strong className="font-medium text-gray-700 dark:text-gray-300">Refresh recommendations</strong> to
-                  generate a new set (heavy; runs only when you ask).
-                </p>
-                      </div>
-              ) : (
-                <div className="grid h-full min-h-0 auto-rows-[minmax(0,1fr)] grid-cols-1 gap-4 md:grid-cols-2 md:gap-5 xl:grid-cols-5 xl:gap-4">
-                  {/* Books */}
-                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
-                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                      <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Books</h3>
-                      <button
-                        type="button"
-                        className={recColumnBtnClass}
-                        disabled={recommendationsLoading || recColumnLoading.books}
-                        onClick={() => refreshRecommendationsColumn("books")}
-                      >
-                        {recColumnLoading.books ? "…" : "Refresh"}
-                      </button>
-                    </div>
-                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
-                      {recommendations.books.length === 0 ? (
-                        <p className="text-gray-500 dark:text-gray-400 text-xs">No book suggestions right now.</p>
-                      ) : (
-                        recommendations.books.map((item, i) => {
-                          const cardKey = `book:${item.title}`;
-                          const isRemoving = removingKeys.has(cardKey);
-                          return (
-                            <div
-                              key={`book-${i}-${item.title}`}
-                              className={`rounded-lg bg-white dark:bg-[#343541] p-3 border border-gray-200 dark:border-gray-600 shadow-sm transition-all duration-300 ease-out ${
-                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
-                              }`}
-                            >
-                              <a
-                                href={
-                                  item.url && item.url.startsWith("http")
-                                    ? item.url
-                                    : `https://www.amazon.com/s?k=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`
-                                }
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-gray-900 dark:text-gray-100 text-sm font-medium hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline cursor-pointer"
-                              >
-                                {item.title}
-                              </a>
-                              {item.author && <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">{item.author}</p>}
-                              {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
-                              <RecFeedbackLinks category="book" item={item} />
-                              <button
-                                type="button"
-                                onClick={() => markConsumed("book", item)}
-                                disabled={consumedIds.has(cardKey)}
-                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-[#10a37f] hover:bg-[#0d8c6e] disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
-                              >
-                                {consumedIds.has(cardKey) ? "Marked as read" : "I've read this"}
-                              </button>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                  </section>
-                  {/* Podcasts */}
-                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
-                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                      <div className="flex flex-wrap items-baseline gap-2 min-w-0">
-                        <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Podcasts</h3>
-                      <a
-                        href="https://www.listennotes.com/"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                          className="text-[10px] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition-colors flex items-baseline gap-0.5"
-                        title="Podcast data by Listen Notes"
-                      >
-                        <span className="lowercase font-normal">powered by</span>
-                          <span className="uppercase font-semibold text-gray-500 dark:text-gray-400">LISTEN NOTES</span>
-                        </a>
-                      </div>
-                      <button
-                        type="button"
-                        className={recColumnBtnClass}
-                        disabled={recommendationsLoading || recColumnLoading.podcasts}
-                        onClick={() => refreshRecommendationsColumn("podcasts")}
-                      >
-                        {recColumnLoading.podcasts ? "…" : "Refresh"}
-                      </button>
-                    </div>
-                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
-                      {recommendations.podcasts.length === 0 ? (
-                        <p className="text-gray-500 dark:text-gray-400 text-xs">No podcast suggestions right now.</p>
-                      ) : (
-                        recommendations.podcasts.map((item, i) => {
-                          const cardKey = `podcast:${item.title}`;
-                          const isRemoving = removingKeys.has(cardKey);
-                          return (
-                            <div
-                              key={`podcast-${i}-${item.title}`}
-                              className={`rounded-lg bg-white dark:bg-[#343541] p-3 border border-gray-200 dark:border-gray-600 shadow-sm transition-all duration-300 ease-out ${
-                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
-                              }`}
-                            >
-                              {item.author && (
-                                <p className="text-gray-500 dark:text-gray-400 text-xs font-medium">{item.author}</p>
-                              )}
-                              <a
-                                href={
-                                  item.url && (item.url.includes("spotify.com") || item.url.includes("podcasts.apple.com") || item.url.includes("listennotes.com"))
-                                    ? item.url
-                                    : `https://open.spotify.com/search/${encodeURIComponent([item.author, item.title].filter(Boolean).join(" "))}`
-                                }
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-gray-900 dark:text-gray-100 text-sm font-medium hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline cursor-pointer block"
-                              >
-                                {item.title}
-                              </a>
-                              {(!item.url || (!item.url.includes("spotify.com") && !item.url.includes("podcasts.apple.com") && !item.url.includes("listennotes.com"))) && (
-                                <p className="text-xs mt-0.5 flex gap-2 flex-wrap">
-                                  <a
-                                    href={`https://open.spotify.com/search/${encodeURIComponent([item.author, item.title].filter(Boolean).join(" "))}`}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-[#10a37f] hover:underline dark:text-emerald-400"
-                                  >
-                                    Spotify
-                                  </a>
-                                  <a
-                                    href={`https://podcasts.apple.com/us/search?term=${encodeURIComponent([item.author, item.title].filter(Boolean).join(" "))}`}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-[#10a37f] hover:underline dark:text-emerald-400"
-                                  >
-                                    Apple Podcasts
-                                  </a>
-                                </p>
-                              )}
-                              {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
-                              <RecFeedbackLinks category="podcast" item={item} />
-                              <button
-                                type="button"
-                                onClick={() => markConsumed("podcast", item)}
-                                disabled={consumedIds.has(cardKey)}
-                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-[#10a37f] hover:bg-[#0d8c6e] disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
-                              >
-                                {consumedIds.has(cardKey) ? "Marked as listened" : "I've listened to this"}
-                              </button>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                  </section>
-                  {/* Articles */}
-                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
-                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                      <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Articles</h3>
-                      <button
-                        type="button"
-                        className={recColumnBtnClass}
-                        disabled={recommendationsLoading || recColumnLoading.articles}
-                        onClick={() => refreshRecommendationsColumn("articles")}
-                      >
-                        {recColumnLoading.articles ? "…" : "Refresh"}
-                      </button>
-                    </div>
-                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
-                      {recommendations.articles.length === 0 ? (
-                        <p className="text-gray-500 dark:text-gray-400 text-xs">No article suggestions right now.</p>
-                      ) : (
-                        recommendations.articles.map((item, i) => {
-                          const cardKey = `article:${item.title}`;
-                          const isRemoving = removingKeys.has(cardKey);
-                          return (
-                            <div
-                              key={`article-${i}-${item.title}`}
-                              className={`rounded-lg bg-white dark:bg-[#343541] p-3 border border-gray-200 dark:border-gray-600 shadow-sm transition-all duration-300 ease-out ${
-                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
-                              }`}
-                            >
-                              <a
-                                href={item.url && item.url.startsWith("http") ? item.url : `https://www.google.com/search?q=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-gray-900 dark:text-gray-100 text-sm font-medium hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline cursor-pointer"
-                              >
-                                {item.title}
-                              </a>
-                              {item.author && <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">{item.author}</p>}
-                              {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
-                              <RecFeedbackLinks category="article" item={item} />
-                              <button
-                                type="button"
-                                onClick={() => markConsumed("article", item)}
-                                disabled={consumedIds.has(cardKey)}
-                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-[#10a37f] hover:bg-[#0d8c6e] disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
-                              >
-                                {consumedIds.has(cardKey) ? "Marked as read" : "I've read this"}
-                              </button>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                  </section>
-                  {/* Research papers */}
-                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
-                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                      <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">Research papers</h3>
-                      <button
-                        type="button"
-                        className={recColumnBtnClass}
-                        disabled={recommendationsLoading || recColumnLoading.research}
-                        onClick={() => refreshRecommendationsColumn("research")}
-                      >
-                        {recColumnLoading.research ? "…" : "Refresh"}
-                      </button>
-                    </div>
-                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
-                      {recommendations.research.length === 0 ? (
-                        <p className="text-gray-500 dark:text-gray-400 text-xs">No research suggestions right now.</p>
-                      ) : (
-                        recommendations.research.map((item, i) => {
-                          const cardKey = `research:${item.title}`;
-                          const isRemoving = removingKeys.has(cardKey);
-                          return (
-                            <div
-                              key={`research-${i}-${item.title}`}
-                              className={`rounded-lg bg-white dark:bg-[#343541] p-3 border border-gray-200 dark:border-gray-600 shadow-sm transition-all duration-300 ease-out ${
-                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
-                              }`}
-                            >
-                              <a
-                                href={item.url && item.url.startsWith("http") ? item.url : `https://www.google.com/search?q=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-gray-900 dark:text-gray-100 text-sm font-medium hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline cursor-pointer"
-                              >
-                                {item.title}
-                              </a>
-                              {item.author && <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">{item.author}</p>}
-                              {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
-                              <RecFeedbackLinks category="research" item={item} />
-                              <button
-                                type="button"
-                                onClick={() => markConsumed("research", item)}
-                                disabled={consumedIds.has(cardKey)}
-                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-[#10a37f] hover:bg-[#0d8c6e] disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
-                              >
-                                {consumedIds.has(cardKey) ? "Marked as read" : "I've read this"}
-                              </button>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                  </section>
-                  {/* News */}
-                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:rounded-xl dark:border-gray-700 dark:bg-[#2f2f2f]">
-                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                      <div className="flex flex-wrap items-baseline gap-2 min-w-0">
-                        <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">News</h3>
-                        <span className="text-[10px] text-gray-400 dark:text-gray-500">Perplexity</span>
-                      </div>
-                      <button
-                        type="button"
-                        className={recColumnBtnClass}
-                        disabled={recommendationsLoading || recColumnLoading.news}
-                        onClick={() => refreshRecommendationsColumn("news")}
-                      >
-                        {recColumnLoading.news ? "…" : "Refresh"}
-                      </button>
-                    </div>
-                    <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
-                      {recommendations.news.length === 0 ? (
-                        <p className="text-gray-500 dark:text-gray-400 text-xs">No news suggestions right now.</p>
-                      ) : (
-                        recommendations.news.map((item, i) => {
-                          const cardKey = `news:${item.title}`;
-                          const isRemoving = removingKeys.has(cardKey);
-                          return (
-                            <div
-                              key={`news-${i}-${item.title}`}
-                              className={`rounded-lg bg-white dark:bg-[#343541] p-3 border border-gray-200 dark:border-gray-600 shadow-sm transition-all duration-300 ease-out ${
-                                isRemoving ? "opacity-0 -translate-x-4 scale-95 pointer-events-none" : ""
-                              }`}
-                            >
-                              <a
-                                href={
-                                  item.url && item.url.startsWith("http")
-                                    ? item.url
-                                    : `https://www.google.com/search?q=${encodeURIComponent([item.title, item.author].filter(Boolean).join(" "))}`
-                                }
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-gray-900 dark:text-gray-100 text-sm font-medium hover:text-[#10a37f] dark:hover:text-emerald-400 hover:underline cursor-pointer"
-                              >
-                                {item.title}
-                              </a>
-                              {item.author && <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5">{item.author}</p>}
-                              {item.reason && <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">{item.reason}</p>}
-                              <RecFeedbackLinks category="news" item={item} />
-                              <button
-                                type="button"
-                                onClick={() => markConsumed("news", item)}
-                                disabled={consumedIds.has(cardKey)}
-                                className="mt-2 px-2 py-1 rounded text-xs font-medium bg-[#10a37f] hover:bg-[#0d8c6e] disabled:opacity-50 disabled:cursor-not-allowed text-white transition-colors"
-                              >
-                                {consumedIds.has(cardKey) ? "Marked as read" : "I've read this"}
-                              </button>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                  </section>
-                </div>
-              )}
-              </div>
-              {/* Library interview modal */}
-              {showLibraryInterview && (
-                <div
-                  className="fixed inset-0 z-50 flex items-center justify-center p-4"
-                  role="dialog"
-                  aria-modal="true"
-                  aria-labelledby="library-interview-title"
-                >
-                  <div
-                    className="absolute inset-0 bg-black/60"
-                    onClick={() => setShowLibraryInterview(false)}
-                  />
-                  <div className="relative bg-white border border-gray-200 rounded-xl shadow-xl max-w-lg w-full max-h-[85vh] flex flex-col dark:bg-[#2f2f2f] dark:border-gray-700">
-                    <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between gap-2 flex-shrink-0">
-                      <h2 id="library-interview-title" className="text-gray-900 dark:text-gray-100 font-medium text-lg">
-                        Interview about your books
-                      </h2>
-                      <button
-                        type="button"
-                        onClick={() => setShowLibraryInterview(false)}
-                        className="p-1.5 rounded-lg text-gray-500 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-100 dark:hover:bg-[#404040] transition-colors"
-                        aria-label="Close"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
-                    </div>
-                    <p className="px-4 pb-2 text-xs text-gray-500 dark:text-gray-400 flex-shrink-0">
-                      Chat about what you liked (or didn’t) — we’ll save short notes to improve recommendations. No hallucination; notes are brief and factual.
-                    </p>
-                    <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
-                      {libraryInterviewMessages.length === 0 && !libraryInterviewLoading && (
-                        <p className="text-gray-500 dark:text-gray-400 text-sm">Say &quot;Start&quot; or &quot;Hi&quot; to begin. The agent will ask about your books one by one.</p>
-                      )}
-                      {libraryInterviewMessages.map((m, i) => (
-                        <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-                          <div
-                            className={`max-w-[90%] rounded-lg px-3 py-2 text-sm ${
-                              m.role === "user"
-                                ? "bg-[#10a37f]/15 text-gray-900 dark:text-gray-100"
-                                : "bg-gray-100 text-gray-800 border border-gray-200 dark:bg-[#343541] dark:text-gray-200 dark:border-gray-600"
-                            }`}
-                          >
-                            <span className="font-medium text-gray-500 dark:text-gray-400 text-xs block mb-0.5">{m.role === "user" ? "You" : "Agent"}</span>
-                            {m.content}
-                          </div>
-                        </div>
-                      ))}
-                      {libraryInterviewLoading && (
-                        <div className="flex justify-start">
-                          <div className="rounded-lg px-3 py-2 text-sm bg-gray-100 text-gray-500 border border-gray-200 dark:bg-[#343541] dark:text-gray-400 dark:border-gray-600">
-                            Thinking…
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                    <div className="p-4 border-t border-gray-200 dark:border-gray-700 flex gap-2 flex-shrink-0">
-                      <input
-                        type="text"
-                        value={libraryInterviewInput}
-                        onChange={(e) => setLibraryInterviewInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" && !e.shiftKey) {
-                            e.preventDefault();
-                            const msg = libraryInterviewInput.trim();
-                            if (msg && !libraryInterviewLoading) sendLibraryInterviewMessage(msg);
-                          }
-                        }}
-                        placeholder="Type your reply…"
-                        className="flex-1 min-w-0 px-3 py-2 rounded-lg bg-white border border-gray-200 text-gray-900 text-sm placeholder-gray-400 dark:bg-[#343541] dark:border-gray-600 dark:text-gray-100 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#10a37f]/40"
-                        disabled={libraryInterviewLoading}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const msg = libraryInterviewInput.trim();
-                          if (msg && !libraryInterviewLoading) sendLibraryInterviewMessage(msg);
-                        }}
-                        disabled={libraryInterviewLoading || !libraryInterviewInput.trim()}
-                        className="px-4 py-2 rounded-lg bg-[#10a37f] hover:bg-[#0d8c6e] text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-[#10a37f]/40"
-                      >
-                        Send
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
           {view === "about" && <AboutTab />}
         </div>
       </main>
@@ -1551,134 +577,6 @@ export const Personaplex = () => {
 
       <MobileAskComposerDockGate railOpen={mobileRailOpen} activeView={view} />
       </div>
-
-      {libraryEditingId ? (() => {
-        const editingEntry = [...libraryItems.books, ...libraryItems.podcasts, ...libraryItems.articles, ...libraryItems.research].find((e) => e.id === libraryEditingId);
-        return (
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center p-4"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="library-modal-title"
-          >
-            <div
-              className="absolute inset-0 bg-black/60"
-              onClick={() => {
-                setLibraryEditingId(null);
-                setLibraryEditDate("");
-                setLibraryEditNote("");
-              }}
-            />
-            <div className="relative bg-white border border-gray-200 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] flex flex-col dark:bg-[#2f2f2f] dark:border-gray-700">
-              <div className="p-4 border-b border-gray-200 dark:border-gray-700">
-                <h2 id="library-modal-title" className="text-gray-900 dark:text-gray-100 font-medium text-lg truncate">
-                  {editingEntry?.title ?? "Library item"}
-                </h2>
-              </div>
-              <div className="p-4 flex-1 min-h-0 overflow-y-auto flex flex-col gap-4">
-                <div>
-                  <label className="block text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">Notes</label>
-                  <textarea
-                    value={libraryEditNote}
-                    onChange={(e) => setLibraryEditNote(e.target.value)}
-                    rows={10}
-                    placeholder="How you felt, what stood out — used for better recommendations."
-                    className="w-full px-3 py-2.5 rounded-lg bg-white border border-gray-200 text-gray-900 text-sm placeholder-gray-400 dark:bg-[#343541] dark:border-gray-600 dark:text-gray-100 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#10a37f]/40 focus:border-[#10a37f] resize-y min-h-[200px]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">Date completed</label>
-                  <input
-                    type="text"
-                    value={libraryEditDate}
-                    onChange={(e) => setLibraryEditDate(e.target.value)}
-                    placeholder="Year e.g. 2024 or 2024-06"
-                    className="w-full px-3 py-2 rounded-lg bg-white border border-gray-200 text-gray-900 text-sm placeholder-gray-400 dark:bg-[#343541] dark:border-gray-600 dark:text-gray-100 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#10a37f]/40 focus:border-[#10a37f]"
-                  />
-                </div>
-              </div>
-              <div className="p-4 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between gap-4">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!libraryEditingId || libraryUpdateSaving) return;
-                    if (!confirm("Remove from library and mark as unread? It may be recommended again.")) return;
-                    setLibraryUpdateSaving(true);
-                    backendFetch(`/library/${encodeURIComponent(libraryEditingId)}`, { method: "DELETE" })
-                      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Delete failed"))))
-                      .then((data: { ok?: boolean }) => {
-                        if (data?.ok !== false) {
-                          fetchLibrary();
-                          setLibraryEditingId(null);
-                          setLibraryEditDate("");
-                          setLibraryEditNote("");
-                          setToastMessage("Removed.");
-                          setTimeout(() => setToastMessage(null), 2000);
-                        }
-                      })
-                      .catch(() => {
-                        setToastMessage("Failed to remove.");
-                        setTimeout(() => setToastMessage(null), 3000);
-                      })
-                      .finally(() => setLibraryUpdateSaving(false));
-                  }}
-                  disabled={libraryUpdateSaving}
-                  className="text-red-400 hover:text-red-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-red-500/50 rounded px-2 py-1 disabled:opacity-50"
-                >
-                  Delete / Mark unread
-                </button>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setLibraryEditingId(null);
-                      setLibraryEditDate("");
-                      setLibraryEditNote("");
-                    }}
-                    className="px-4 py-2 rounded-lg bg-gray-100 text-gray-800 text-sm font-medium hover:bg-gray-200 dark:bg-[#404040] dark:text-gray-200 dark:hover:bg-[#505050] border border-gray-200 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-400/50"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (!libraryEditingId || libraryUpdateSaving) return;
-                      setLibraryUpdateSaving(true);
-                      backendFetch(`/library/${encodeURIComponent(libraryEditingId)}`, {
-                        method: "PATCH",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                          date_completed: libraryEditDate.trim(),
-                          note: libraryEditNote.trim(),
-                        }),
-                      })
-                        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Update failed"))))
-                        .then((data: { ok?: boolean }) => {
-                          if (data?.ok !== false) {
-                            fetchLibrary();
-                            setLibraryEditingId(null);
-                            setToastMessage("Saved.");
-                            setTimeout(() => setToastMessage(null), 2000);
-                          }
-                        })
-                        .catch(() => {
-                          setToastMessage("Failed to save.");
-                          setTimeout(() => setToastMessage(null), 3000);
-                        })
-                        .finally(() => setLibraryUpdateSaving(false));
-                    }}
-                    disabled={libraryUpdateSaving}
-                    className="px-4 py-2 rounded-lg bg-teal-600 text-white text-sm font-medium hover:bg-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50 disabled:opacity-50"
-                  >
-                    {libraryUpdateSaving ? "Saving…" : "Save"}
-                  </button>
-                </div>
-              </div>
-            </div>
-    </div>
-        );
-      })() : null}
-
     </div>
     </PersonaplexChatProvider>
   );

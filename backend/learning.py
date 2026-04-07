@@ -12,9 +12,45 @@ import urllib.error
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from urllib.parse import urlparse
+
 from decision_logger import DecisionLogger
-from library import _is_paywalled_domain
 import vec_store
+
+# Paywalled hosts to skip when picking open-web articles (mirrors former library.py list).
+_PAYWALLED_ARTICLE_DOMAINS = (
+    "nytimes.com",
+    "wsj.com",
+    "washingtontimes.com",
+    "washingtonpost.com",
+    "theatlantic.com",
+    "newyorker.com",
+    "economist.com",
+    "ft.com",
+    "bloomberg.com",
+    "barrons.com",
+    "latimes.com",
+    "bostonglobe.com",
+    "chicagotribune.com",
+    "harpers.org",
+    "medium.com",
+    "substack.com",
+)
+
+
+def _is_paywalled_domain(url: str) -> bool:
+    try:
+        host = (urlparse(url).netloc or "").lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        if not host:
+            return False
+        for domain in _PAYWALLED_ARTICLE_DOMAINS:
+            if host == domain or host.endswith("." + domain):
+                return True
+        return False
+    except Exception:
+        return False
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -552,14 +588,9 @@ def _recent_journal_context(instance_id: str, num_days: int = 4) -> str:
     return ""
 
 
-def _consumed_context(instance_id: str) -> tuple[str, list[dict]]:
-    """Return (lower-cased blob for overlap, raw rows) for consumed media."""
-    rows = vec_store.list_consumed_rows(max_items=500, instance_id=instance_id)
-    parts = []
-    for r in rows:
-        parts.append((r.get("title") or "").lower())
-        parts.append((r.get("url") or "").lower() if r.get("url") else "")
-    return " ".join(parts), rows
+def _consumed_context(_instance_id: str) -> tuple[str, list[dict]]:
+    """No library/consumed store; empty overlap string and rows (learning uses journals only)."""
+    return "", []
 
 
 def _search_articles_opus(

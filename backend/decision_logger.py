@@ -109,36 +109,6 @@ class DecisionLogger:
         )
 
     @staticmethod
-    def log_recommendation(
-        *,
-        instance_id: str = "",
-        session_id: str | None = None,
-        input_summary: str | None = None,
-        retrieved_items: list[dict] | None = None,
-        llm_prompt_summary: str | None = None,
-        llm_response: str | None = None,
-        final_output: str | None = None,
-        reasoning_notes: str | None = None,
-        duration_ms: int | None = None,
-        model_used: str | None = None,
-        search_api_calls: list[dict] | None = None,
-    ) -> int | None:
-        return DecisionLogger._write(
-            instance_id=instance_id,
-            session_id=session_id,
-            action_type="recommendation",
-            input_summary=input_summary,
-            retrieved_items=_jsonify(retrieved_items),
-            llm_prompt_summary=llm_prompt_summary,
-            llm_response=llm_response,
-            final_output=final_output,
-            reasoning_notes=reasoning_notes,
-            duration_ms=duration_ms,
-            model_used=model_used,
-            search_api_calls=_jsonify(search_api_calls),
-        )
-
-    @staticmethod
     def log_extraction(
         *,
         instance_id: str = "",

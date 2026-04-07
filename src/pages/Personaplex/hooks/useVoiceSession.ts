@@ -182,6 +182,8 @@ export function useVoiceSession({
   const browserTtsCancelRef = useRef<(() => void) | null>(null);
   const activeRef = useRef(false);
   const accumulatedFinalRef = useRef("");
+  /** Latest interim (not-yet-finalized) text — promoted to accumulatedFinal on recognition restart. */
+  const pendingInterimRef = useRef("");
   const onSendRef = useRef(onSendTranscript);
   onSendRef.current = onSendTranscript;
   const stateRef = useRef<VoiceSessionState>("idle");
@@ -268,6 +270,11 @@ export function useVoiceSession({
 
   const flushTranscript = useCallback(() => {
     clearSilenceTimer();
+    const pending = pendingInterimRef.current.trim();
+    if (pending) {
+      accumulatedFinalRef.current += pending;
+      pendingInterimRef.current = "";
+    }
     const text = accumulatedFinalRef.current.trim();
     if (!text) return;
 
@@ -394,6 +401,7 @@ export function useVoiceSession({
           }
         }
 
+        pendingInterimRef.current = interim;
         setPartialTranscript((accumulatedFinalRef.current + interim).trim());
 
         if (stateRef.current === "speaking" && bargeInCandidate) {
@@ -416,6 +424,7 @@ export function useVoiceSession({
         if (!activeRef.current) return;
         // During TTS, keep recognition alive for intentional barge-in (engine often stops sessions).
         if (stateRef.current === "speaking") {
+          pendingInterimRef.current = "";
           speechRecRef.current = null;
           try {
             const next = createAndWire();
@@ -427,6 +436,13 @@ export function useVoiceSession({
           return;
         }
         if (stateRef.current !== "listening") return;
+        // Promote any pending interim text so it survives the restart —
+        // browsers drop non-final results when the session ends.
+        const pending = pendingInterimRef.current.trim();
+        if (pending) {
+          accumulatedFinalRef.current += pending;
+          pendingInterimRef.current = "";
+        }
         speechRecRef.current = null;
         try {
           const next = createAndWire();
@@ -508,6 +524,9 @@ export function useVoiceSession({
               stopVadLoop();
               resetBargeInGates();
               if (!activeRef.current) return;
+              accumulatedFinalRef.current = "";
+              pendingInterimRef.current = "";
+              setPartialTranscript("");
               setVoiceState("listening");
             },
             onError: () => {
@@ -515,6 +534,9 @@ export function useVoiceSession({
               stopVadLoop();
               resetBargeInGates();
               if (!activeRef.current) return;
+              accumulatedFinalRef.current = "";
+              pendingInterimRef.current = "";
+              setPartialTranscript("");
               setVoiceState("listening");
             },
           });
@@ -541,6 +563,9 @@ export function useVoiceSession({
             stopVadLoop();
             resetBargeInGates();
             if (!activeRef.current) return;
+            accumulatedFinalRef.current = "";
+            pendingInterimRef.current = "";
+            setPartialTranscript("");
             setVoiceState("listening");
           },
           { once: true },
@@ -553,6 +578,9 @@ export function useVoiceSession({
             stopVadLoop();
             resetBargeInGates();
             if (!activeRef.current) return;
+            accumulatedFinalRef.current = "";
+            pendingInterimRef.current = "";
+            setPartialTranscript("");
             setVoiceState("listening");
           },
           { once: true },
@@ -575,6 +603,7 @@ export function useVoiceSession({
     if (activeRef.current) return;
     activeRef.current = true;
     accumulatedFinalRef.current = "";
+    pendingInterimRef.current = "";
     setPartialTranscript("");
     setFullTranscript("");
     setAssistantText("");
@@ -591,6 +620,7 @@ export function useVoiceSession({
     stopTts();
     releaseMicStream();
     accumulatedFinalRef.current = "";
+    pendingInterimRef.current = "";
     setPartialTranscript("");
     setFullTranscript("");
     setAssistantText("");
@@ -609,6 +639,7 @@ export function useVoiceSession({
     if (!activeRef.current || stateRef.current !== "speaking") return;
     stopTts();
     accumulatedFinalRef.current = "";
+    pendingInterimRef.current = "";
     setPartialTranscript("");
     setVoiceState("listening");
     startSpeechRec();

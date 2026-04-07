@@ -46,38 +46,28 @@ from lightrag_bridge import query_for_context, schedule_lightrag_index_after_ing
 from graph import build_graph, build_librarian_graph, JournalState
 from langchain_core.messages import AIMessage, HumanMessage
 from library import (
-    add_consumed,
     add_memory_fact,
     add_memory_summary,
-    delete_consumed,
     delete_memory_fact,
     delete_memory_summary,
     DEFAULT_PERPLEXITY_EMBEDDING_MODEL,
     generate_day_summary,
     generate_memory_mermaid,
     _embed_texts,
-    generate_recommendations,
-    generate_recommendations_category,
     generate_derived_insights,
     get_memory_for_date,
     get_memory_for_visualization,
     get_person_events,
     get_writing_loop_hints,
-    list_consumed,
     list_memory_facts,
     list_memory_summaries,
-    run_library_interview,
     run_person_facts_agent,
     run_relationship_summary_agent,
     run_people_grouping_agent,
-    process_content_feedback,
-    record_rec_feedback_for_recs,
     refresh_pattern_memory,
     save_session_data,
     extraction_llm_backend,
-    library_recommendations_llm_label,
     _openrouter_chat_completion,
-    update_consumed,
     update_memory_fact,
     update_memory_summary,
     wipe_memory,
@@ -90,11 +80,9 @@ def _instance_id(request: Request) -> str:
 
 # In-memory session store (minimal for 1hr sprint; replace with Redis/DB later)
 sessions: dict[str, list] = {}
-library_interview_sessions: dict[str, list] = {}  # session_id -> list of {role, content}
 
 # Chat may run OpenRouter + tool round-trips; keep headroom.
 CHAT_INVOKE_TIMEOUT_SEC = 180
-LIBRARY_INTERVIEW_TIMEOUT_SEC = 45
 
 
 def get_or_create_session(session_id: Optional[str]) -> str:
@@ -139,8 +127,6 @@ async def lifespan(app: FastAPI):
     if not pplx_key:
         print("[backend] WARNING: PERPLEXITY_API_KEY missing — vector ingest and retrieval will fail until set.")
 
-    print(f"[backend] Extraction / library LLM: {extraction_llm_backend()}")
-    print(f"[backend] Library recommendations (books, articles, research): {library_recommendations_llm_label()}")
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     chat_model = (os.getenv("OPENROUTER_CHAT_MODEL") or "openai/gpt-4.1-mini").strip()
     chat_fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or "openai/gpt-5.4").strip()
@@ -149,7 +135,7 @@ async def lifespan(app: FastAPI):
         print(
             f"[backend] OPENROUTER_API_KEY is set — /chat journal ({chat_model}; fallback {chat_fallback}), "
             f"conversation ({convo_model} + reasoning), journal validation, "
-            "voice-memo polish, date inference, and library extraction helpers"
+            "voice-memo polish, and date inference"
         )
         print(
             f"[backend] Speech-to-text: OpenRouter ({(os.getenv('OPENROUTER_TRANSCRIPTION_MODEL') or 'openai/gpt-audio-mini').strip()})"
@@ -202,7 +188,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     personalization: Optional[float] = None  # ignored for graph /chat; server uses 1.0 (full memory)
     intrusiveness: Optional[float] = None
-    mode: Optional[str] = None  # "journal" | "conversation" | "autobiography" (Assisted Journal) | "recommendations"
+    mode: Optional[str] = None  # "journal" | "conversation" | "autobiography"
     # Allowlisted OpenRouter id for conversation + autobiography only (see graph.USER_SELECTABLE_CHAT_MODELS)
     openrouter_model: Optional[str] = None
     # Optional: client-formatted local time + daypart string for Assisted Journal (autobiography) check-ins
@@ -214,7 +200,6 @@ class ChatResponse(BaseModel):
     session_id: str
     retrieval_log: Optional[str] = None
     notes_saved: Optional[List[Dict[str, str]]] = None  # [{"item_id": "...", "note": "..."}]
-    library_items_added: Optional[int] = None  # journal mode: agent saved N items to Library
     agent_steps: Optional[List[Dict[str, Any]]] = None  # retrieval + tool summaries for UI
     # Allowlisted UI actions from journal chat agent (e.g. navigate). Frontend must ignore unknown types.
     actions: Optional[List[Dict[str, Any]]] = None
@@ -238,24 +223,6 @@ class EndSessionResponse(BaseModel):
     ok: bool
     session_id: str
 
-
-class LibraryInterviewItem(BaseModel):
-    id: str
-    title: str
-    author: Optional[str] = None
-    note: Optional[str] = None
-
-
-class LibraryInterviewRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
-    library_snapshot: Optional[List[LibraryInterviewItem]] = None
-
-
-class LibraryInterviewResponse(BaseModel):
-    response: str
-    session_id: str
-    notes_saved: Optional[List[Dict[str, str]]] = None  # [{"item_id": "...", "note": "..."}]
 
 
 class IngestHistoryRequest(BaseModel):
@@ -398,93 +365,10 @@ class BrainPersonThoughtUpdate(BaseModel):
     thought_text: Optional[str] = None
 
 
-class RecommendationItem(BaseModel):
-    title: str
-    author: str = ""
-    reason: str = ""
-    url: str = ""
-
-
-class RecommendationsResponse(BaseModel):
-    books: list[RecommendationItem]
-    podcasts: list[RecommendationItem]
-    articles: list[RecommendationItem]
-    research: list[RecommendationItem]
-    news: list[RecommendationItem] = []
-
-
-class ConsumedRequest(BaseModel):
-    type: str  # "book" | "podcast" | "article"
-    title: str
-    author: Optional[str] = None
-    url: Optional[str] = None
-    liked: bool = True
-
-
-class ConsumedResponse(BaseModel):
-    ok: bool
-
 
 class WritingHintsRequest(BaseModel):
     draft: str = ""
 
-
-class RecFeedbackRequest(BaseModel):
-    action: str
-    content_type: Optional[str] = None
-    topic_tags: Optional[str] = None
-    intent_context: Optional[str] = None
-    item_title: Optional[str] = None
-
-
-class RecFeedbackResponse(BaseModel):
-    ok: bool
-
-
-class ContentFeedbackRequest(BaseModel):
-    content_title: str
-    content_type: str = "article"
-    content_url: Optional[str] = None
-    feedback: str = "liked"
-    user_notes: Optional[str] = None
-
-
-class LibraryNoteRequest(BaseModel):
-    text: str
-    type: Optional[str] = None  # "book" | "podcast" | "article" | "research" to restrict to one category
-
-
-class LibraryNoteResponse(BaseModel):
-    ok: bool
-    items_added: int
-
-
-class LibraryBulkImportItem(BaseModel):
-    id: str
-    type: str  # book | podcast | article | research
-    title: str
-    author: Optional[str] = None
-    note: Optional[str] = None
-    date_completed: Optional[str] = None
-    url: Optional[str] = None
-    liked: bool = True
-
-
-class LibraryBulkImportRequest(BaseModel):
-    items: List[LibraryBulkImportItem]
-
-
-class LibraryBulkImportResponse(BaseModel):
-    ok: bool
-    count: int = 0
-
-
-class LibraryItemUpdate(BaseModel):
-    date_completed: Optional[str] = None
-    note: Optional[str] = None
-    title: Optional[str] = None
-    author: Optional[str] = None
-    url: Optional[str] = None
 
 
 class MemoryDiagramResponse(BaseModel):
@@ -1159,14 +1043,21 @@ async def api_voice(req: VoiceRequest):
         )
     vid = _resolve_mistral_voice_id(req.voiceId)
     tts_fmt = _mistral_tts_response_format()
-    try:
-        audio_bytes = await asyncio.to_thread(_mistral_tts_speech, text, vid, tts_fmt)
-    except ValueError as e:
-        print("[backend] Mistral TTS:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        print("[backend] Mistral TTS error:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            audio_bytes = await asyncio.to_thread(_mistral_tts_speech, text, vid, tts_fmt)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                print(f"[backend] Mistral TTS attempt {attempt + 1} failed, retrying: {e}")
+                await asyncio.sleep(0.5 * (attempt + 1))
+            else:
+                print(f"[backend] Mistral TTS failed after 3 attempts: {e}")
+    if last_err is not None:
+        raise HTTPException(status_code=500, detail=str(last_err))
     rate = _mistral_tts_playback_rate()
     return {
         "audio": b64.b64encode(audio_bytes).decode("ascii"),
@@ -1218,58 +1109,13 @@ async def memory_diagram(request: Request):
 
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, request: Request):
-    """User sends text; Interviewer responds. State updated in memory. mode=recommendations uses library interview (books, notes)."""
+    """User sends text; Interviewer responds. State updated in memory."""
     instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     mode = (req.mode or "journal").strip().lower()
-    if mode not in ("journal", "conversation", "autobiography", "recommendations"):
+    if mode not in ("journal", "conversation", "autobiography"):
         mode = "journal"
 
-    if mode == "recommendations":
-        # Library interview: ask about books, save short notes. Uses library_interview_sessions.
-        _get_or_create_library_interview_session(session_id)
-        messages = library_interview_sessions[session_id]
-        try:
-            library_data = await asyncio.to_thread(list_consumed, 200, instance_id)
-            books = library_data.get("books") or []
-            library_items = [
-                {"id": b.get("id", ""), "title": b.get("title", "?"), "author": b.get("author") or "", "note": (b.get("note") or "").strip() or None}
-                for b in books
-            ]
-        except Exception as e:
-            print("[backend] /chat recommendations list_consumed error:", e)
-            library_items = []
-        user_message = (req.text or "").strip()
-        if not user_message:
-            user_message = "Start"
-        try:
-            reply, notes_saved = await asyncio.wait_for(
-                asyncio.to_thread(run_library_interview, list(messages), library_items, user_message),
-                timeout=LIBRARY_INTERVIEW_TIMEOUT_SEC,
-            )
-        except asyncio.CancelledError:
-            raise HTTPException(status_code=499, detail="Request cancelled")
-        except asyncio.TimeoutError:
-            return ChatResponse(
-                response="That took a bit long—try again in a moment.",
-                session_id=session_id,
-            )
-        except Exception as e:
-            print("[backend] /chat recommendations error:", e)
-            return ChatResponse(
-                response="Something went wrong. Please try again.",
-                session_id=session_id,
-            )
-        messages.append({"role": "user", "content": user_message})
-        messages.append({"role": "assistant", "content": reply})
-        library_interview_sessions[session_id] = messages
-        return ChatResponse(
-            response=reply,
-            session_id=session_id,
-            notes_saved=notes_saved if notes_saved else None,
-        )
-
-    # Default: journal interview (existing flow)
     messages = sessions[session_id]
     # Full memory retrieval (vec store + gist) for all graph-backed modes; not client-tunable.
     personalization = 1.0
@@ -1319,8 +1165,6 @@ async def chat(req: ChatRequest, request: Request):
             c.get("text", str(c)) for c in response_text if isinstance(c, dict)
         )
     retrieval_log = result.get("retrieval_log")
-    lib_n = result.get("library_items_added")
-    lib_opt = int(lib_n) if isinstance(lib_n, int) and lib_n > 0 else None
     raw_steps = result.get("agent_steps")
     agent_steps: Optional[List[Dict[str, Any]]] = None
     if isinstance(raw_steps, list) and raw_steps:
@@ -1337,7 +1181,6 @@ async def chat(req: ChatRequest, request: Request):
         response=response_text,
         session_id=session_id,
         retrieval_log=retrieval_log,
-        library_items_added=lib_opt,
         agent_steps=agent_steps,
         actions=actions,
     )
@@ -1357,77 +1200,6 @@ async def get_chat_session_history(session_id: str):
         messages=[ChatSessionHistoryMessage(role=r["role"], content=r["content"]) for r in rows],
     )
 
-
-def _get_or_create_library_interview_session(session_id: Optional[str]) -> str:
-    if not session_id:
-        session_id = str(uuid.uuid4())
-    if session_id not in library_interview_sessions:
-        library_interview_sessions[session_id] = []
-    return session_id
-
-
-@api_router.post("/library-interview", response_model=LibraryInterviewResponse)
-async def library_interview(req: LibraryInterviewRequest, request: Request):
-    """
-    One turn of the library interview: user message + optional library snapshot.
-    Agent asks about books and may save short notes; notes_saved lists any updates.
-    """
-    instance_id = _instance_id(request)
-    session_id = _get_or_create_library_interview_session(req.session_id)
-    messages = library_interview_sessions[session_id]
-
-    library_items = []
-    if req.library_snapshot:
-        for it in req.library_snapshot:
-            library_items.append({
-                "id": it.id,
-                "title": it.title or "?",
-                "author": (it.author or "").strip() or None,
-                "note": (it.note or "").strip() or None,
-            })
-
-    user_message = (req.message or "").strip()
-    if not user_message and not library_items:
-        return LibraryInterviewResponse(
-            response="Add some books to your library first, then we can chat about them.",
-            session_id=session_id,
-        )
-    if not user_message:
-        user_message = "Start"
-
-    try:
-        reply, notes_saved = await asyncio.wait_for(
-            asyncio.to_thread(
-                run_library_interview,
-                list(messages),
-                library_items,
-                user_message,
-            ),
-            timeout=LIBRARY_INTERVIEW_TIMEOUT_SEC,
-        )
-    except asyncio.CancelledError:
-        raise HTTPException(status_code=499, detail="Request cancelled")
-    except asyncio.TimeoutError:
-        return LibraryInterviewResponse(
-            response="That took a bit long—try again in a moment.",
-            session_id=session_id,
-        )
-    except Exception as e:
-        print("[backend] /library-interview error:", e)
-        return LibraryInterviewResponse(
-            response="Something went wrong. Please try again.",
-            session_id=session_id,
-        )
-
-    messages.append({"role": "user", "content": user_message})
-    messages.append({"role": "assistant", "content": reply})
-    library_interview_sessions[session_id] = messages
-
-    return LibraryInterviewResponse(
-        response=reply,
-        session_id=session_id,
-        notes_saved=notes_saved if notes_saved else None,
-    )
 
 
 @api_router.post("/end-session", response_model=EndSessionResponse)
@@ -1539,40 +1311,6 @@ async def memory_patterns_refresh(request: Request):
     instance_id = _instance_id(request)
     return await asyncio.to_thread(refresh_pattern_memory, instance_id)
 
-
-@api_router.post("/recommendations/feedback", response_model=RecFeedbackResponse)
-async def recommendations_feedback(req: RecFeedbackRequest, request: Request):
-    instance_id = _instance_id(request)
-
-    def _run() -> None:
-        record_rec_feedback_for_recs(
-            instance_id,
-            req.action,
-            content_type=req.content_type,
-            topic_tags=req.topic_tags,
-            intent_context=req.intent_context,
-            item_title=req.item_title,
-        )
-
-    await asyncio.to_thread(_run)
-    return RecFeedbackResponse(ok=True)
-
-
-@api_router.post("/feedback")
-async def submit_content_feedback(req: ContentFeedbackRequest, request: Request):
-    instance_id = _instance_id(request)
-
-    def _run():
-        return process_content_feedback(
-            instance_id,
-            content_title=req.content_title,
-            content_type=req.content_type,
-            content_url=req.content_url,
-            feedback=req.feedback,
-            user_notes=req.user_notes,
-        )
-
-    return await asyncio.to_thread(_run)
 
 
 @api_router.get("/profile")
@@ -2266,56 +2004,6 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
     return {"ok": ok}
 
 
-# Keep under typical proxy origin timeout (e.g. Cloudflare 100s) to avoid 524.
-# Slightly above RECOMMENDATIONS_AGENT_TIMEOUT_SEC so parallel agents can finish first.
-RECOMMENDATIONS_TIMEOUT_SEC = float(os.getenv("RECOMMENDATIONS_HTTP_TIMEOUT_SEC", "78"))
-
-@api_router.get("/recommendations", response_model=RecommendationsResponse)
-async def get_recommendations(
-    request: Request,
-    category: Optional[str] = Query(
-        None,
-        description="If set (books, podcasts, articles, research, news), only that column is regenerated; other lists are empty.",
-    ),
-):
-    """
-    Personalized books, podcasts, articles, research, and news from journal memory and consumed library.
-    May take ~35–80s depending on Perplexity + LLM latency; override RECOMMENDATIONS_HTTP_TIMEOUT_SEC if needed.
-    With ?category=books (etc.), only that agent runs — faster for per-column refresh; merge client-side with cache.
-    """
-    instance_id = _instance_id(request)
-    cat = (category or "").strip().lower()
-    allowed = ("books", "podcasts", "articles", "research", "news")
-    if cat and cat not in allowed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid category. Use one of: {', '.join(allowed)}",
-        )
-    gen_fn = generate_recommendations_category if cat else generate_recommendations
-    gen_args = (instance_id, cat) if cat else (instance_id,)
-    try:
-        data = await asyncio.wait_for(
-            asyncio.to_thread(gen_fn, *gen_args),
-            timeout=RECOMMENDATIONS_TIMEOUT_SEC,
-        )
-    except asyncio.CancelledError:
-        raise
-    except asyncio.TimeoutError:
-        print("[backend] /recommendations timed out after", RECOMMENDATIONS_TIMEOUT_SEC, "s")
-        return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[], news=[])
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        print("[backend] /recommendations error:", e)
-        return RecommendationsResponse(books=[], podcasts=[], articles=[], research=[], news=[])
-    return RecommendationsResponse(
-        books=[RecommendationItem(**x) for x in data.get("books", [])],
-        podcasts=[RecommendationItem(**x) for x in data.get("podcasts", [])],
-        articles=[RecommendationItem(**x) for x in data.get("articles", [])],
-        research=[RecommendationItem(**x) for x in data.get("research", [])],
-        news=[RecommendationItem(**x) for x in data.get("news", [])],
-    )
-
 
 class CalendarDayRequest(BaseModel):
     date: str  # YYYY-MM-DD
@@ -2358,99 +2046,9 @@ async def calendar_day_summary(req: CalendarDayRequest, request: Request):
         )
 
 
-@api_router.post("/recommendations/consumed", response_model=ConsumedResponse)
-async def mark_consumed(req: ConsumedRequest, request: Request):
-    """
-    Record that the user has read/listened to a recommendation. Stored in the vector store
-    so future recommendations avoid repeats and better match their tastes.
-    """
-    instance_id = _instance_id(request)
-    content_type = (req.type or "article").lower()
-    if content_type not in ("book", "podcast", "article", "research", "news"):
-        content_type = "article"
-    try:
-        add_consumed(
-            content_type=content_type,
-            title=req.title,
-            author=req.author,
-            url=req.url,
-            liked=req.liked,
-            instance_id=instance_id,
-        )
-        return ConsumedResponse(ok=True)
-    except Exception as e:
-        print("[backend] /recommendations/consumed error:", e)
-        return ConsumedResponse(ok=False)
 
 
-@api_router.get("/library")
-async def get_library(request: Request):
-    """
-    Return consumed items grouped by type for the Library UI.
-    """
-    instance_id = _instance_id(request)
-    try:
-        data = await asyncio.to_thread(list_consumed, 200, instance_id)
-        return data
-    except Exception as e:
-        print("[backend] GET /library error:", e)
-        return {"books": [], "podcasts": [], "articles": [], "research": [], "news": []}
 
-
-@api_router.patch("/library/{item_id}")
-async def update_library_item(item_id: str, req: LibraryItemUpdate, request: Request):
-    """
-    Update library item metadata by id.
-    """
-    instance_id = _instance_id(request)
-    try:
-        def _wrap():
-            return update_consumed(
-                item_id,
-                date_completed=req.date_completed,
-                note=req.note,
-                title=req.title,
-                author=req.author,
-                url=req.url,
-                instance_id=instance_id,
-            )
-        ok = await asyncio.to_thread(_wrap)
-        return {"ok": ok}
-    except Exception as e:
-        print("[backend] PATCH /library error:", e)
-        return {"ok": False}
-
-
-@api_router.delete("/library/{item_id}")
-async def delete_library_item(item_id: str, request: Request):
-    """
-    Remove a library item from the consumed collection.
-    """
-    instance_id = _instance_id(request)
-    try:
-        ok = await asyncio.to_thread(delete_consumed, item_id, instance_id)
-        return {"ok": ok}
-    except Exception as e:
-        print("[backend] DELETE /library error:", e)
-        return {"ok": False}
-
-
-@api_router.post("/library-notes", response_model=LibraryNoteResponse)
-async def library_notes(req: LibraryNoteRequest, request: Request):
-    """
-    Library helper endpoint: user can paste titles or notes about books, podcasts,
-    articles, or research they've read. An agent organizes this into structured
-    consumed items to improve future recommendations.
-    """
-    instance_id = _instance_id(request)
-    try:
-        from library import process_library_note
-
-        count = await asyncio.to_thread(process_library_note, req.text, req.type, instance_id)
-        return LibraryNoteResponse(ok=count > 0, items_added=count)
-    except Exception as e:
-        print("[backend] /library-notes error:", e)
-        return LibraryNoteResponse(ok=False, items_added=0)
 
 
 @api_router.get("/lightrag-context")
@@ -2472,7 +2070,7 @@ async def lightrag_context(q: str = "", mode: str = "hybrid"):
 @api_router.post("/memory-wipe")
 async def memory_wipe(request: Request):
     """
-    Wipe gist and episodic memory for the current user/instance. Consumed library is kept.
+    Wipe memory for the current user.
     """
     instance_id = _instance_id(request)
     if instance_id:
@@ -2485,9 +2083,8 @@ async def memory_wipe(request: Request):
 @api_router.post("/memory-reset-knowledge-base-import")
 async def memory_reset_knowledge_base_import(request: Request):
     """
-    Wipe all vector-backed memory for this instance: journal gist/episodic embeddings and the
-    consumed library index. Used before a full knowledge-base folder re-import so embeddings
-    match the uploaded export only.
+    Wipe all vector-backed memory for this instance: journal gist/episodic embeddings.
+    Used before a full knowledge-base folder re-import so embeddings match the uploaded export only.
     """
     instance_id = _instance_id(request)
     try:
@@ -2497,37 +2094,6 @@ async def memory_reset_knowledge_base_import(request: Request):
         print("[backend] /memory-reset-knowledge-base-import error:", e)
         return {"ok": False, "detail": str(e)}
 
-
-@api_router.post("/library/bulk-import", response_model=LibraryBulkImportResponse)
-async def library_bulk_import(req: LibraryBulkImportRequest, request: Request):
-    """
-    Rebuild consumed library rows with embeddings (after KB import). Items use client ids as stable keys.
-    """
-    instance_id = _instance_id(request)
-    n = 0
-    for it in req.items:
-        ct = (it.type or "article").lower()
-        if ct not in ("book", "podcast", "article", "research"):
-            ct = "article"
-        if not (it.id or "").strip() or not (it.title or "").strip():
-            continue
-        try:
-            await asyncio.to_thread(
-                add_consumed,
-                ct,
-                it.title.strip(),
-                author=it.author,
-                url=it.url,
-                liked=it.liked,
-                note=it.note,
-                date_completed=it.date_completed,
-                instance_id=instance_id,
-                id_override=it.id.strip(),
-            )
-            n += 1
-        except Exception as e:
-            print("[backend] /library/bulk-import item error:", e)
-    return LibraryBulkImportResponse(ok=True, count=n)
 
 
 @api_router.get("/health")

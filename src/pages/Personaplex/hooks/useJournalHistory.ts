@@ -8,7 +8,7 @@ export type JournalEntry = {
   date: string;
   preview: string;
   fullTranscript: ChatMessage[];
-  /** True after this entry has been sent to /ingest-history so recommendations use it */
+  /** True after this entry has been sent to /ingest-history for server memory */
   syncedToMemory?: boolean;
   /**
    * `conversation` = live Personaplex AI session (saveOrUpdateEntry).
@@ -109,57 +109,23 @@ function isExportPayload(obj: unknown): obj is ExportPayload {
 
 export const KNOWLEDGE_BASE_EXPORT_VERSION = 2 as const;
 
-export type KnowledgeBaseLibraryItem = {
-  id: string;
-  title: string;
-  author?: string;
-  date_completed?: string;
-  note?: string;
-};
-
-export type KnowledgeBaseLibrarySnapshot = {
-  books: KnowledgeBaseLibraryItem[];
-  podcasts: KnowledgeBaseLibraryItem[];
-  articles: KnowledgeBaseLibraryItem[];
-  research: KnowledgeBaseLibraryItem[];
-};
-
 export type KnowledgeBaseExport = {
   version: typeof KNOWLEDGE_BASE_EXPORT_VERSION;
   exportedAt: string;
   entries: JournalEntry[];
-  library: KnowledgeBaseLibrarySnapshot;
 };
 
 function isKnowledgeBaseExport(obj: unknown): obj is KnowledgeBaseExport {
   if (!isExportPayload(obj)) return false;
   const o = obj as Record<string, unknown>;
-  if (o.version !== KNOWLEDGE_BASE_EXPORT_VERSION) return false;
-  const lib = o.library;
-  if (lib == null || typeof lib !== "object") return false;
-  const L = lib as Record<string, unknown>;
-  return (
-    Array.isArray(L.books) &&
-    Array.isArray(L.podcasts) &&
-    Array.isArray(L.articles) &&
-    Array.isArray(L.research)
-  );
+  return o.version === KNOWLEDGE_BASE_EXPORT_VERSION;
 }
 
-export function buildKnowledgeBaseJson(
-  entries: JournalEntry[],
-  library: KnowledgeBaseLibrarySnapshot
-): string {
+export function buildKnowledgeBaseJson(entries: JournalEntry[]): string {
   const payload: KnowledgeBaseExport = {
     version: KNOWLEDGE_BASE_EXPORT_VERSION,
     exportedAt: new Date().toISOString(),
     entries,
-    library: {
-      books: [...library.books],
-      podcasts: [...library.podcasts],
-      articles: [...library.articles],
-      research: [...library.research],
-    },
   };
   return JSON.stringify(payload, null, 2);
 }

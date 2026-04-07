@@ -1,5 +1,5 @@
 import JSZip from "jszip";
-import type { ChatMessage, JournalEntry, KnowledgeBaseLibrarySnapshot } from "./hooks/useJournalHistory";
+import type { ChatMessage, JournalEntry } from "./hooks/useJournalHistory";
 
 const ROOT = "selfmeridian-knowledge-base";
 
@@ -8,10 +8,6 @@ export const KNOWLEDGE_BASE_ENTRY_BOUNDARY = "<!-- SelfMeridian:entry-boundary -
 
 function isConversationEntry(e: JournalEntry): boolean {
   return e.entrySource === "conversation";
-}
-
-function slugFilePart(s: string): string {
-  return s.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "entry";
 }
 
 /** Local calendar date key `YYYY-MM-DD` for grouping exports and sidebar. */
@@ -56,12 +52,6 @@ function bucketEntriesByLocalDay(entries: JournalEntry[], section: "journals" | 
     list.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
   }
   return map;
-}
-
-function yamlScalar(s: string): string {
-  if (s === "") return '""';
-  if (/[\n":]/.test(s) || s.trim() !== s) return JSON.stringify(s);
-  return s;
 }
 
 function formatRecordedForMarkdown(iso: string): string {
@@ -109,31 +99,6 @@ function entryToMarkdown(e: JournalEntry): string {
   return fm;
 }
 
-function libraryItemToMarkdown(
-  item: KnowledgeBaseLibrarySnapshot["books"][number],
-  category: keyof KnowledgeBaseLibrarySnapshot
-): string {
-  const lines = [
-    "---",
-    `id: ${item.id}`,
-    `title: ${yamlScalar(item.title)}`,
-    item.author ? `author: ${yamlScalar(item.author)}` : "author: ",
-    item.date_completed ? `date_completed: ${yamlScalar(item.date_completed)}` : "date_completed: ",
-    `category: ${category}`,
-    "---",
-    "",
-    item.note?.trim() ? item.note.trim() : "_No notes._",
-    "",
-  ];
-  return lines.join("\n");
-}
-
-function libraryFileName(item: KnowledgeBaseLibrarySnapshot["books"][number]): string {
-  const t = slugFilePart(item.title).slice(0, 60);
-  const tail = item.id.replace(/[^a-zA-Z0-9-_]/g, "").slice(-10);
-  return `${t}_${tail}.md`;
-}
-
 function readme(): string {
   return [
     "# SelfMeridian knowledge base",
@@ -142,17 +107,13 @@ function readme(): string {
     "",
     "- `journals/<year>/<Month>/YYYY-MM-DD.md` — **Manual Journal Mode** saves; one file per calendar day; multiple sessions in time order, separated by `<!-- SelfMeridian:entry-boundary -->`",
     "- `conversations/<year>/<Month>/` — **AI-Assisted Journal Mode** saves; same one-file-per-day layout",
-    "- `library/books|podcasts|articles|research/` — media library notes",
     "",
     "Each daily file contains one or more entries (YAML front matter + transcript each). Entries are separated by `<!-- SelfMeridian:entry-boundary -->`. Transcript JSON for re-import is at the end of each entry block.",
     "",
   ].join("\n");
 }
 
-export async function buildKnowledgeBaseMarkdownZip(
-  entries: JournalEntry[],
-  library: KnowledgeBaseLibrarySnapshot
-): Promise<Blob> {
+export async function buildKnowledgeBaseMarkdownZip(entries: JournalEntry[]): Promise<Blob> {
   const zip = new JSZip();
   const root = zip.folder(ROOT);
   if (!root) throw new Error("Failed to create zip root");
@@ -171,12 +132,6 @@ export async function buildKnowledgeBaseMarkdownZip(
     const combined = dayEntries.map((e) => entryToMarkdown(e)).join(`\n\n${KNOWLEDGE_BASE_ENTRY_BOUNDARY}\n\n`);
     root.file(path, combined);
   }
-
-  (["books", "podcasts", "articles", "research"] as const).forEach((cat) => {
-    for (const item of library[cat]) {
-      root.file(`library/${cat}/${libraryFileName(item)}`, libraryItemToMarkdown(item, cat));
-    }
-  });
 
   return zip.generateAsync({ type: "blob", compression: "DEFLATE" });
 }
@@ -294,21 +249,6 @@ function journalEntryFromMarkdown(
   };
 }
 
-function libraryItemFromMarkdown(body: string, front: SimpleFront) {
-  const title = typeof front.title === "string" ? front.title.trim() : "";
-  if (!title) return null;
-  const id = typeof front.id === "string" ? front.id : `lib-${Date.now()}`;
-  let note = body.trim();
-  if (note === "_No notes._") note = "";
-  return {
-    id,
-    title,
-    author: front.author?.trim() || undefined,
-    date_completed: front.date_completed?.trim() || undefined,
-    note: note || undefined,
-  };
-}
-
 function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/^\/+/, "");
 }
@@ -320,20 +260,13 @@ function stripRootPrefix(p: string): string {
   return x;
 }
 
-function pathEntryKind(rel: string): "journal" | "conversation" | "library" | "skip" {
+function pathEntryKind(rel: string): "journal" | "conversation" | "skip" {
   const p = normalizePath(rel);
   if (p === "README.md" || !p.endsWith(".md")) return "skip";
   if (p.startsWith("journals/")) return "journal";
   if (p.startsWith("conversations/")) return "conversation";
-  if (p.startsWith("library/")) return "library";
+  if (p.startsWith("library/")) return "skip";
   return "skip";
-}
-
-function libraryCategoryFromPath(rel: string): keyof KnowledgeBaseLibrarySnapshot | null {
-  const p = normalizePath(rel);
-  const m = p.match(/^library\/(books|podcasts|articles|research)\//);
-  if (!m) return null;
-  return m[1] as keyof KnowledgeBaseLibrarySnapshot;
 }
 
 /** Relative paths for journal/conversation `.md` files (for `/infer-journal-filename-dates`). */
@@ -358,14 +291,10 @@ export async function listJournalPathsInKnowledgeBaseZip(file: File): Promise<st
 export async function parseKnowledgeBaseMarkdownZip(
   file: File,
   journalPathDates: Map<string, string>
-): Promise<{
-  entries: JournalEntry[];
-  library: KnowledgeBaseLibrarySnapshot;
-} | null> {
+): Promise<{ entries: JournalEntry[] } | null> {
   try {
     const zip = await JSZip.loadAsync(await file.arrayBuffer());
     const entries: JournalEntry[] = [];
-    const library: KnowledgeBaseLibrarySnapshot = { books: [], podcasts: [], articles: [], research: [] };
 
     const tasks: Promise<void>[] = [];
     for (const relPath of Object.keys(zip.files)) {
@@ -379,8 +308,6 @@ export async function parseKnowledgeBaseMarkdownZip(
           const text = await entry.async("string");
           const kind = pathEntryKind(rel);
           if (kind === "skip") return;
-
-          const { front, body } = parseSimpleFrontmatter(text);
 
           if (kind === "journal" || kind === "conversation") {
             const entryDateIso = journalPathDates.get(rel) ?? new Date().toISOString();
@@ -400,14 +327,6 @@ export async function parseKnowledgeBaseMarkdownZip(
               );
               if (je) entries.push(je);
             }
-            return;
-          }
-
-          if (kind === "library") {
-            const cat = libraryCategoryFromPath(rel);
-            if (!cat) return;
-            const item = libraryItemFromMarkdown(body, front);
-            if (item) library[cat].push(item);
           }
         })()
       );
@@ -415,10 +334,8 @@ export async function parseKnowledgeBaseMarkdownZip(
 
     await Promise.all(tasks);
 
-    if (entries.length === 0 && library.books.length + library.podcasts.length + library.articles.length + library.research.length === 0) {
-      return null;
-    }
-    return { entries, library };
+    if (entries.length === 0) return null;
+    return { entries };
   } catch {
     return null;
   }

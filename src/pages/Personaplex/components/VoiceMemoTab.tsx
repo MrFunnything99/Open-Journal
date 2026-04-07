@@ -628,32 +628,45 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
         role="tablist"
         aria-label="Manual Journal Mode and AI-Assisted Journal Mode"
       >
-        <button
-          type="button"
-          role="tab"
-          aria-selected={chatInteractionMode === "autobiography"}
-          onClick={() => setChatInteractionMode("autobiography")}
-          className={`rounded-full px-3 py-1.5 text-xs font-medium transition sm:px-4 sm:text-[0.8rem] ${
-            chatInteractionMode === "autobiography"
-              ? "bg-white text-gray-900 shadow-sm"
-              : "text-white/65 hover:bg-white/10 hover:text-white"
-          }`}
-        >
-          {CHAT_INTERACTION_MODE_META.autobiography.label}
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={chatInteractionMode === "journal"}
-          onClick={() => setChatInteractionMode("journal")}
-          className={`rounded-full px-3 py-1.5 text-xs font-medium transition sm:px-4 sm:text-[0.8rem] ${
-            chatInteractionMode === "journal"
-              ? "bg-white text-gray-900 shadow-sm"
-              : "text-white/65 hover:bg-white/10 hover:text-white"
-          }`}
-        >
-          {CHAT_INTERACTION_MODE_META.journal.label}
-        </button>
+        {chatInteractionMode === "autobiography" && hasConversation ? (
+          <button
+            type="button"
+            onClick={handoffAssistedToJournal}
+            disabled={sending}
+            className="rounded-full bg-[#10a37f] px-4 py-1.5 text-xs font-medium tracking-tight text-white shadow-sm transition hover:bg-[#0d8c6e] disabled:pointer-events-none disabled:opacity-45 sm:text-[0.8rem]"
+          >
+            Save to Journal
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={chatInteractionMode === "autobiography"}
+              onClick={() => setChatInteractionMode("autobiography")}
+              className={`rounded-full px-3 py-1.5 text-xs font-medium transition sm:px-4 sm:text-[0.8rem] ${
+                chatInteractionMode === "autobiography"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-white/65 hover:bg-white/10 hover:text-white"
+              }`}
+            >
+              {CHAT_INTERACTION_MODE_META.autobiography.label}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={chatInteractionMode === "journal"}
+              onClick={() => setChatInteractionMode("journal")}
+              className={`rounded-full px-3 py-1.5 text-xs font-medium transition sm:px-4 sm:text-[0.8rem] ${
+                chatInteractionMode === "journal"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-white/65 hover:bg-white/10 hover:text-white"
+              }`}
+            >
+              {CHAT_INTERACTION_MODE_META.journal.label}
+            </button>
+          </>
+        )}
       </div>
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -981,7 +994,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
           )}
 
           {chatInteractionMode === "autobiography" && !finalizerOpen && !assistedHero && (
-            <div className="relative z-10 mx-auto w-full max-w-[48rem] px-3 py-8 md:px-6">
+            <div className="animate-chat-fade-in relative z-10 mx-auto w-full max-w-[48rem] px-3 py-8 md:px-6">
               {errorBanner}
 
               {messages.map((m) => (
@@ -1106,18 +1119,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
         </div>
 
         {showAssistedBottomComposer && (
-          <div className="flex-none border-t border-white/10 bg-[#0a0a12]/92 px-3 py-2.5 pb-[max(0.65rem,env(safe-area-inset-bottom))] backdrop-blur-md">
+          <div className="animate-composer-enter flex-none border-t border-white/10 bg-[#0a0a12]/92 px-3 py-2.5 pb-[max(0.65rem,env(safe-area-inset-bottom))] backdrop-blur-md">
             <div className="mx-auto w-full max-w-[48rem] space-y-2">
-              {messages.length > 0 && (
-                <button
-                  type="button"
-                  onClick={handoffAssistedToJournal}
-                  disabled={sending}
-                  className="w-full rounded-2xl bg-[#10a37f] px-4 py-3.5 text-center text-sm font-semibold tracking-tight text-white shadow-lg shadow-[#10a37f]/20 transition hover:bg-[#0d8c6e] disabled:pointer-events-none disabled:opacity-45"
-                >
-                  Save to Journal
-                </button>
-              )}
               <LiveDictationBubble />
               <AskAnythingComposer layout="center" assistedJournalMinimal onStartVoiceSession={startVoiceSession} />
             </div>

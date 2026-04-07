@@ -14,14 +14,14 @@ import {
 /** Allowlisted client action from journal /chat (backend filters unknown types). */
 export type PersonaplexNavigateAction = {
   type: "navigate";
-  view: "voice_memo" | "journal" | "brain" | "recommendations";
+  view: "voice_memo" | "journal" | "brain";
   brainSection?: "knowledgeBase" | "calendar";
 };
 
 function parseNavigateActions(raw: unknown): PersonaplexNavigateAction[] {
   if (!Array.isArray(raw)) return [];
   const out: PersonaplexNavigateAction[] = [];
-  const views = new Set<string>(["voice_memo", "journal", "brain", "recommendations"]);
+  const views = new Set<string>(["voice_memo", "journal", "brain"]);
   const brains = new Set<string>(["knowledgeBase", "calendar"]);
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
@@ -449,7 +449,6 @@ export function PersonaplexChatProvider({
         detail?: string;
         response?: string;
         session_id?: string;
-        library_items_added?: number;
         retrieval_log?: string;
         agent_steps?: Array<{ kind?: string; name?: string; summary?: string }>;
         actions?: unknown[];
@@ -503,14 +502,6 @@ export function PersonaplexChatProvider({
       const replyPreview =
         data.response!.length > 160 ? `${data.response!.slice(0, 160)}…` : data.response!;
       pushActivity({ kind: "assistant", summary: `Assistant: ${replyPreview}` });
-
-      const libN =
-        typeof data.library_items_added === "number" && data.library_items_added > 0
-          ? Math.floor(data.library_items_added)
-          : 0;
-      if (libN > 0) {
-        onToast(libN === 1 ? "Added 1 item to your Library." : `Added ${libN} items to your Library.`);
-      }
 
       if (navActions.length > 0) {
         onAgentActionRef.current?.(navActions);
@@ -584,7 +575,6 @@ export function PersonaplexChatProvider({
         detail?: string;
         response?: string;
         session_id?: string;
-        library_items_added?: number;
         retrieval_log?: string;
         agent_steps?: Array<{ kind?: string; name?: string; summary?: string }>;
         actions?: unknown[];
@@ -638,14 +628,6 @@ export function PersonaplexChatProvider({
       const replyPreview =
         data.response!.length > 160 ? `${data.response!.slice(0, 160)}…` : data.response!;
       pushActivity({ kind: "assistant", summary: `Assistant: ${replyPreview}` });
-
-      const libN =
-        typeof data.library_items_added === "number" && data.library_items_added > 0
-          ? Math.floor(data.library_items_added)
-          : 0;
-      if (libN > 0) {
-        onToast(libN === 1 ? "Added 1 item to your Library." : `Added ${libN} items to your Library.`);
-      }
 
       if (navActions.length > 0) {
         onAgentActionRef.current?.(navActions);
@@ -707,7 +689,6 @@ export function PersonaplexChatProvider({
         void (async () => {
           const t = await transcribeBlob(blob);
           if (t) {
-            setIsChatActive(true);
             setDraft((d) => (d.trim() ? `${d.trim()}\n\n${t.polished}` : t.polished));
             pushActivity({ kind: "system", summary: "Transcribed voice into your message — edit or send." });
           }

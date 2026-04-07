@@ -22,32 +22,39 @@ export async function blobToBase64(blob: Blob): Promise<string> {
 }
 
 /**
- * Use MediaRecorder output as-is for /voice-memo (OpenRouter accepts webm/m4a/etc.).
- * Avoids decode→re-encode to WAV, which could degrade or mis-handle some captures.
+ * Prepare a MediaRecorder blob for /voice-memo transcription.
+ * Webm (the default from most browsers) isn't accepted by OpenRouter audio
+ * models, so we decode → re-encode to WAV for that case. Formats already
+ * supported natively (m4a, mp3, ogg, wav, flac) are sent as-is.
  */
 export async function micBlobToTranscriptionPayload(blob: Blob): Promise<{
   b64: string;
   filename: string;
   mimeType: string;
 }> {
-  const mimeType = (blob.type || "").trim() || "audio/webm";
+  const rawMime = (blob.type || "").trim().toLowerCase() || "audio/webm";
+
+  const needsWavConversion = rawMime.includes("webm");
+
+  if (needsWavConversion) {
+    const b64 = await blobToWavBase64(blob);
+    return { b64, filename: "dictation.wav", mimeType: "audio/wav" };
+  }
+
   const b64 = await blobToBase64(blob);
-  const mt = mimeType.toLowerCase();
-  let filename = "dictation.webm";
-  if (mt.includes("mp4") || mt.includes("m4a") || mt.includes("aac") || mt === "audio/mp4") {
+  let filename = "dictation.wav";
+  if (rawMime.includes("mp4") || rawMime.includes("m4a") || rawMime.includes("aac")) {
     filename = "dictation.m4a";
-  } else if (mt.includes("webm")) {
-    filename = "dictation.webm";
-  } else if (mt.includes("wav")) {
+  } else if (rawMime.includes("wav")) {
     filename = "dictation.wav";
-  } else if (mt.includes("mpeg") || mt.includes("mp3")) {
+  } else if (rawMime.includes("mpeg") || rawMime.includes("mp3")) {
     filename = "dictation.mp3";
-  } else if (mt.includes("ogg") || mt.includes("opus")) {
+  } else if (rawMime.includes("ogg") || rawMime.includes("opus")) {
     filename = "dictation.ogg";
-  } else if (mt.includes("flac")) {
+  } else if (rawMime.includes("flac")) {
     filename = "dictation.flac";
   }
-  return { b64, filename, mimeType };
+  return { b64, filename, mimeType: rawMime };
 }
 
 function audioBufferToWav(audioBuffer: AudioBuffer): ArrayBuffer {
