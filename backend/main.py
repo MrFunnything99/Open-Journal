@@ -8,11 +8,23 @@ import io
 import json
 import os
 import re
+import ssl
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, List, Dict
+
+# Ensure urllib uses certifi CA bundle on macOS (python.org builds ship without
+# system root certs; the "Install Certificates.command" symlinks them, but if
+# that hasn't been run yet we fall back to certifi directly).
+try:
+    import certifi
+    ssl._create_default_https_context = lambda purpose=ssl.Purpose.SERVER_AUTH, cafile=certifi.where(): (
+        ssl.create_default_context(purpose=purpose, cafile=cafile)
+    )
+except ImportError:
+    pass
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Response, Query
@@ -190,7 +202,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     personalization: Optional[float] = None  # ignored for graph /chat; server uses 1.0 (full memory)
     intrusiveness: Optional[float] = None
-    mode: Optional[str] = None  # "journal" | "conversation" | "autobiography" (Assisted Journal) | "recommendations" | "learning"
+    mode: Optional[str] = None  # "journal" | "conversation" | "autobiography" (Assisted Journal) | "recommendations"
     # Allowlisted OpenRouter id for conversation + autobiography only (see graph.USER_SELECTABLE_CHAT_MODELS)
     openrouter_model: Optional[str] = None
     # Optional: client-formatted local time + daypart string for Assisted Journal (autobiography) check-ins
@@ -668,21 +680,27 @@ VOICE_MEMO_POLISH_INSTRUCTION = """You are editing a voice memo transcript. Clea
 - Do NOT add new content, headings, sign-offs, or commentary.
 Output ONLY the cleaned text with no title or preamble."""
 
-JOURNAL_VALIDATE_INSTRUCTION = """You are a supportive assistant helping someone turn a voice transcript into readable journal text.
+JOURNAL_FEEDBACK_INSTRUCTION = """You are a warm, perceptive companion reading someone's personal journal. Your job is to give thoughtful, substantive feedback that helps the writer understand themselves better.
 
-Your first job is reformatting only: make the passage coherent and pleasant to read. Smooth out filler and repeated words (e.g. "um", stutters, accidental duplicates), fix obvious transcription errors and misspellings, and resolve small incoherencies—without changing what the author meant. Preserve roughly 98% of their wording; only light edits. Do not invent facts or add new events.
+You have been given:
+1. The journal entry the writer just composed.
+2. Their most recent previous entries (if any) for continuity.
+3. Semantically related passages from their journal history found by vector search — these reveal recurring themes, patterns, and echoes across time.
 
-Your second job is short, friendly feedback or light reflection. Stay warm and uplifting toward the writer. Never attack or belittle them. You may name difficult realities in a protective, caring way (e.g. a situation sounds unsafe, or someone treated them poorly).
-
-Do not ask questions or prompt for replies; the writer will respond to feedback on their own.
+How to respond:
+- Start by genuinely engaging with what they wrote today. Reflect back what you notice — the emotions, the undercurrents, the things said between the lines.
+- Then weave in connections to their past writing. Name patterns you see: recurring themes, evolving perspectives, unresolved tensions, or growth arcs. Quote or paraphrase specific past passages when relevant.
+- Offer gentle observations or reframings that might help them see their situation from a new angle. You may name difficult realities in a protective, caring way (e.g. a situation sounds unsafe, or someone is treating them poorly).
+- Be substantial — aim for several rich paragraphs, not a few sentences. The writer values depth.
+- Stay warm, honest, and supportive. Never condescending or preachy. Write like a trusted friend who has been reading their journal for months and genuinely cares.
+- Do not ask questions or prompt for replies; the writer will respond on their own.
+- Do not reformat or rewrite their entry. Focus entirely on feedback and reflection.
 
 Respond in this exact format:
-===REFORMATTED===
-<journal text>
 ===FEEDBACK===
-<feedback text>
-===VALIDATION===
-- <0–3 short optional lines: only gentle or protective observations; if none, write a single line: - (none)>"""
+<your multi-paragraph feedback>
+===OBSERVATIONS===
+- <2–5 bullet points: specific patterns, themes, or growth you noticed across entries; reference dates or content where possible>"""
 
 
 def _guess_audio_filename(filename: Optional[str], mime_type: Optional[str]) -> str:
@@ -947,7 +965,11 @@ async def _polish_voice_memo_openrouter(raw: str, model_override: Optional[str] 
     return out if out else text
 
 
-async def _validate_journal_openrouter(raw: str, model_override: Optional[str] = None) -> tuple[str, str, list[str], Optional[str]]:
+async def _validate_journal_openrouter(
+    raw: str,
+    model_override: Optional[str] = None,
+    instance_id: str = "",
+) -> tuple[str, str, list[str], Optional[str]]:
     key = os.getenv("OPENROUTER_API_KEY", "").strip()
     text = (raw or "").strip()
     if not text:
@@ -962,13 +984,81 @@ async def _validate_journal_openrouter(raw: str, model_override: Optional[str] =
     try:
         import urllib.error
         import urllib.request
+        import time as _time
 
+        t0 = _time.perf_counter()
         model = (model_override or os.getenv("OPENROUTER_JOURNAL_VALIDATE_MODEL", "")).strip() or "openai/gpt-5.4"
-        prompt = JOURNAL_VALIDATE_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
+
+        # --- 1. Fetch the last 2 saved journal entries for continuity ---
+        recent_entries: list[dict] = []
+        try:
+            recent_entries = await asyncio.to_thread(
+                vec_store.list_journal_entries_recent, instance_id or "", limit=2
+            )
+        except Exception as e:
+            print(f"[backend] journal-feedback: recent entries fetch failed: {e}")
+
+        # --- 2. Vector search for thematic echoes across journal history ---
+        vec_chunks: list[dict] = []
+        try:
+            embs = await asyncio.to_thread(_embed_texts, [text[:2000]])
+            if embs and embs[0]:
+                vec_chunks = await asyncio.to_thread(
+                    vec_store.query_journal_chunks, embs[0], instance_id or "", k=12
+                )
+        except Exception as e:
+            print(f"[backend] journal-feedback: vector search failed: {e}")
+
+        t_ctx = _time.perf_counter()
+        print(f"[backend] journal-feedback: context retrieval in {t_ctx - t0:.1f}s "
+              f"({len(recent_entries)} recent, {len(vec_chunks)} vec chunks)")
+
+        # --- 3. Assemble context block for the prompt ---
+        context_parts: list[str] = []
+
+        if recent_entries:
+            for i, entry in enumerate(recent_entries):
+                doc = (entry.get("document") or "").strip()
+                date = (entry.get("timestamp") or entry.get("created_at") or "").strip()
+                if doc:
+                    label = f"Previous entry #{i + 1}" + (f" ({date})" if date else "")
+                    context_parts.append(f"{label}:\n{doc[:4000]}")
+
+        if vec_chunks:
+            theme_lines: list[str] = []
+            seen: set[str] = set()
+            for ch in vec_chunks:
+                txt = (ch.get("chunk_text") or "").strip()
+                ed = (ch.get("entry_date") or "").strip()
+                if txt and txt not in seen:
+                    seen.add(txt)
+                    theme_lines.append(f"[{ed}] {txt}" if ed else txt)
+            if theme_lines:
+                context_parts.append(
+                    "Related passages from journal history (vector search — recurring themes, "
+                    "echoes, patterns):\n" + "\n---\n".join(theme_lines)
+                )
+
+        context_block = ""
+        if context_parts:
+            context_block = (
+                "\n\n=== CONTEXT: RECENT ENTRIES & RELATED HISTORY ===\n"
+                + "\n\n".join(context_parts)
+                + "\n=== END CONTEXT ===\n"
+            )
+
+        # --- 4. Build final prompt ---
+        prompt = (
+            JOURNAL_FEEDBACK_INSTRUCTION
+            + context_block
+            + "\n\n--- Today's Journal Entry ---\n"
+            + text[:48000]
+        )
+
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
+            "temperature": 0.45,
         }
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -984,7 +1074,7 @@ async def _validate_journal_openrouter(raw: str, model_override: Optional[str] =
 
         def _call() -> str:
             try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
+                with urllib.request.urlopen(req, timeout=180) as resp:
                     raw_text = resp.read().decode("utf-8")
                     status = resp.status
             except urllib.error.HTTPError as e:
@@ -1009,6 +1099,9 @@ async def _validate_journal_openrouter(raw: str, model_override: Optional[str] =
             return ""
 
         out = await asyncio.to_thread(_call)
+        t_llm = _time.perf_counter()
+        print(f"[backend] journal-feedback: LLM response in {t_llm - t_ctx:.1f}s (total {t_llm - t0:.1f}s)")
+
         if not out:
             return text, "AI returned empty output.", [], model
 
@@ -1022,12 +1115,15 @@ async def _validate_journal_openrouter(raw: str, model_override: Optional[str] =
             j = src.find(end, i)
             return src[i:j].strip() if j != -1 else src[i:].strip()
 
-        reformatted = _between(out, "===REFORMATTED===", "===FEEDBACK===")
-        feedback = _between(out, "===FEEDBACK===", "===VALIDATION===")
-        validation_block = _between(out, "===VALIDATION===", None)
+        feedback = _between(out, "===FEEDBACK===", "===OBSERVATIONS===")
+        observations_block = _between(out, "===OBSERVATIONS===", None)
+
+        # If the model didn't use the delimiters, treat the whole output as feedback
+        if not feedback:
+            feedback = out.strip()
 
         notes: list[str] = []
-        for line in validation_block.splitlines():
+        for line in observations_block.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -1036,14 +1132,11 @@ async def _validate_journal_openrouter(raw: str, model_override: Optional[str] =
             if line:
                 notes.append(line)
 
-        if not reformatted:
-            reformatted = text
-        if not feedback:
-            feedback = "No major issues found."
-        return reformatted, feedback, notes[:8], model
+        return text, feedback, notes[:8], model
     except Exception as e:
-        print("[backend] journal validate openrouter error:", e)
-        return text, "Validation failed; using original transcript.", [str(e)[:180]], None
+        print("[backend] journal feedback openrouter error:", e)
+        import traceback; traceback.print_exc()
+        return text, "Feedback failed; please try again.", [str(e)[:180]], None
 
 
 @api_router.post("/voice")
@@ -1129,7 +1222,7 @@ async def chat(req: ChatRequest, request: Request):
     instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     mode = (req.mode or "journal").strip().lower()
-    if mode not in ("journal", "conversation", "autobiography", "recommendations", "learning"):
+    if mode not in ("journal", "conversation", "autobiography", "recommendations"):
         mode = "journal"
 
     if mode == "recommendations":
@@ -2575,88 +2668,22 @@ async def api_journal_cleanup(req: JournalCleanupRequest):
 
 
 @app.post("/api/journal-validate", response_model=JournalValidateResponse, include_in_schema=False)
-async def api_journal_validate(req: JournalValidateRequest):
+async def api_journal_validate(req: JournalValidateRequest, request: Request):
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
     if len(text) < 10:
         raise HTTPException(status_code=400, detail="Please provide a longer transcript before validation")
-    reformatted, feedback, notes, model_used = await _validate_journal_openrouter(text, req.model)
+    instance_id = _instance_id(request)
+    reformatted, feedback, notes, model_used = await _validate_journal_openrouter(
+        text, req.model, instance_id=instance_id
+    )
     return JournalValidateResponse(
         reformatted_journal=reformatted,
         feedback=feedback,
         validation_notes=notes,
         model_used=model_used,
     )
-
-
-# ---------------------------------------------------------------------------
-#  Learning Tab endpoints
-# ---------------------------------------------------------------------------
-
-from learning import generate_daily_article, register_user_provided_learning_url
-
-
-class LearningStatusRequest(BaseModel):
-    status: str  # "read" | "skipped"
-
-
-class LearningCustomUrlRequest(BaseModel):
-    url: str
-
-
-@app.get("/api/learning/today", include_in_schema=False)
-async def api_learning_today(request: Request):
-    instance_id = _instance_id(request)
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(generate_daily_article, instance_id, False),
-            timeout=CHAT_INVOKE_TIMEOUT_SEC,
-        )
-        return result
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Article generation timed out")
-    except Exception as e:
-        print(f"[backend] Learning today error: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/learning/regenerate", include_in_schema=False)
-async def api_learning_regenerate(request: Request):
-    instance_id = _instance_id(request)
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(generate_daily_article, instance_id, True),
-            timeout=CHAT_INVOKE_TIMEOUT_SEC,
-        )
-        return result
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Article regeneration timed out")
-    except Exception as e:
-        print(f"[backend] Learning regenerate error: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/learning/custom-url", include_in_schema=False)
-async def api_learning_custom_url(request: Request, req: LearningCustomUrlRequest):
-    """User-pasted article or podcast URL for reflection (replaces today's curated slot)."""
-    instance_id = _instance_id(request)
-    try:
-        return await asyncio.to_thread(register_user_provided_learning_url, instance_id, req.url)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        print(f"[backend] Learning custom-url error: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/learning/status", include_in_schema=False)
-async def api_learning_status(request: Request, req: LearningStatusRequest):
-    instance_id = _instance_id(request)
-    from datetime import date
-    today = date.today().isoformat()
-    updated = vec_store.daily_article_update_status(instance_id, today, req.status)
-    return {"ok": updated}
 
 
 # Serve built frontend (monolith: when built assets exist, e.g. Docker build).

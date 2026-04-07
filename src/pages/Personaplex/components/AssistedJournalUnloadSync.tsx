@@ -4,20 +4,17 @@ import { personaplexChatToJournalTranscript, usePersonaplexChat } from "../Perso
 
 /**
  * On tab/window close, persist in-flight Home /chat reflection (AI-Assisted Journal Mode, or residue after
- * switching to Manual Journal Mode) — not Learning-tab chats.
+ * switching to Manual Journal Mode).
  */
 export function AssistedJournalUnloadSync() {
-  const { messages, chatInteractionMode } = usePersonaplexChat();
+  const { messages } = usePersonaplexChat();
   const messagesRef = useRef(messages);
-  const modeRef = useRef(chatInteractionMode);
   messagesRef.current = messages;
-  modeRef.current = chatInteractionMode;
 
   useEffect(() => {
     const onPageHide = () => {
       const msgs = messagesRef.current;
       if (msgs.length === 0) return;
-      if (modeRef.current === "learning") return;
       appendJournalEntrySync(personaplexChatToJournalTranscript(msgs), "conversation");
     };
     window.addEventListener("pagehide", onPageHide);

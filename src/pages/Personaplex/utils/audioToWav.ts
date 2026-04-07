@@ -21,6 +21,35 @@ export async function blobToBase64(blob: Blob): Promise<string> {
   return arrayBufferToBase64(buf);
 }
 
+/**
+ * Use MediaRecorder output as-is for /voice-memo (OpenRouter accepts webm/m4a/etc.).
+ * Avoids decode→re-encode to WAV, which could degrade or mis-handle some captures.
+ */
+export async function micBlobToTranscriptionPayload(blob: Blob): Promise<{
+  b64: string;
+  filename: string;
+  mimeType: string;
+}> {
+  const mimeType = (blob.type || "").trim() || "audio/webm";
+  const b64 = await blobToBase64(blob);
+  const mt = mimeType.toLowerCase();
+  let filename = "dictation.webm";
+  if (mt.includes("mp4") || mt.includes("m4a") || mt.includes("aac") || mt === "audio/mp4") {
+    filename = "dictation.m4a";
+  } else if (mt.includes("webm")) {
+    filename = "dictation.webm";
+  } else if (mt.includes("wav")) {
+    filename = "dictation.wav";
+  } else if (mt.includes("mpeg") || mt.includes("mp3")) {
+    filename = "dictation.mp3";
+  } else if (mt.includes("ogg") || mt.includes("opus")) {
+    filename = "dictation.ogg";
+  } else if (mt.includes("flac")) {
+    filename = "dictation.flac";
+  }
+  return { b64, filename, mimeType };
+}
+
 function audioBufferToWav(audioBuffer: AudioBuffer): ArrayBuffer {
   const numChannels = 1; // Mono for transcription
   const sampleRate = audioBuffer.sampleRate;

@@ -13,6 +13,7 @@ import base64
 import contextvars
 import hashlib
 import re
+import ssl
 import time
 import json
 import math
@@ -24,6 +25,14 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import certifi
+    ssl._create_default_https_context = lambda purpose=ssl.Purpose.SERVER_AUTH, cafile=certifi.where(): (
+        ssl.create_default_context(purpose=purpose, cafile=cafile)
+    )
+except ImportError:
+    pass
 
 import numpy as np
 from dotenv import load_dotenv

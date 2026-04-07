@@ -1,4 +1,5 @@
 import { backendFetch } from "../../../backendApi";
+import { browserSpeechSynthesisAvailable, speakWithSpeechSynthesis } from "./browserSpeech";
 
 let currentAudio: HTMLAudioElement | null = null;
 let currentObjectUrl: string | null = null;
@@ -15,6 +16,13 @@ function stopChatReadAloud() {
   if (currentObjectUrl) {
     URL.revokeObjectURL(currentObjectUrl);
     currentObjectUrl = null;
+  }
+  if (typeof window !== "undefined" && window.speechSynthesis) {
+    try {
+      window.speechSynthesis.cancel();
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -68,6 +76,19 @@ export async function playChatReadAloud(
         body: JSON.stringify({ text: t.slice(0, 12_000) }),
       });
     } catch {
+      if (browserSpeechSynthesisAvailable()) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            speakWithSpeechSynthesis(t.slice(0, 12_000), {
+              onEnd: () => resolve(),
+              onError: () => reject(new Error("browser TTS")),
+            });
+          });
+          return;
+        } catch {
+          /* fall through */
+        }
+      }
       onError("Could not reach the server for read aloud.");
       return;
     }
@@ -86,12 +107,38 @@ export async function playChatReadAloud(
           : detail && typeof detail === "object" && "message" in detail && typeof (detail as { message: unknown }).message === "string"
             ? (detail as { message: string }).message
             : `Read aloud failed (${res.status}).`;
+      if (browserSpeechSynthesisAvailable()) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            speakWithSpeechSynthesis(t.slice(0, 12_000), {
+              onEnd: () => resolve(),
+              onError: () => reject(new Error("browser TTS")),
+            });
+          });
+          return;
+        } catch {
+          /* fall through */
+        }
+      }
       onError(msg);
       return;
     }
 
     const b64 = typeof data.audio === "string" ? data.audio : "";
     if (!b64) {
+      if (browserSpeechSynthesisAvailable()) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            speakWithSpeechSynthesis(t.slice(0, 12_000), {
+              onEnd: () => resolve(),
+              onError: () => reject(new Error("browser TTS")),
+            });
+          });
+          return;
+        } catch {
+          /* fall through */
+        }
+      }
       onError("No audio returned.");
       return;
     }
@@ -131,4 +178,25 @@ export async function playChatReadAloud(
 
 export function stopReadAloudPlayback() {
   stopChatReadAloud();
+}
+
+/** True when TTS audio (Mistral or browser speechSynthesis) is currently playing. */
+export function isReadAloudPlaying(): boolean {
+  if (currentAudio && !currentAudio.paused && !currentAudio.ended) return true;
+  if (typeof window !== "undefined" && window.speechSynthesis?.speaking) return true;
+  return false;
+}
+
+const POST_TTS_COOLDOWN_MS = 450;
+
+/**
+ * Stop any playing read-aloud and wait a brief cooldown for room echo to decay.
+ * Call before opening the mic so the recorder doesn't capture residual speaker output.
+ */
+export async function stopReadAloudAndCooldown(): Promise<void> {
+  const wasPlaying = isReadAloudPlaying();
+  stopChatReadAloud();
+  if (wasPlaying) {
+    await new Promise((r) => setTimeout(r, POST_TTS_COOLDOWN_MS));
+  }
 }

@@ -21,7 +21,6 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-from learning import get_learning_system_prompt
 from library import (
     apply_library_tool_items,
     get_assisted_journal_continuity_block,
@@ -927,14 +926,7 @@ def interviewer_node(state: JournalState) -> JournalState:
             "are empty or bare None, use the reflective fallback openers above — seamlessly, as if this is how you always start."
         )
 
-    if mode_raw == "learning":
-        import vec_store as _vs
-        _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        _article = _vs.daily_article_get(instance_id, _today) or {}
-        learning_sys = get_learning_system_prompt(instance_id, _article)
-        system = SystemMessage(content=learning_sys)
-    else:
-        system = SystemMessage(content="\n".join(system_parts))
+    system = SystemMessage(content="\n".join(system_parts))
 
     lc_messages = [system] + state["messages"]
     oai_messages = _messages_to_openai_dicts(lc_messages)
@@ -955,9 +947,6 @@ def interviewer_node(state: JournalState) -> JournalState:
             extra_body = {"reasoning": {"enabled": True}}
         elif mode_raw == "autobiography":
             model = (os.getenv("OPENROUTER_ASSISTED_JOURNAL_MODEL") or DEFAULT_ASSISTED_JOURNAL_MODEL).strip()
-            extra_body = _reasoning_extra_body_for_model(model)
-        elif mode_raw == "learning":
-            model = (os.getenv("OPENROUTER_LEARNING_MODEL") or "anthropic/claude-opus-4.6").strip()
             extra_body = _reasoning_extra_body_for_model(model)
         response, library_added, tool_steps, nav_actions = _interviewer_run_with_tools(
             client, model, oai_messages, instance_id, extra_body=extra_body

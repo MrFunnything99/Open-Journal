@@ -49,7 +49,15 @@ import {
   type UserSelectableChatModelId,
   USER_CHAT_MODEL_STORAGE_KEY,
 } from "./chatCompletionModels";
-import { blobToBase64, blobToWavBase64 } from "./utils/audioToWav";
+import { blobToBase64, micBlobToTranscriptionPayload } from "./utils/audioToWav";
+import {
+  attachDictationLevelMonitor,
+  DICTATION_MIC_CONSTRAINTS,
+  shouldDiscardDictationRecording,
+  type DictationLevelMonitor,
+} from "./utils/dictationRecordingMonitor";
+import { stopReadAloudAndCooldown } from "./utils/chatReadAloud";
+import { transcriptLikelyEchoesAssistantText } from "./utils/transcriptionEchoGuard";
 
 const CHAT_TIMEOUT_MS = 190_000;
 /** Sent for API compatibility; server always uses full memory retrieval (1.0) for graph /chat. */
@@ -90,19 +98,6 @@ export type AgentActivityEntry = {
 };
 
 const MAX_ACTIVITY = 60;
-
-export function defaultFilenameForMicBlob(mimeType: string): string {
-  const mt = (mimeType || "").toLowerCase();
-  if (mt.includes("mp4") || mt.includes("m4a") || mt.includes("aac") || mt === "audio/mp4") {
-    return "dictation.m4a";
-  }
-  if (mt.includes("webm")) return "dictation.webm";
-  if (mt.includes("wav")) return "dictation.wav";
-  if (mt.includes("mpeg") || mt.includes("mp3")) return "dictation.mp3";
-  if (mt.includes("ogg") || mt.includes("opus")) return "dictation.ogg";
-  if (mt.includes("flac")) return "dictation.flac";
-  return "dictation.webm";
-}
 
 function effectiveRecorderMime(recorder: MediaRecorder): string {
   const t = recorder.mimeType?.trim();
@@ -215,6 +210,8 @@ export function PersonaplexChatProvider({
   const onAgentActionRef = useRef(onAgentAction);
   onAgentActionRef.current = onAgentAction;
   const [messages, setMessages] = useState<PersonaplexChatMessage[]>([]);
+  const messagesRef = useRef<PersonaplexChatMessage[]>([]);
+  messagesRef.current = messages;
   const [draft, setDraft] = useState("");
   const [chatSessionId, setChatSessionId] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -222,7 +219,7 @@ export function PersonaplexChatProvider({
   const [liveDictationText, setLiveDictationText] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
   const [isChatActive, setIsChatActive] = useState(false);
-  const [chatInteractionMode, setChatInteractionMode] = useState<ChatInteractionMode>("journal");
+  const [chatInteractionMode, setChatInteractionMode] = useState<ChatInteractionMode>("autobiography");
   const [userChatModel, setUserChatModelState] = useState<UserSelectableChatModelId>(() =>
     typeof window !== "undefined" ? readStoredUserChatModel() : DEFAULT_USER_CHAT_MODEL
   );
@@ -234,6 +231,8 @@ export function PersonaplexChatProvider({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const dictationMonitorRef = useRef<DictationLevelMonitor | null>(null);
+  const recordStartRef = useRef(0);
   const speechRecRef = useRef<SpeechRecInstance | null>(null);
   const speechSessionActiveRef = useRef(false);
   const speechFinalRef = useRef("");
@@ -326,9 +325,10 @@ export function PersonaplexChatProvider({
           filename = (blob as File).name;
           mimeType = blob.type || "audio/mpeg";
         } else {
-          b64 = await blobToWavBase64(blob);
-          filename = "dictation.wav";
-          mimeType = "audio/wav";
+          const mic = await micBlobToTranscriptionPayload(blob);
+          b64 = mic.b64;
+          filename = mic.filename;
+          mimeType = mic.mimeType;
         }
         const res = await backendFetch("/voice-memo", {
           method: "POST",
@@ -350,6 +350,17 @@ export function PersonaplexChatProvider({
         const line = (data.polished_text ?? data.raw_transcript ?? "").trim();
         const raw = ((data.raw_transcript ?? "").trim() || line).trim();
         if (!line) return null;
+        const lastAsst = [...messagesRef.current].reverse().find((m) => m.role === "assistant");
+        if (
+          lastAsst?.content &&
+          (transcriptLikelyEchoesAssistantText(line, lastAsst.content) ||
+            transcriptLikelyEchoesAssistantText(raw, lastAsst.content))
+        ) {
+          onToast(
+            "Transcription matched the assistant's last reply instead of your voice — try again with speakers lower or after read-aloud stops."
+          );
+          return null;
+        }
         return { polished: line, raw: raw || line };
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Transcription failed";
@@ -665,8 +676,9 @@ export function PersonaplexChatProvider({
   const startRecording = useCallback(async () => {
     if (micPhase !== "idle" || sending) return;
     setChatError(null);
+    await stopReadAloudAndCooldown();
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: DICTATION_MIC_CONSTRAINTS });
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : MediaRecorder.isTypeSupported("audio/webm")
@@ -682,6 +694,16 @@ export function PersonaplexChatProvider({
         const mimeDone = effectiveRecorderMime(mr);
         const blob = new Blob(chunksRef.current, { type: mimeDone });
         mediaRecorderRef.current = null;
+        const mon = dictationMonitorRef.current;
+        dictationMonitorRef.current = null;
+        const peakRms = mon ? mon.getMaxRms() : 1;
+        mon?.stop();
+        const elapsed = Date.now() - recordStartRef.current;
+        if (shouldDiscardDictationRecording(elapsed, peakRms)) {
+          setMicPhase("idle");
+          setLiveDictationText("");
+          return;
+        }
         void (async () => {
           const t = await transcribeBlob(blob);
           if (t) {
@@ -692,6 +714,8 @@ export function PersonaplexChatProvider({
         })();
       };
       mr.start();
+      recordStartRef.current = Date.now();
+      dictationMonitorRef.current = attachDictationLevelMonitor(stream);
       mediaRecorderRef.current = mr;
       setMicPhase("recording");
       beginLiveSpeechCaption();
@@ -708,7 +732,11 @@ export function PersonaplexChatProvider({
     setLiveDictationText("");
     const mr = mediaRecorderRef.current;
     if (mr && mr.state !== "inactive") mr.stop();
-    else setMicPhase("idle");
+    else {
+      dictationMonitorRef.current?.stop();
+      dictationMonitorRef.current = null;
+      setMicPhase("idle");
+    }
   }, [stopSpeechRecognition]);
 
   const onPickFile = useCallback(

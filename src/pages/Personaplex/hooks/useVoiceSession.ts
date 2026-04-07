@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
+import { speakWithSpeechSynthesis } from "../utils/browserSpeech";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -178,6 +179,7 @@ export function useVoiceSession({
   const speechRecRef = useRef<SpeechRecInstance | null>(null);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const browserTtsCancelRef = useRef<(() => void) | null>(null);
   const activeRef = useRef(false);
   const accumulatedFinalRef = useRef("");
   const onSendRef = useRef(onSendTranscript);
@@ -226,6 +228,9 @@ export function useVoiceSession({
       a.src = "";
       ttsAudioRef.current = null;
     }
+    const cancelBrowser = browserTtsCancelRef.current;
+    browserTtsCancelRef.current = null;
+    cancelBrowser?.();
     resetBargeInGates();
     stopVadLoop();
   }, [resetBargeInGates, stopVadLoop]);
@@ -483,14 +488,42 @@ export function useVoiceSession({
       setVoiceState("speaking");
 
       try {
-        const audio = await fetchTtsAudio(text);
+        let audio: HTMLAudioElement | null = null;
+        try {
+          audio = await fetchTtsAudio(text);
+        } catch {
+          audio = null;
+        }
         if (!activeRef.current) return;
         if (!audio) {
-          setVoiceState("listening");
+          void ensureMicStream().then(() => {
+            if (stateRef.current === "speaking" && activeRef.current) {
+              startVadWhileSpeaking();
+            }
+          });
           startSpeechRec();
+          const { cancel } = speakWithSpeechSynthesis(text, {
+            onEnd: () => {
+              browserTtsCancelRef.current = null;
+              stopVadLoop();
+              resetBargeInGates();
+              if (!activeRef.current) return;
+              setVoiceState("listening");
+            },
+            onError: () => {
+              browserTtsCancelRef.current = null;
+              stopVadLoop();
+              resetBargeInGates();
+              if (!activeRef.current) return;
+              setVoiceState("listening");
+            },
+          });
+          browserTtsCancelRef.current = cancel;
           return;
         }
 
+        browserTtsCancelRef.current?.();
+        browserTtsCancelRef.current = null;
         ttsAudioRef.current = audio;
 
         void ensureMicStream().then(() => {

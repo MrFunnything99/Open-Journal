@@ -172,7 +172,7 @@ const CAT_LABEL: Record<BrainLibraryCategory, string> = {
 const knowledgeBaseToolbarBtnClass =
   "rounded-full border border-gray-300 bg-transparent px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-100 dark:border-white/20 dark:text-white/85 dark:hover:bg-white/10";
 const journalDumpBtnClass =
-  "flex-1 min-w-0 rounded-xl border border-white/15 bg-white/5 px-2 py-2 text-center text-xs font-medium text-white/80 transition-colors hover:bg-white/10 hover:text-white leading-snug";
+  "w-full rounded-xl border border-white/15 bg-white/5 px-2 py-2 text-center text-xs font-medium text-white/80 transition-colors hover:bg-white/10 hover:text-white leading-snug";
 
 export const BrainLayout: FC<BrainLayoutProps> = ({
   entries,
@@ -198,7 +198,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   onPrepareJournalDumpUpload,
   onStartFresh,
 }) => {
-  type ExplorerTab = "journals" | "conversations" | "library" | "learning";
+  type ExplorerTab = "journals" | "conversations" | "library";
   const [explorerTab, setExplorerTab] = useState<ExplorerTab>("journals");
   const [selection, setSelection] = useState<Selection | null>(null);
   const [journalExpandedYears, setJournalExpandedYears] = useState<Set<number>>(() => new Set());
@@ -213,6 +213,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const [expandedLogKey, setExpandedLogKey] = useState<string | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
   const moreRef = useRef<HTMLDivElement>(null);
+  const [journalImportOpen, setJournalImportOpen] = useState(false);
+  const journalImportMenuRef = useRef<HTMLDivElement>(null);
   const knowledgeBaseFileRef = useRef<HTMLInputElement>(null);
   const journalDumpFolderRef = useRef<HTMLInputElement>(null);
   const journalDumpFilesRef = useRef<HTMLInputElement>(null);
@@ -281,7 +283,6 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
       if (tab === "conversations") {
         return conversationSorted[0] ? { kind: "conversation", id: conversationSorted[0].id } : null;
       }
-      if (tab === "learning") return null;
       for (const cat of ["book", "podcast", "article", "research"] as BrainLibraryCategory[]) {
         const list = libraryItems[CAT_KEY[cat]];
         if (list.length > 0) return { kind: "library", category: cat, id: list[0].id };
@@ -330,7 +331,9 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
-      if (moreRef.current && !moreRef.current.contains(e.target as Node)) setMoreOpen(false);
+      const t = e.target as Node;
+      if (moreRef.current && !moreRef.current.contains(t)) setMoreOpen(false);
+      if (journalImportMenuRef.current && !journalImportMenuRef.current.contains(t)) setJournalImportOpen(false);
     };
     document.addEventListener("click", close);
     return () => document.removeEventListener("click", close);
@@ -596,7 +599,6 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 { key: "journals", label: "Manual Journals" },
                 { key: "conversations", label: "AI-Assisted Journals" },
                 { key: "library", label: "Library" },
-                { key: "learning", label: "Learning" },
               ] as { key: ExplorerTab; label: string }[]
             ).map((tab) => (
               <button
@@ -854,17 +856,6 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
             </div>
           )}
 
-          {explorerTab === "learning" && (
-            <div className="flex flex-col items-center justify-center px-4 py-10 text-center">
-              <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-gray-100 dark:bg-white/10">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-gray-400 dark:text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" />
-                </svg>
-              </div>
-              <p className="text-sm font-medium text-gray-600 dark:text-white/60">Coming soon</p>
-              <p className="mt-1 text-xs text-gray-400 dark:text-white/35">Learning insights will appear here.</p>
-            </div>
-          )}
         </nav>
         {onImportJournalDumpFolder && (
           <div className="border-t border-white/10 p-2">
@@ -893,29 +884,52 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 e.target.value = "";
               }}
             />
-            <div className="flex gap-2">
+            <div className="relative w-full" ref={journalImportMenuRef}>
               <button
                 type="button"
-                className={journalDumpBtnClass}
-                onClick={openJournalDumpFolderPicker}
-                title="Import a folder of .md/.txt files; filing dates are inferred from each path/name on the server (OpenRouter)"
+                className={`${journalDumpBtnClass} inline-flex items-center justify-center gap-1.5`}
+                onClick={() => setJournalImportOpen((o) => !o)}
+                aria-expanded={journalImportOpen}
+                aria-haspopup="menu"
+                title="Import .md/.txt journals from a folder or pick one or more files; filing dates from path/name (API)"
               >
-                Journal dump upload
+                Import journals
+                <span className="text-white/50" aria-hidden>
+                  {journalImportOpen ? "▴" : "▾"}
+                </span>
               </button>
-              <button
-                type="button"
-                className={journalDumpBtnClass}
-                onClick={openJournalDumpFilesPicker}
-                title="Pick one or more .md/.txt files; filing date is inferred from each path/name on the server (OpenRouter), not from file contents"
-              >
-                Individual journal(s)
-              </button>
+              {journalImportOpen && (
+                <div
+                  className="absolute bottom-full left-0 right-0 z-30 mb-1 overflow-hidden rounded-xl border border-white/15 bg-[#1e1e2e] py-1 shadow-lg dark:bg-[#252530]"
+                  role="menu"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="block w-full px-3 py-2.5 text-left text-xs font-medium text-white/90 transition-colors hover:bg-white/10"
+                    onClick={() => {
+                      setJournalImportOpen(false);
+                      openJournalDumpFolderPicker();
+                    }}
+                  >
+                    Choose folder…
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="block w-full px-3 py-2.5 text-left text-xs font-medium text-white/90 transition-colors hover:bg-white/10"
+                    onClick={() => {
+                      setJournalImportOpen(false);
+                      openJournalDumpFilesPicker();
+                    }}
+                  >
+                    Choose files…
+                  </button>
+                </div>
+              )}
             </div>
             {onStartFresh && (
-              <div className="mt-3 rounded-xl border border-red-200/90 bg-red-50/80 p-3 dark:border-red-400/25 dark:bg-red-950/30">
-                <p className="mb-2 text-[0.6rem] font-semibold uppercase tracking-[0.15em] text-red-800/80 dark:text-red-300/90">
-                  Testing
-                </p>
+              <div className="mt-3 rounded-xl border border-red-200/90 bg-red-50/80 p-2 dark:border-red-400/25 dark:bg-red-950/30">
                 <button
                   type="button"
                   onClick={() => void onStartFresh()}
@@ -923,10 +937,6 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 >
                   Start fresh
                 </button>
-                <p className="mt-2 text-[0.65rem] leading-snug text-red-900/70 dark:text-red-200/65">
-                  Wipes the server database for this instance and clears local storage (journals, library, recommendations) plus the home chat workspace.
-                  Use between test runs; cannot be undone.
-                </p>
               </div>
             )}
           </div>
@@ -1421,22 +1431,6 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
               </div>
             </div>
           </div>
-        ) : explorerTab === "learning" ? (
-          <div className="flex flex-1 items-center justify-center p-6 min-h-[200px]">
-            <div className="w-full max-w-md rounded-2xl border-2 border-dashed border-gray-200 bg-gray-50 px-8 py-14 text-center dark:border-gray-600 dark:bg-[#343541]">
-              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-gray-100 dark:bg-white/10">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-gray-400 dark:text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" />
-                </svg>
-              </div>
-              <h3 className="mb-2 text-sm font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-300">
-                Learning — coming soon
-              </h3>
-              <p className="text-sm leading-relaxed text-gray-500 dark:text-gray-400">
-                This section will surface insights, patterns, and growth themes extracted from your journals and AI-assisted reflections.
-              </p>
-            </div>
-          </div>
         ) : !hasAnyContent ? (
           <div className="flex flex-1 min-h-0 flex-col m-3 md:m-4 overflow-hidden rounded-2xl border border-gray-100 bg-white shadow-sm dark:border-gray-700 dark:bg-[#2f2f2f]">
             {onImportKnowledgeBaseFile && (
@@ -1482,9 +1476,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 </h3>
                 <p className="mb-6 text-sm leading-relaxed text-gray-500 dark:text-gray-400">
                   Import a Markdown <strong className="font-medium text-gray-700 dark:text-gray-300">.zip</strong> to load manual journals,
-                  AI-assisted journals, and library items. Or use <strong className="font-medium text-gray-700 dark:text-gray-300">Journal dump upload</strong>{" "}
-                  or <strong className="font-medium text-gray-700 dark:text-gray-300">Individual journal(s)</strong> in the sidebar — a folder or
-                  separate <code className="rounded bg-gray-200/80 px-1 text-xs dark:bg-black/30">.md</code> files (filing dates from path/name via the API).
+                  AI-assisted journals, and library items. Or use <strong className="font-medium text-gray-700 dark:text-gray-300">Import journals</strong>{" "}
+                  in the sidebar — a folder or one or more <code className="rounded bg-gray-200/80 px-1 text-xs dark:bg-black/30">.md</code> files (filing dates from path/name via the API).
                   New entries from AI-Assisted Journal Mode appear here after you save.
                 </p>
                 {onImportKnowledgeBaseFile ? (

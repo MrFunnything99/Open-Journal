@@ -3,10 +3,18 @@ import { backendFetch } from "../../../backendApi";
 import { CHAT_INTERACTION_MODE_META } from "../chatInteractionModes";
 import type { ChatMessage } from "../hooks/useJournalHistory";
 import { useVoiceSession } from "../hooks/useVoiceSession";
+import type { PersonaplexChatMessage } from "../PersonaplexChatContext";
 import { personaplexChatToJournalTranscript, usePersonaplexChat } from "../PersonaplexChatContext";
-import { blobToBase64, blobToWavBase64 } from "../utils/audioToWav";
+import { blobToBase64, micBlobToTranscriptionPayload } from "../utils/audioToWav";
+import {
+  attachDictationLevelMonitor,
+  DICTATION_MIC_CONSTRAINTS,
+  shouldDiscardDictationRecording,
+  type DictationLevelMonitor,
+} from "../utils/dictationRecordingMonitor";
+import { transcriptLikelyEchoesAssistantText } from "../utils/transcriptionEchoGuard";
 import { AskAnythingComposer, LiveDictationBubble } from "./GlobalAskAnythingBar";
-import { playChatReadAloud } from "../utils/chatReadAloud";
+import { playChatReadAloud, stopReadAloudAndCooldown } from "../utils/chatReadAloud";
 import { VoiceSessionPanel } from "./VoiceSessionPanel";
 
 type Props = {
@@ -92,6 +100,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     resetAssistedWorkspace,
     idPrefix: chatComposerIdPrefix,
   } = usePersonaplexChat();
+  const messagesRef = useRef<PersonaplexChatMessage[]>(messages);
+  messagesRef.current = messages;
   const idPrefix = useId();
   const [journalMicPhase, setJournalMicPhase] = useState<"idle" | "recording" | "processing">("idle");
   const [error, setError] = useState<string | null>(null);
@@ -125,6 +135,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const journalVoiceInsertPosRef = useRef<number | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const dictationMonitorRef = useRef<DictationLevelMonitor | null>(null);
+  const recordStartRef = useRef(0);
 
   // --- Voice conversation mode ---
   const voiceSession = useVoiceSession({
@@ -182,10 +194,12 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   }, [journalMessages, gettingFeedback]);
 
   useEffect(() => {
-    if (chatInteractionMode === "learning") {
-      setChatInteractionMode("journal");
+    if (chatInteractionMode === "journal" && !journalEntryDate && !journalEntryTime) {
+      const now = new Date();
+      setJournalEntryDate(toDateInputValue(now));
+      setJournalEntryTime(toTimeInputValue(now));
     }
-  }, [chatInteractionMode, setChatInteractionMode]);
+  }, [chatInteractionMode, journalEntryDate, journalEntryTime]);
 
   const handoffAssistedToJournal = useCallback(() => {
     if (chatInteractionMode !== "autobiography" || sending || messages.length === 0) return;
@@ -302,9 +316,10 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
         filename = (blob as File).name;
         mimeType = blob.type || "audio/mpeg";
       } else {
-        b64 = await blobToWavBase64(blob);
-        filename = "dictation.wav";
-        mimeType = "audio/wav";
+        const mic = await micBlobToTranscriptionPayload(blob);
+        b64 = mic.b64;
+        filename = mic.filename;
+        mimeType = mic.mimeType;
       }
       const isJournal = chatInteractionMode === "journal";
       const res = await backendFetch("/voice-memo", {
@@ -334,32 +349,43 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       if (line) {
         const capturedAt = new Date();
         const rawBody = ((data.raw_transcript ?? "").trim() || line).trim();
-        // Manual Journal Mode: show raw transcript only; polish via "AI Spelling Correction/Reformatting".
-        const reviewBody = !isJournal && data.cleaned_transcript?.trim()
-          ? data.cleaned_transcript.trim()
-          : rawBody;
-
-        if (isJournal) {
-          const pos = journalVoiceInsertPosRef.current;
-          journalVoiceInsertPosRef.current = null;
-          setReviewText((prev) => {
-            const next = insertTranscriptSegment(prev, reviewBody, pos ?? undefined);
-            setRawTranscript(next);
-            return next;
-          });
+        const lastAsst = [...messagesRef.current].reverse().find((m) => m.role === "assistant");
+        if (
+          lastAsst?.content &&
+          (transcriptLikelyEchoesAssistantText(line, lastAsst.content) ||
+            transcriptLikelyEchoesAssistantText(rawBody, lastAsst.content))
+        ) {
+          onToast(
+            "Transcription matched the assistant's last reply instead of your voice — try again with speakers lower or after read-aloud stops."
+          );
         } else {
-          setRawTranscript(rawBody);
-          setReviewText(reviewBody);
+          // Manual Journal Mode: show raw transcript only; polish via "AI Spelling Correction/Reformatting".
+          const reviewBody = !isJournal && data.cleaned_transcript?.trim()
+            ? data.cleaned_transcript.trim()
+            : rawBody;
+
+          if (isJournal) {
+            const pos = journalVoiceInsertPosRef.current;
+            journalVoiceInsertPosRef.current = null;
+            setReviewText((prev) => {
+              const next = insertTranscriptSegment(prev, reviewBody, pos ?? undefined);
+              setRawTranscript(next);
+              return next;
+            });
+          } else {
+            setRawTranscript(rawBody);
+            setReviewText(reviewBody);
+          }
+          if (!journalEntryDate) setJournalEntryDate(toDateInputValue(capturedAt));
+          if (!journalEntryTime) setJournalEntryTime(toTimeInputValue(capturedAt));
         }
-        if (!journalEntryDate) setJournalEntryDate(toDateInputValue(capturedAt));
-        if (!journalEntryTime) setJournalEntryTime(toTimeInputValue(capturedAt));
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Transcription failed");
     } finally {
       setJournalMicPhase("idle");
     }
-  }, [chatInteractionMode, journalEntryDate, journalEntryTime]);
+  }, [chatInteractionMode, journalEntryDate, journalEntryTime, onToast]);
 
   useEffect(() => {
     if (journalFileToProcess && chatInteractionMode === "journal") {
@@ -516,11 +542,12 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const startRecording = useCallback(async () => {
     if (journalMicPhase !== "idle" || sending) return;
     setError(null);
+    await stopReadAloudAndCooldown();
     if (chatInteractionMode === "journal") {
       captureJournalVoiceInsertPosition();
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: DICTATION_MIC_CONSTRAINTS });
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : MediaRecorder.isTypeSupported("audio/webm")
@@ -536,9 +563,20 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
         const mime = effectiveRecorderMime(mr);
         const blob = new Blob(chunksRef.current, { type: mime });
         mediaRecorderRef.current = null;
+        const mon = dictationMonitorRef.current;
+        dictationMonitorRef.current = null;
+        const peakRms = mon ? mon.getMaxRms() : 1;
+        mon?.stop();
+        const elapsed = Date.now() - recordStartRef.current;
+        if (shouldDiscardDictationRecording(elapsed, peakRms)) {
+          setJournalMicPhase("idle");
+          return;
+        }
         void processMicAudio(blob);
       };
       mr.start();
+      recordStartRef.current = Date.now();
+      dictationMonitorRef.current = attachDictationLevelMonitor(stream);
       mediaRecorderRef.current = mr;
       setJournalMicPhase("recording");
     } catch (e) {
@@ -550,7 +588,11 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const stopRecording = useCallback(() => {
     const mr = mediaRecorderRef.current;
     if (mr && mr.state !== "inactive") mr.stop();
-    else setJournalMicPhase("idle");
+    else {
+      dictationMonitorRef.current?.stop();
+      dictationMonitorRef.current = null;
+      setJournalMicPhase("idle");
+    }
   }, []);
 
   const onPickFile = useCallback(

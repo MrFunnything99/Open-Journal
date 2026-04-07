@@ -112,6 +112,25 @@ export type AskAnythingLayout = "dock" | "rail" | "center";
 
 function ComposerChatModelSelect({ idPrefix, embedded }: { idPrefix: string; embedded?: boolean }) {
   const { userChatModel, setUserChatModel, composerDisabled } = usePersonaplexChat();
+  if (embedded) {
+    return (
+      <select
+        id={`${idPrefix}-chat-model`}
+        aria-label="Chat model"
+        value={userChatModel}
+        onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
+        disabled={composerDisabled}
+        title="Model for replies (retrieval + tools use this model)"
+        className="min-w-0 flex-1 rounded-lg border border-white/12 bg-black/40 px-2.5 py-1.5 text-[0.7rem] text-white focus:border-white/25 focus:outline-none focus:ring-1 focus:ring-white/15 disabled:opacity-50 sm:max-w-[16rem] sm:flex-none sm:text-xs"
+      >
+        {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    );
+  }
   return (
     <select
       id={`${idPrefix}-chat-model`}
@@ -120,18 +139,38 @@ function ComposerChatModelSelect({ idPrefix, embedded }: { idPrefix: string; emb
       onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
       disabled={composerDisabled}
       title="Model for replies (retrieval + tools use this model)"
-      className={
-        embedded
-          ? "min-w-0 flex-1 rounded-lg border border-white/12 bg-black/40 px-2.5 py-1.5 text-[0.7rem] text-white focus:border-white/25 focus:outline-none focus:ring-1 focus:ring-white/15 disabled:opacity-50 sm:max-w-[16rem] sm:flex-none sm:text-xs"
-          : "max-w-[10rem] shrink-0 rounded-full border border-white/15 bg-black/35 px-2 py-1 text-[0.65rem] text-white focus:border-white/30 focus:outline-none disabled:opacity-50 sm:max-w-[11rem] sm:text-xs"
-      }
+      className="appearance-none rounded-full border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[0.65rem] font-medium text-white/55 backdrop-blur-sm transition-colors hover:bg-white/[0.07] hover:text-white/70 focus:border-white/20 focus:outline-none focus:ring-1 focus:ring-white/10 disabled:opacity-40"
+      style={{ backgroundImage: "none" }}
     >
       {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
         <option key={o.id} value={o.id}>
-          {o.label}
+          {o.label} ▾
         </option>
       ))}
     </select>
+  );
+}
+
+function ModelChipAboveComposer({ idPrefix }: { idPrefix: string }) {
+  const { userChatModel, setUserChatModel, composerDisabled } = usePersonaplexChat();
+  return (
+    <div className="mb-1 flex items-center">
+      <select
+        id={`${idPrefix}-chat-model-above`}
+        aria-label="Chat model"
+        value={userChatModel}
+        onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
+        disabled={composerDisabled}
+        title="Model for replies"
+        className="cursor-pointer appearance-none rounded-full border border-white/[0.06] bg-transparent px-2 py-[2px] text-[0.6rem] font-medium text-white/40 transition-colors hover:border-white/12 hover:text-white/55 focus:border-white/15 focus:outline-none disabled:opacity-40"
+      >
+        {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </div>
   );
 }
 
@@ -334,20 +373,6 @@ export function AskAnythingComposer({
 
   const showModelFooter = chatInteractionMode === "autobiography";
 
-  const shellOuterClass =
-    layout === "dock"
-      ? "glass-panel flex w-full flex-col overflow-hidden rounded-[1.75rem] shadow-[0_-4px_32px_rgba(0,0,0,0.35)] transition-shadow"
-      : layout === "center"
-        ? "glass-panel mx-auto flex w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/12 shadow-[0_8px_32px_rgba(0,0,0,0.28)] transition-shadow"
-        : "glass-panel flex w-full flex-col overflow-hidden rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.25)] transition-shadow";
-
-  const shellRowClass =
-    layout === "dock"
-      ? "flex items-center gap-1 pl-3 pr-2 py-1.5 md:gap-2 md:pl-4 md:py-2"
-      : layout === "center"
-        ? "flex items-center gap-1 px-3 py-2 md:gap-2 md:px-4 md:py-2.5"
-        : "flex w-full items-center gap-1 px-2 py-1.5";
-
   if (layout === "rail" && railNarrow) {
     return (
       <div className="flex w-full flex-col gap-1.5 border-t border-white/10 px-0.5 py-2">
@@ -454,180 +479,165 @@ export function AskAnythingComposer({
 
   const plusPlacement: PlusPlacement = layout === "dock" ? "above" : "below";
 
+  const isRail = layout === "rail";
+  const iconSize = isRail ? "h-[18px] w-[18px]" : "h-5 w-5";
+  const btnSize = isRail ? "h-9 w-9" : "h-10 w-10";
+  const canSend = !sending && micPhase === "idle" && (!!draft.trim() || !!pendingAudioFile);
+  const showVoice = assistedJournalMinimal && chatInteractionMode === "autobiography" && !!onStartVoiceSession && micPhase === "idle";
+
   return (
-    <div className="flex flex-col">
+    <div className={`flex flex-col ${layout === "center" ? "mx-auto w-full max-w-2xl" : "w-full"}`}>
+      {/* Model selector — ghost chip above the bar */}
+      {showModelFooter && <ModelChipAboveComposer idPrefix={idPrefix} />}
+
+      {/* Pending audio attachment */}
       {pendingAudioFile && (
-        <div className="flex items-center gap-2 rounded-t-2xl border border-b-0 border-white/10 bg-white/[0.04] px-3 py-2">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0 text-white/60" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <div className="mb-1 flex items-center gap-2 rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-1.5">
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0 text-white/50" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
           </svg>
-          <span className="min-w-0 flex-1 truncate text-xs text-white/80">{pendingAudioFile.name}</span>
-          <button
-            type="button"
-            onClick={clearPendingAudioFile}
-            className="shrink-0 rounded p-0.5 text-white/50 hover:bg-white/10 hover:text-white/90"
-            aria-label="Remove audio file"
-            title="Remove"
-          >
+          <span className="min-w-0 flex-1 truncate text-[0.7rem] text-white/70">{pendingAudioFile.name}</span>
+          <button type="button" onClick={clearPendingAudioFile} className="shrink-0 rounded p-0.5 text-white/40 hover:bg-white/10 hover:text-white/80" aria-label="Remove audio file" title="Remove">
             <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
         </div>
       )}
+
+      {/* Single flat container — no nested backgrounds */}
       <div
         className={
-          shellOuterClass +
+          "flex items-center rounded-2xl border border-white/[0.07] bg-[rgba(15,20,30,0.45)] backdrop-blur-[20px] transition-shadow" +
           (micPhase === "recording" ? " ring-2 ring-red-400/50" : "") +
-          (pendingAudioFile ? " rounded-t-none border-t-0" : "")
+          (isRail ? " min-h-[48px]" : " min-h-[56px]")
         }
       >
-      <div className={shellRowClass}>
-      <input
-        ref={fileInputRef as React.LegacyRef<HTMLInputElement>}
-        type="file"
-        accept="audio/*,.mp3,.m4a,.wav,.webm,.ogg,.flac"
-        className="hidden"
-        onChange={onPickFile}
-      />
-      {!assistedJournalMinimal ? (
-        <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
-          <div className="relative shrink-0" ref={plusWrapRef}>
+        <input ref={fileInputRef as React.LegacyRef<HTMLInputElement>} type="file" accept="audio/*,.mp3,.m4a,.wav,.webm,.ogg,.flac" className="hidden" onChange={onPickFile} />
+
+        {/* + button (non-assisted mode only) */}
+        {!assistedJournalMinimal && (
+          <div className="flex shrink-0 items-center pl-2.5">
+            <div className="relative shrink-0" ref={plusWrapRef}>
+              <button
+                type="button"
+                onClick={() => setPlusOpen((o) => !o)}
+                disabled={composerDisabled}
+                className={`flex shrink-0 items-center justify-center rounded-full text-white/60 outline-none hover:bg-white/[0.08] hover:text-white/85 disabled:opacity-40 ${btnSize}`}
+                aria-label="Modes and attachments"
+                aria-expanded={plusOpen}
+                title="Modes and attachments"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className={iconSize} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                </svg>
+              </button>
+              <PlusOptionsMenu
+                open={plusOpen}
+                onClose={() => setPlusOpen(false)}
+                placement={plusPlacement}
+                anchorRef={plusWrapRef}
+                menuContainerRef={plusMenuRef}
+                fileInputRef={fileInputRef}
+                composerDisabled={composerDisabled}
+                mode={chatInteractionMode}
+                setMode={setChatInteractionMode}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Textarea — seamless, no inner border */}
+        <textarea
+          id={`${idPrefix}-global-composer`}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void sendChat();
+            }
+          }}
+          disabled={composerDisabled}
+          rows={isRail ? 2 : 1}
+          placeholder={
+            pendingAudioFile
+              ? "Add a message or press send to transcribe"
+              : "What's on your mind..."
+          }
+          className={`max-h-36 min-w-0 flex-1 resize-none border-0 bg-transparent text-[0.95rem] text-white placeholder:text-white/30 focus:outline-none focus:ring-0 disabled:opacity-50 ${
+            isRail
+              ? "min-h-[44px] py-3 pl-3 pr-1 text-[0.9rem] leading-snug"
+              : `min-h-[56px] py-[18px] pr-1 ${assistedJournalMinimal ? "pl-5" : "pl-1"}`
+          }`}
+        />
+
+        {/* Right-side action buttons — flat, no nested container */}
+        <div className="flex shrink-0 items-center pr-3">
+          {micPhase === "recording" ? (
             <button
               type="button"
-              onClick={() => setPlusOpen((o) => !o)}
-              disabled={composerDisabled}
-              className={`flex shrink-0 items-center justify-center rounded-full text-white/90 outline-none hover:bg-white/10 disabled:opacity-40 ${
-                layout === "rail" ? "h-9 w-9" : "h-11 w-11"
-              }`}
-              aria-label="Modes and attachments"
-              aria-expanded={plusOpen}
-              title="Modes and attachments"
+              onClick={stopRecording}
+              className={`flex shrink-0 items-center justify-center rounded-full bg-red-500 text-white ${btnSize}`}
+              aria-label="Stop recording"
+              title="Stop recording"
             >
-              <svg xmlns="http://www.w3.org/2000/svg" className={layout === "rail" ? "h-5 w-5" : "h-6 w-6"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+              <span className="h-2.5 w-2.5 rounded-full bg-white animate-pulse" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void startRecording()}
+              disabled={composerDisabled}
+              className={`flex shrink-0 items-center justify-center rounded-full text-white/55 transition-colors hover:bg-white/[0.07] hover:text-white/85 disabled:opacity-40 ${btnSize}`}
+              aria-label="Transcribe"
+              title="Transcribe"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className={iconSize} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
               </svg>
             </button>
-            <PlusOptionsMenu
-              open={plusOpen}
-              onClose={() => setPlusOpen(false)}
-              placement={plusPlacement}
-              anchorRef={plusWrapRef}
-              menuContainerRef={plusMenuRef}
-              fileInputRef={fileInputRef}
-              composerDisabled={composerDisabled}
-              mode={chatInteractionMode}
-              setMode={setChatInteractionMode}
-            />
-          </div>
-          <ComposerModeChip
-            mode={chatInteractionMode}
-            compact={layout === "rail"}
-            onOpen={() => setPlusOpen(true)}
-            disabled={composerDisabled}
-          />
+          )}
+
+          {showVoice && (
+            <button
+              type="button"
+              onClick={onStartVoiceSession}
+              disabled={composerDisabled}
+              className={`flex shrink-0 items-center justify-center rounded-full text-white/55 transition-colors hover:bg-white/[0.07] hover:text-white/85 disabled:opacity-40 ${btnSize}`}
+              aria-label="Voice conversation"
+              title="Voice to voice"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className={iconSize} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+                <line x1="2" y1="12" x2="2" y2="12" />
+                <line x1="6" y1="8" x2="6" y2="16" />
+                <line x1="10" y1="4" x2="10" y2="20" />
+                <line x1="14" y1="8" x2="14" y2="16" />
+                <line x1="18" y1="6" x2="18" y2="18" />
+                <line x1="22" y1="10" x2="22" y2="14" />
+              </svg>
+            </button>
+          )}
+
+          {/* Divider between voice buttons and send */}
+          <div className="mx-1 h-5 w-px bg-white/[0.08]" aria-hidden />
+
+          {/* Send button */}
+          <button
+            type="button"
+            onClick={() => void sendChat()}
+            disabled={!canSend}
+            className={`flex shrink-0 items-center justify-center rounded-full transition-all ${btnSize} ${
+              canSend
+                ? "bg-[#10a37f] text-white shadow-sm shadow-[#10a37f]/20 hover:bg-[#0d8c6e]"
+                : "text-white/20"
+            }`}
+            aria-label="Send message"
+            title="Send"
+          >
+            <SendIcon className={isRail ? "h-4 w-4" : "h-[18px] w-[18px]"} />
+          </button>
         </div>
-      ) : null}
-
-      <textarea
-        id={`${idPrefix}-global-composer`}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            void sendChat();
-          }
-        }}
-        disabled={composerDisabled}
-        rows={layout === "rail" ? 2 : 1}
-        placeholder={
-          pendingAudioFile
-            ? "Add a message or press send to transcribe"
-            : chatInteractionMode === "autobiography"
-              ? "Chat for AI-assisted journaling…"
-              : "Write in your manual journal…"
-        }
-        className={`max-h-36 min-w-0 flex-1 resize-none border-0 bg-transparent text-[0.95rem] text-white placeholder:text-white/45 focus:outline-none focus:ring-0 disabled:opacity-50 ${
-          layout === "rail" ? "min-h-[44px] py-2 text-[0.9rem] leading-snug" : "min-h-[48px] py-3"
-        }`}
-      />
-
-      {micPhase === "recording" ? (
-        <button
-          type="button"
-          onClick={stopRecording}
-          className={`flex shrink-0 items-center justify-center rounded-full bg-red-500 text-white ${layout === "rail" ? "h-9 w-9" : "h-11 w-11"}`}
-          aria-label="Stop recording"
-        >
-          <span className="h-2.5 w-2.5 rounded-full bg-white animate-pulse" />
-        </button>
-      ) : (
-        <button
-          type="button"
-          onClick={() => void startRecording()}
-          disabled={composerDisabled}
-          className={`flex shrink-0 items-center justify-center rounded-full text-white/90 hover:bg-white/10 disabled:opacity-40 ${
-            layout === "rail" ? "h-9 w-9" : "h-11 w-11"
-          }`}
-          aria-label="Dictate"
-          title="Dictate"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" className={layout === "rail" ? "h-5 w-5" : "h-6 w-6"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-            />
-          </svg>
-        </button>
-      )}
-
-      {/* Voice conversation mode (autobiography + assistedJournalMinimal only) */}
-      {assistedJournalMinimal && chatInteractionMode === "autobiography" && onStartVoiceSession && micPhase === "idle" && (
-        <button
-          type="button"
-          onClick={onStartVoiceSession}
-          disabled={composerDisabled}
-          className={`flex shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500/20 to-emerald-500/20 text-white/90 ring-1 ring-white/15 transition hover:from-indigo-500/30 hover:to-emerald-500/30 hover:ring-white/25 disabled:opacity-40 ${
-            layout === "rail" ? "h-9 w-9" : "h-11 w-11"
-          }`}
-          aria-label="Start voice conversation"
-          title="Voice conversation"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" className={layout === "rail" ? "h-5 w-5" : "h-[1.35rem] w-[1.35rem]"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072M17.95 6.05a8 8 0 010 11.9M6.5 8H4a1 1 0 00-1 1v6a1 1 0 001 1h2.5l4.5 4V4l-4.5 4z" />
-          </svg>
-        </button>
-      )}
-
-      <button
-        type="button"
-        onClick={() => void sendChat()}
-        disabled={sending || micPhase !== "idle" || (!draft.trim() && !pendingAudioFile)}
-        className={`flex shrink-0 items-center justify-center rounded-full bg-white text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-40 ${
-          layout === "rail" ? "h-9 w-9" : "h-11 w-11"
-        }`}
-        aria-label="Send message"
-        title="Send"
-      >
-        <SendIcon className={layout === "rail" ? "h-4 w-4" : "h-5 w-5"} />
-      </button>
-      </div>
-      {showModelFooter && (
-        <div
-          className={
-            layout === "center"
-              ? "flex items-center gap-2 border-t border-white/10 bg-black/20 px-3 py-1.5 md:px-4"
-              : layout === "rail"
-                ? "flex items-center gap-2 border-t border-white/10 bg-black/20 px-2 py-1.5"
-                : "flex items-center gap-2 border-t border-white/10 bg-black/25 px-3 py-1.5 md:px-4"
-          }
-        >
-          <span className="shrink-0 text-[0.6rem] font-semibold uppercase tracking-[0.14em] text-white/40">Model</span>
-          <ComposerChatModelSelect idPrefix={idPrefix} embedded />
-        </div>
-      )}
       </div>
     </div>
   );

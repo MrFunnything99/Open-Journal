@@ -53,8 +53,8 @@ export const AboutTab: FC = () => {
             Purpose
           </h2>
           <p className="text-[0.95rem] leading-relaxed text-white/80">
-            Placeholder for mission and intent: why Selfmeridian exists, who it is for, and how reflective journaling,
-            learning, and memory-assisted chat fit together in one workspace.
+            Placeholder for mission and intent: why Selfmeridian exists, who it is for, and how reflective journaling
+            and memory-assisted chat fit together in one workspace.
           </p>
           <p className="text-[0.95rem] leading-relaxed text-white/80">
             Replace this with your product story, values, and any acknowledgements or open-source credits you want to

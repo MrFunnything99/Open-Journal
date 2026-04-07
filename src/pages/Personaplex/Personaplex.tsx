@@ -10,7 +10,7 @@ import {
 } from "./knowledgeBaseMarkdownZip";
 import { BrainLayout, type BrainLibraryCategory } from "./components/BrainLayout";
 import { VoiceMemoTab } from "./components/VoiceMemoTab";
-import { LearningTab } from "./components/LearningTab";
+
 import { BrainCalendarPanel } from "./components/BrainCalendarPanel";
 import { PersonaplexChatProvider, type PersonaplexNavigateAction } from "./PersonaplexChatContext";
 import { MobileAskComposerDockGate } from "./components/GlobalAskAnythingBar";
@@ -930,7 +930,7 @@ export const Personaplex = () => {
             view === "brain" ||
               view === "voice_memo" ||
               view === "recommendations" ||
-              view === "learning" ||
+              
               view === "about"
               ? "overflow-hidden"
               : "overflow-y-auto"
@@ -1538,7 +1538,6 @@ export const Personaplex = () => {
               )}
             </div>
           )}
-          {view === "learning" && <LearningTab onToast={chatToast} />}
           {view === "about" && <AboutTab />}
         </div>
       </main>
