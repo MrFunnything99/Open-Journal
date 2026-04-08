@@ -321,7 +321,9 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
         filename = mic.filename;
         mimeType = mic.mimeType;
       }
-      const isJournal = chatInteractionMode === "journal";
+      // This callback is only used from Manual Journal (record, attach, file handoff). Always request
+      // transcribe-only on the server — never voice-memo polish — so the editor stays raw STT until
+      // the user explicitly runs spelling/reformat or feedback.
       const res = await backendFetch("/voice-memo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -329,7 +331,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
           audio: b64,
           filename,
           mime_type: mimeType,
-          journal_mode: isJournal,
+          journal_mode: true,
         }),
       });
       const data = (await res.json().catch(() => ({}))) as {
@@ -345,37 +347,28 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
           typeof d === "string" ? d : typeof data.error === "string" ? data.error : `Request failed (${res.status})`;
         throw new Error(msg);
       }
-      const line = (data.polished_text ?? data.raw_transcript ?? "").trim();
-      if (line) {
+      const rawBody = (
+        (data.raw_transcript ?? "").trim() ||
+        (data.polished_text ?? "").trim()
+      ).trim();
+      if (rawBody) {
         const capturedAt = new Date();
-        const rawBody = ((data.raw_transcript ?? "").trim() || line).trim();
         const lastAsst = [...messagesRef.current].reverse().find((m) => m.role === "assistant");
         if (
           lastAsst?.content &&
-          (transcriptLikelyEchoesAssistantText(line, lastAsst.content) ||
-            transcriptLikelyEchoesAssistantText(rawBody, lastAsst.content))
+          transcriptLikelyEchoesAssistantText(rawBody, lastAsst.content)
         ) {
           onToast(
             "Transcription matched the assistant's last reply instead of your voice — try again with speakers lower or after read-aloud stops."
           );
         } else {
-          // Manual Journal Mode: show raw transcript only; polish via "AI Spelling Correction/Reformatting".
-          const reviewBody = !isJournal && data.cleaned_transcript?.trim()
-            ? data.cleaned_transcript.trim()
-            : rawBody;
-
-          if (isJournal) {
-            const pos = journalVoiceInsertPosRef.current;
-            journalVoiceInsertPosRef.current = null;
-            setReviewText((prev) => {
-              const next = insertTranscriptSegment(prev, reviewBody, pos ?? undefined);
-              setRawTranscript(next);
-              return next;
-            });
-          } else {
-            setRawTranscript(rawBody);
-            setReviewText(reviewBody);
-          }
+          const pos = journalVoiceInsertPosRef.current;
+          journalVoiceInsertPosRef.current = null;
+          setReviewText((prev) => {
+            const next = insertTranscriptSegment(prev, rawBody, pos ?? undefined);
+            setRawTranscript(next);
+            return next;
+          });
           if (!journalEntryDate) setJournalEntryDate(toDateInputValue(capturedAt));
           if (!journalEntryTime) setJournalEntryTime(toTimeInputValue(capturedAt));
         }
@@ -385,7 +378,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     } finally {
       setJournalMicPhase("idle");
     }
-  }, [chatInteractionMode, journalEntryDate, journalEntryTime, onToast]);
+  }, [journalEntryDate, journalEntryTime, onToast]);
 
   useEffect(() => {
     if (journalFileToProcess && chatInteractionMode === "journal") {

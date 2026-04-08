@@ -22,7 +22,6 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
 from library import (
-    get_assisted_journal_continuity_block,
     get_relevant_context_dual,
     ingest_journal_entry,
 )
@@ -148,6 +147,21 @@ NAVIGATE_UI_TOOL = {
 _CHAT_TOOLS = [
     NAVIGATE_UI_TOOL,
 ]
+
+_ASSISTED_JOURNAL_PROMPT = (
+    "You are a journaling companion in an app called Open Journal. "
+    "The user is here to think out loud. Your job is to help them reflect — "
+    "ask questions that fit the moment, follow their energy, and help them go deeper than they would alone.\n\n"
+    "The current time is {local_time}.\n\n"
+    "Three kinds of questions to draw from as fits the thread (do not use canned lines or a fixed rotation; "
+    "phrase everything in your own words each time):\n"
+    "- EMOTIONAL: surface feeling-tone, texture, and inner experience around what they shared.\n"
+    "- DYNAMIC: stay with the lived beat — the doing, the moment-to-moment of an event or interaction, not only the summary.\n"
+    "- CONTEXT BUILDING: widen the frame — how something fits in time, habit, history, or background so the picture has depth.\n\n"
+    "Keep it short. Keep it natural. One question at a time. "
+    "No advice, no clinical language, no summaries of what they just said. "
+    "Just good questions and the occasional honest observation."
+)
 
 
 def _messages_to_openai_dicts(messages: list[BaseMessage]) -> list[dict]:
@@ -309,54 +323,6 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
-def _assisted_journal_inspiration_intent(text: str) -> bool:
-    """User wants the model to scan journals and suggest concrete memory threads."""
-    t = (text or "").lower()
-    needles = (
-        "inspiration",
-        "inspire me",
-        "look at my journal",
-        "look through my journal",
-        "check my journal",
-        "my journals",
-        "from my journal",
-        "scan my",
-        "pull from my",
-        "you pick",
-        "you choose",
-        "surprise me",
-        "pick a memory",
-        "suggest something",
-        "ideas from",
-        "what from my past",
-        "what stands out",
-        "see what's in",
-        "for some inspiration",
-        "journal inspiration",
-        "ideas from my life",
-        "past memories",
-        "my memories",
-        "our memories",
-        "you can look",
-        "go ahead and look",
-        "look them up",
-        "use my entries",
-        "knowledge base",
-        "knowledgebase",
-        "my brain",
-        "the brain",
-        "in my brain",
-        "brain hub",
-        "saved in the app",
-        "what i saved",
-        "what i've saved",
-        "look at everything",
-        "everything i wrote",
-        "selfmeridian",
-    )
-    return any(n in t for n in needles)
-
-
 def interviewer_node(state: JournalState) -> JournalState:
     """
     Respond with empathy. When personalization > 0, retrieve relevant context from
@@ -374,47 +340,21 @@ def interviewer_node(state: JournalState) -> JournalState:
     if _client_tc:
         date_context = f"{date_context} (server UTC calendar day). {_client_tc}"
     mode_raw = (state.get("mode") or "").strip().lower()
-    _kb_intro = ""
+    retrieval_log: str | None = None
+
     if mode_raw == "autobiography":
-        _kb_intro = (
-            "Assisted Journal — your view of their knowledge base: Anything below titled Continuity anchor, Who This Person Is, or "
-            "Relevant Context is loaded from this user's SelfMeridian knowledge base (saved journal text and Brain memory excerpts). "
-            "If they say knowledge base, Brain, journals, or what I saved, they mean that injected content, not an external system you cannot read. "
-            "When those sections list real excerpts, bullets, or dated lines (not only the bare word \"None.\"), you already have that access. "
-            "Do not say you lack access to their knowledge base in that case.\n\n"
-        )
-    _length_hint = (
-        "Keep replies concise (2-4 sentences). "
-        if mode_raw != "autobiography"
-        else "Keep replies concise (1-2 sentences for openings, 2-4 for follow-ups) except when synthesizing journal inspiration from memory—then follow the Assisted Journal length and prose rules. "
-    )
-    if mode_raw == "autobiography":
-        _memory_personalization = (
-            "At 0%, do not use memory; keep questions general and present-focused only. "
-            "At higher levels, treat Continuity anchor (if present) and Relevant Context as ground truth for prior journal text. "
-            "Memory is intentionally balanced: manual journals and AI-assisted sessions are equally valid; do not treat one as more real. "
-            "Default recency window for openings is yesterday + today; use older memory only when it clearly helps the live thread. "
-            "\n\nRECENCY-FIRST OPENING RULE (critical for first replies / check-in openers like 'hey', 'how's it going', 'what should we talk about'):\n"
-            "Priority order — always follow this:\n"
-            "1. Yesterday + today entries first (manual and assisted together) — reference concrete details and current-day reality.\n"
-            "2. Live unresolved thread from the same window — include only if genuinely pickup-able.\n"
-            "3. Older repeated pattern only when user language implies recurrence (again/still/every time) or asks for deeper context.\n\n"
-            "OPENING SHAPE (this is spoken aloud — optimize for natural speech cadence):\n"
-            "- Write 2-4 short sentences, prose only (no bullets, no menu framing).\n"
-            "- Offer 2-3 possible doors naturally inside prose; at least one door must be about RIGHT NOW.\n"
-            "- If there was heavy material recently, acknowledge briefly in one short clause and include an explicit off-ramp door.\n"
-            "- End with ONE real open question.\n"
-            "- Use time-of-day awareness naturally (morning/afternoon/evening) when local time is available.\n"
-            "- Sound like a thoughtful companion who's good at asking the next question, not a therapist, intake form, or assistant.\n\n"
-            "Do NOT invent people, events, or outcomes not clearly supported by Continuity or Relevant Context. "
-            "Banned first-reply openers (always): "
-            "A couple threads seem alive; There are a few themes; What feels most present?; What should we talk about?; How are you?; What's on your mind? "
-            "Do not use clinical labels unless the user explicitly used them first. Avoid defaulting to therapist phrases like 'it sounds like...' or 'I notice that...'. "
-            "If Continuity anchor and Relevant Context are both empty or bare None, use the reflective fallback style from the Assisted Journal section — "
-            "warm, time-aware, psychologically evocative, 1-2 sentences. Never mention missing context.\n"
-            "When the user explicitly requests inspiration, a journal scan, surprise me, you pick, etc., follow the Inspiration Scan rules in the Assisted Journal section for that turn instead. "
-        )
+        _local_time = _client_tc if _client_tc else date_context
+        system_parts = [
+            _ASSISTED_JOURNAL_PROMPT.format(local_time=_local_time),
+            "User-facing formatting (mandatory): The chat surface is plain text. Do not use Markdown in your reply: "
+            "no asterisks for bold, no hash headings, no fenced code blocks. Use normal sentences, commas, and em dashes. "
+            "Prefer emphasis through wording, not formatting.",
+            "Use **navigate_ui** when they explicitly ask to open another main screen (Brain, Chat, Home). "
+            "Never claim you changed data unless the corresponding tool returned ok. "
+            "Do not offer **navigate_ui** for destructive operations. After tool success, reply briefly and warmly.",
+        ]
     else:
+        _length_hint = "Keep replies concise (2-4 sentences). "
         _memory_personalization = (
             "At 0%, do not use memory; keep questions general and present-focused only. "
             "At higher levels, use the memory context only as loose inspiration. Ask BROAD, open-ended questions. "
@@ -423,15 +363,12 @@ def interviewer_node(state: JournalState) -> JournalState:
             "Only reference a specific person, place, or event if it is clearly named in the context; otherwise keep questions broad (e.g. 'How are you feeling about that?' 'What's on your mind today?'). "
             "Do NOT repeat back emotions or themes as facts ('You felt anxious about X') unless the user has just said so; prefer open invitations ('Want to say more about that?' 'What would be helpful to explore?'). "
         )
-    _menu_explore_hint = (
-        "When the user asks what to talk about or what to explore, answer with continuity: reference 1 concrete detail from the LATEST manual journal entry, then ONE short question (under 25 words total). "
-        "No menus. Only if there is truly no journal text, give a brief warm invitation without the banned vague openers. "
-        if mode_raw == "autobiography"
-        else "When the user asks 'what should we talk about?' or 'what should we explore?', you may offer 1–2 broad areas if the memory context clearly suggests them; otherwise keep it open: 'Whatever feels most present—we can go wherever you'd like.' "
-    )
-    system_parts = [
+        _menu_explore_hint = (
+            "When the user asks 'what should we talk about?' or 'what should we explore?', you may offer 1–2 broad areas "
+            "if the memory context clearly suggests them; otherwise keep it open: 'Whatever feels most present—we can go wherever you'd like.' "
+        )
+        system_parts = [
             f"Today's date (use for time perspective): {date_context}. "
-            + _kb_intro
             + "You are a warm, empathetic journaling companion. Listen actively and respond with care. "
             + _length_hint
             + f"Personalization level: {personalization_percent}%. "
@@ -444,170 +381,35 @@ def interviewer_node(state: JournalState) -> JournalState:
             "Use **navigate_ui** when they explicitly ask to open another main screen (Brain, Chat, Home). "
             "Never claim you changed data unless the corresponding tool returned ok. Do not offer **navigate_ui** for destructive operations. "
             "After tool success, reply briefly and warmly. ",
-    ]
+        ]
 
-    retrieval_log: str | None = None
-    inspiration_journal_scan = False
-    if personalization > 0:
+    if personalization > 0 and mode_raw != "autobiography":
         query = _last_user_text(state["messages"])
         if not query and state["messages"]:
             query = str(state["messages"][-1])[:500]
-        if mode_raw == "autobiography" and _assisted_journal_inspiration_intent(query):
-            inspiration_journal_scan = True
-            query = (
-                "Meaningful personal memories, relationships, trips, milestones, achievements, "
-                "warm or proud moments, formative experiences, people and places named in journal entries"
-            )
         instance_id = state.get("instance_id") or ""
-        continuity_block = ""
-        if mode_raw == "autobiography":
-            continuity_block = get_assisted_journal_continuity_block(instance_id)
         try:
-            tg, te = (12, 12) if inspiration_journal_scan else (10, 6)
             processed, raw = get_relevant_context_dual(
                 query,
-                top_k_gist=tg,
-                top_k_episodic=te,
+                top_k_gist=10,
+                top_k_episodic=6,
                 instance_id=instance_id,
                 session_id=state.get("session_id"),
                 log=True,
             )
-            raw_s = (raw or "").strip()
-            if (
-                mode_raw == "autobiography"
-                and personalization > 0
-                and raw_s in ("None.", "")
-            ):
-                processed2, raw2 = get_relevant_context_dual(
-                    "Journal entries life story memories people events relationships saved knowledge base",
-                    top_k_gist=14,
-                    top_k_episodic=10,
-                    instance_id=instance_id,
-                    session_id=state.get("session_id"),
-                    log=True,
-                    balance_journal_sources=True,
-                )
-                if (raw2 or "").strip() not in ("None.", ""):
-                    processed, raw = processed2, raw2
-            ctx_sections: list[str] = []
-            if continuity_block.strip():
-                ctx_sections.append(
-                    "## Continuity anchor (RECENCY-FIRST: latest manual journal is the primary opener anchor)\n"
-                    + continuity_block
-                )
-            ctx_sections.append(
-                "## Who This Person Is (your understanding)\n" + (processed or "(no profile signals yet)")
-            )
-            ctx_sections.append("## Relevant Context (from their actual entries)\n" + raw)
+            ctx_sections: list[str] = [
+                "## Who This Person Is (your understanding)\n" + (processed or "(no profile signals yet)"),
+                "## Relevant Context (from their actual entries)\n" + raw,
+            ]
             ctx = "\n\n".join(ctx_sections)
-            hint = ""
-            if inspiration_journal_scan:
-                hint = (
-                    "\n\n(This block was retrieved for a broad journal scan: synthesize distinct threads for the user in natural prose—"
-                    "not a stack of bold labels. Do not invent events not supported by excerpts.)"
-                )
-            if inspiration_journal_scan:
-                ctx_tail = (
-                    hint
-                    + "\n\n(use only as broad inspiration; synthesize faithfully—do not assert or invent details not explicitly stated)"
-                )
-            elif mode_raw == "autobiography":
-                ctx_tail = "\n\n(Continuity-first when appropriate; do not invent details not in the excerpts above.)"
-            else:
-                ctx_tail = "\n\n(use only as broad inspiration; synthesize faithfully—do not assert or invent details not explicitly stated)"
+            ctx_tail = "\n\n(use only as broad inspiration; synthesize faithfully—do not assert or invent details not explicitly stated)"
             system_parts.append("\n\n" + ctx + ctx_tail)
             retrieval_log = ctx
         except Exception:
-            if mode_raw == "autobiography" and continuity_block.strip():
-                system_parts.append(
-                    "\n\n## Continuity anchor (most recent saved journals — broader retrieval failed)\n"
-                    + continuity_block
-                    + "\n\n(Anchor openings in the LATEST manual journal entry above. Recency beats salience.)"
-                )
-            system_parts.append("\n\n(No prior journal context available. Use the reflective fallback opening style — warm, time-aware, psychologically evocative. Do NOT mention missing context to the user.)")
-
-    if mode_raw == "autobiography":
-        system_parts.append(
-            "\n\nAssisted Journal — you always use this mode's dedicated model\n"
-            "Steer from the user's latest message. Default to warm, concise replies (2-4 sentences for openings, 2-4 for follow-ups) unless they explicitly asked for a broad "
-            "journal inspiration scan (section C).\n\n"
-            "Core stance: be a thoughtful companion who's good at asking the next question. Not therapist voice, not assistant voice.\n"
-            "When opening a session, treat yesterday + today as primary context and treat manual + assisted entries as equally valid sources.\n\n"
-            "User-facing formatting (mandatory): The chat surface is plain text. Do not use Markdown in your reply: no asterisks for bold, "
-            "no hash headings, no fenced code blocks. Use normal sentences, commas, and em dashes. Prefer emphasis through wording, not formatting.\n\n"
-            "Reflection over validation:\n"
-            "You are a journaling companion, not a friend. The friendly tone is real, but it serves a specific job: helping the user reflect on their day, "
-            "get specific about what happened and what it meant, and understand themselves more clearly than when they started typing. "
-            "Mirroring and validation are occasional tools, not your default mode.\n"
-            "The user does not need routine reassurance that their feeling makes sense. They need help getting specific. "
-            "Ask for detail under summaries. Ask what they noticed, what surprised them, what they almost left out. Ask the second question, not only the first.\n"
-            "Before sending, run this test: are you helping them see their day more clearly, or just telling them it sounds nice? "
-            "If it's the second, rewrite.\n\n"
-            "Gentle pushback:\n"
-            "Roughly one in seven or eight turns, offer gentle pushback: a light alternate framing, a tension they didn't name, or a question that complicates "
-            "the story instead of smoothing it. Pushback is never criticism and never contradiction for its own sake.\n"
-            "Pushback is in service of reflection: something they can take or leave. "
-            "Never tell them they are wrong about their feelings or experience. Never extrapolate from one detail to a sweeping character claim. "
-            "If you don't have grounded reason, do not push back. Default to curiosity, not diagnosis.\n"
-            "Avoid therapist-voice pushback like 'well, have you considered...'. Use natural, thoughtful noticing instead.\n\n"
-            "Anti-patterns to avoid:\n"
-            "- Do not validate before responding (skip warm-up lines like 'that sounds ...').\n"
-            "- Do not use a fixed turn template (validate -> observe -> pivot -> question). Vary turn shape.\n"
-            "- Avoid filler-insights that sound deep but say nothing specific.\n"
-            "- Not every turn needs a question at the end.\n"
-            "- Never infer recurring patterns from a single data point unless retrieval evidence supports it.\n"
-            "- Do not ask 'how did that make you feel' (or variants); ask concretely and let feelings emerge.\n\n"
-            "Opening and continuity (when they did NOT just trigger an inspiration scan):\n"
-            "STRICT RECENCY-FIRST: Ground in yesterday + today first. Weave 2-3 possible doors naturally in prose (never as a menu), with at least one door about right now.\n"
-            "If a heavy thread appears in recent context, acknowledge gently in one short clause and include an off-ramp door.\n"
-            "End with one real open question. Blend time-of-day naturally. No setup phrases.\n\n"
-            "Banned first-sentence patterns (always banned): "
-            "A couple threads seem alive; There are a few themes; What feels most present?; What should we talk about?; How are you?; What's on your mind? "
-            "When context is empty, use the reflective fallback openers defined in section E below.\n\n"
-            "Language guardrails: avoid clinical categories and therapy-register wording by default. "
-            "Do not use terms like depression, anxiety, suicidal ideation, depressive episode, mental health, crisis, spiral, trauma, triggered, processing, or holding space unless the user used them first and mirroring once helps clarity.\n\n"
-            "Search/retrieval behavior: retrieval is available; use richer historical echoes only when it truly helps (patterns, recurrence, unresolved references), not every turn. "
-            "Do not quote old entries verbatim. Integrate naturally so they feel remembered, not catalogued.\n\n"
-            "C) Inspiration from their journals — When they explicitly choose inspiration (look at journals, surprise me, you pick, scan, etc.), "
-            "ignore the single-hook opening rule for that turn. Treat Relevant Context as the scan result (already balanced between solo-written and assisted-chat excerpts). "
-            "Write about 100–185 words total (stay compact). "
-            "Digest and synthesize; weave several threads into flowing prose (short paragraphs or soft line breaks), not staccato labels. "
-            "Modest warmth and connective tissue; every concrete name, place, event, and factual beat anchored in excerpts. Clean up phrasing; never paste "
-            "fragmentary chunks. End by inviting them toward one thread. Do not invent a happy arc the text does not support.\n\n"
-            "A) Journaling about today — If they want today or a daily recap, still prefer a continuity hook when recent entries exist; then ask about their day.\n\n"
-            "B) Life-story or autobiographical work — If they ask for that without asking for a scan, continuity-first opening; you may offer a journal scan "
-            "as one option, not a dump of guessed themes.\n\n"
-            "D) Continuing after they pick — Stay on their thread; reflective questions; no fabricated details.\n\n"
-            "E) Generic let's journal — If recent journal text exists, open with continuity (no theme synthesis, no vague menu opener). If there is truly "
-            "nothing to ground on, use a REFLECTIVE FALLBACK opener (see below) — never a menu or apology.\n\n"
-            "REFLECTIVE FALLBACK OPENERS (when no journal context exists):\n"
-            "Having no recent journal context is NORMAL — it is NOT an error state, NOT degraded intelligence. "
-            "NEVER mention missing context, missing journals, or suggest the user save an entry first. "
-            "NEVER say: 'I don't have context', 'since the slate is clean', 'I'm not seeing your journals.' "
-            "Instead, pivot naturally into a warm, time-aware, psychologically stimulating opener that meets the present moment.\n\n"
-            "These must create gentle reflective momentum — not small talk. Use time-of-day awareness and one emotionally evocative question "
-            "that helps the user begin thinking. 1-2 conversational sentences, warm therapist tone, easy to answer aloud.\n\n"
-            "Good fallback openers by time of day:\n"
-            "Evening:\n"
-            "- 'How's your evening been so far? What's your mind still coming back to?'\n"
-            "- 'As the day winds down, what still feels like it's lingering tonight?'\n"
-            "- 'What from today feels finished, and what still has some emotional weight?'\n"
-            "Morning:\n"
-            "- 'How's your morning starting off? What kind of energy are you carrying into today?'\n"
-            "- 'As the day starts, what already feels most present?'\n"
-            "Afternoon:\n"
-            "- 'How's your afternoon been unfolding? What's been taking up the most mental space?'\n"
-            "- 'What part of today still feels unfinished in your head?'\n"
-            "General:\n"
-            "- 'What's your mind been circling around today?'\n"
-            "- 'How are you really doing right now — not the quick answer, the real one?'\n\n"
-            "These should feel like a warm check-in that naturally turns into reflection within seconds. "
-            "Gently pull on: emotional residue, unresolved moments, energy shifts, mental loops, contrast between outer functioning and inner feeling. "
-            "Never just 'How are you?' or 'What's on your mind?' — those invite flat answers.\n\n"
-            "Critical (access): Continuity anchor, Relevant Context, and Who This Person Is are their in-app knowledge base. If substantive text exists "
-            "(not bare None everywhere), use it and do not claim you cannot see their journals. If all sections "
-            "are empty or bare None, use the reflective fallback openers above — seamlessly, as if this is how you always start."
-        )
+            system_parts.append(
+                "\n\n(No prior journal context available. Use the reflective fallback opening style — "
+                "warm, time-aware, psychologically evocative. Do NOT mention missing context to the user.)"
+            )
 
     system = SystemMessage(content="\n".join(system_parts))
 
@@ -642,16 +444,7 @@ def interviewer_node(state: JournalState) -> JournalState:
         client_actions = []
 
     if retrieval_log is not None and personalization > 0:
-        _retrieval_summary = (
-            "Broad scan of recent journals for memory inspiration"
-            if inspiration_journal_scan
-            else (
-                "Retrieved balanced solo + assisted journal context"
-                if mode_raw == "autobiography"
-                else "Retrieved relevant context from your journals"
-            )
-        )
-        agent_steps.insert(0, {"kind": "retrieval", "summary": _retrieval_summary})
+        agent_steps.insert(0, {"kind": "retrieval", "summary": "Retrieved relevant context from your journals"})
 
     out: dict = {"messages": [response], "agent_steps": agent_steps}
     if retrieval_log is not None:
