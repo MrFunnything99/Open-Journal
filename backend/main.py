@@ -51,11 +51,9 @@ from library import (
     delete_memory_fact,
     delete_memory_summary,
     DEFAULT_PERPLEXITY_EMBEDDING_MODEL,
-    generate_day_summary,
     generate_memory_mermaid,
     _embed_texts,
     generate_derived_insights,
-    get_memory_for_date,
     get_memory_for_visualization,
     get_person_events,
     get_writing_loop_hints,
@@ -1450,7 +1448,7 @@ CRITICAL: What is written in the entry has absolute precedence. Use the exact da
 Reply with ONLY a single line: either an ISO 8601 date in UTC (e.g. 2025-12-18T12:00:00.000Z), or the word NONE if you cannot determine a date from the entry. No other text."""
 
 
-JOURNAL_FILENAME_DATE_SYSTEM = """You file journal entries into a calendar sidebar. You ONLY see file names or relative paths — never file contents.
+JOURNAL_FILENAME_DATE_SYSTEM = """You assign journal entries to a filing date from paths/filenames only. You ONLY see file names or relative paths — never file contents.
 
 For each numbered item, infer the single calendar day the user meant (from the name/path: e.g. 1-30-2026.md, 1-30-26.md, 2026-02-03.md, journals/2026/January/2026-01-30.md). Two-digit years 00–69 mean 2000–2069; 70–99 mean 1970–1999. Use US month-day-year when a short date is ambiguous (first number = month). If you cannot infer a day, use null for that index.
 
@@ -2002,50 +2000,6 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
     vec_store.ensure_db()
     ok = vec_store.delete_person_thought(thought_id)
     return {"ok": ok}
-
-
-
-class CalendarDayRequest(BaseModel):
-    date: str  # YYYY-MM-DD
-    raw_transcript: Optional[str] = None
-
-
-class CalendarDayResponse(BaseModel):
-    summary: str
-    has_journal: bool
-
-
-@api_router.post("/calendar-day-summary", response_model=CalendarDayResponse)
-async def calendar_day_summary(req: CalendarDayRequest, request: Request):
-    """
-    For a given date, combine raw journal transcript (if any) with DB memory for that day
-    and return an AI-generated day summary/highlights.
-    """
-    instance_id = _instance_id(request)
-    date_iso = (req.date or "").strip()[:10]
-    if not date_iso or len(date_iso) < 10:
-        return CalendarDayResponse(summary="Please provide a valid date (YYYY-MM-DD).", has_journal=False)
-    try:
-        episodic, gist = await asyncio.to_thread(get_memory_for_date, date_iso, instance_id)
-        summary = await asyncio.to_thread(
-            generate_day_summary,
-            date_iso,
-            (req.raw_transcript or "").strip() or None,
-            episodic,
-            gist,
-        )
-        return CalendarDayResponse(
-            summary=summary,
-            has_journal=bool((req.raw_transcript or "").strip()),
-        )
-    except Exception as e:
-        print("[backend] /calendar-day-summary error:", e)
-        return CalendarDayResponse(
-            summary="Could not generate summary for this day.",
-            has_journal=bool((req.raw_transcript or "").strip()),
-        )
-
-
 
 
 

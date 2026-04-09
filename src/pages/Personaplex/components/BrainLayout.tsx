@@ -1,43 +1,91 @@
 import { FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { backendFetch } from "../../../backendApi";
 import type { ChatMessage, JournalEntry } from "../hooks/useJournalHistory";
-import { formatCalendarDayHeading, localCalendarDayKey } from "../knowledgeBaseMarkdownZip";
+import {
+  buildYearMonthTree,
+  formatCalendarDayHeading,
+  groupJournalMonthByCalendarDay,
+  localCalendarDayKey,
+} from "../knowledgeBaseMarkdownZip";
+
+/* Knowledge Base: teal/violet shell aligned with Personaplex gradient.
+ * Elsewhere, neutral grays may still be appropriate: e.g. MemoryDiagram.tsx, VoiceMemoTab (non-Brain), index.css .scrollbar thumb — not updated here. */
+const kbAsideClass =
+  "w-full lg:w-[min(100%,340px)] lg:flex-shrink-0 flex flex-col min-h-0 border-b lg:border-b-0 lg:border-r border-[rgba(120,180,200,0.12)] bg-[rgba(15,28,40,0.6)] backdrop-blur-md";
+const kbExplorerHeaderClass =
+  "border-b border-[rgba(120,180,200,0.1)] bg-[rgba(10,18,28,0.35)] px-4 py-3 backdrop-blur-sm";
+const kbTabRailClass =
+  "flex w-full gap-0.5 rounded-xl border border-[rgba(120,180,200,0.12)] bg-[rgba(20,37,52,0.8)] p-1 backdrop-blur-sm";
+const kbTabSelectedClass = "bg-white text-gray-900 shadow-sm dark:bg-white/90";
+const kbTabIdleClass = "text-[#9BB1BE] hover:bg-white/[0.06] hover:text-[#E8F1F5]";
+const kbDetailShellClass =
+  "flex-1 flex flex-col min-h-0 m-3 md:m-4 rounded-2xl border border-[rgba(120,180,200,0.14)] bg-[rgba(15,28,40,0.55)] backdrop-blur-md shadow-[0_8px_32px_rgba(0,0,0,0.2)] overflow-hidden";
+const kbToolbarStripWrapClass =
+  "flex shrink-0 flex-wrap justify-end gap-2 border-b border-[rgba(120,180,200,0.1)] bg-[rgba(10,18,28,0.4)] px-4 pb-2.5 pt-3 backdrop-blur-sm";
+const kbMetaRowClass =
+  "flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-[rgba(120,180,200,0.12)] bg-[rgba(12,22,32,0.35)] backdrop-blur-sm";
+const kbTreeBorder = "border-[rgba(120,180,200,0.12)]";
+const kbHoverRow = "hover:bg-white/[0.06]";
+const kbEmptyListClass =
+  "text-xs text-[#5F7585] py-1 pl-2 pr-1 border-l border-[rgba(45,212,191,0.25)]";
+
+/** Serialized after AI turn body; JSON-stringified retrieval log inside tilde fence (avoids breaking on ``` in logs). */
+const KB_RETRIEVAL_FENCE_OPEN = "\n~~~selfmeridian-retrieval\n";
+const KB_RETRIEVAL_FENCE_CLOSE = "\n~~~";
+
+function parseAiMarkdownSegment(raw: string): ChatMessage {
+  const open = raw.lastIndexOf(KB_RETRIEVAL_FENCE_OPEN);
+  if (open < 0) return { role: "ai", text: raw.trimEnd() };
+  const text = raw.slice(0, open).trimEnd();
+  const after = raw.slice(open + KB_RETRIEVAL_FENCE_OPEN.length);
+  const closeIdx = after.lastIndexOf(KB_RETRIEVAL_FENCE_CLOSE);
+  if (closeIdx < 0) return { role: "ai", text: raw.trimEnd() };
+  const jsonRaw = after.slice(0, closeIdx).trim();
+  try {
+    return { role: "ai", text, retrievalLog: JSON.parse(jsonRaw) as string };
+  } catch {
+    return { role: "ai", text: raw.trimEnd() };
+  }
+}
+
+/** ChatMessage[] ↔ markdown for Brain single-textarea edit. Mirrors read labels (## You / ## AI). */
+function transcriptToMarkdownForEdit(messages: ChatMessage[]): string {
+  const chunks: string[] = [];
+  for (const m of messages) {
+    const head = m.role === "user" ? "## You" : "## AI";
+    let body = m.text.replace(/\r\n/g, "\n").trimEnd();
+    if (m.role === "ai" && m.retrievalLog != null && String(m.retrievalLog).trim() !== "") {
+      body += KB_RETRIEVAL_FENCE_OPEN + JSON.stringify(m.retrievalLog) + KB_RETRIEVAL_FENCE_CLOSE;
+    }
+    chunks.push(`${head}\n\n${body}`);
+  }
+  return `${chunks.join("\n\n")}\n`;
+}
+
+function markdownToTranscript(source: string): ChatMessage[] {
+  const normalized = source.replace(/\r\n/g, "\n").trimEnd();
+  if (!normalized) return [];
+  const parts = normalized.split(/^## (You|AI)\s*$/m);
+  if (parts.length === 1) {
+    const t = parts[0].trim();
+    return t ? [{ role: "user", text: t }] : [];
+  }
+  const out: ChatMessage[] = [];
+  if (parts[0].trim()) {
+    out.push({ role: "user", text: parts[0].trim() });
+  }
+  for (let i = 1; i < parts.length; i += 2) {
+    const label = parts[i];
+    const segment = (parts[i + 1] ?? "").trim();
+    if (label === "You") out.push({ role: "user", text: segment });
+    else if (label === "AI") out.push(parseAiMarkdownSegment(segment));
+  }
+  return out;
+}
 
 type Selection =
   | { kind: "journal"; id: string }
   | { kind: "journal_day"; dayKey: string }
   | { kind: "conversation"; id: string };
-
-type YearMonthTree = {
-  year: number;
-  months: { month: number; monthLabel: string; entries: JournalEntry[] }[];
-}[];
-
-function buildYearMonthTree(sorted: JournalEntry[]): YearMonthTree {
-  const byYear = new Map<number, Map<number, JournalEntry[]>>();
-  for (const e of sorted) {
-    const d = new Date(e.date);
-    const y = d.getFullYear();
-    const m = d.getMonth();
-    if (!byYear.has(y)) byYear.set(y, new Map());
-    const ym = byYear.get(y)!;
-    if (!ym.has(m)) ym.set(m, []);
-    ym.get(m)!.push(e);
-  }
-  const years = [...byYear.keys()].sort((a, b) => b - a);
-  return years.map((year) => {
-    const monthsMap = byYear.get(year)!;
-    const months = [...monthsMap.keys()].sort((a, b) => b - a);
-    return {
-      year,
-      months: months.map((month) => ({
-        month,
-        monthLabel: new Date(year, month, 1).toLocaleString("en-US", { month: "long" }),
-        entries: monthsMap.get(month)!,
-      })),
-    };
-  });
-}
 
 function isConversationEntry(e: JournalEntry): boolean {
   return e.entrySource === "conversation";
@@ -49,7 +97,8 @@ type BrainLayoutProps = {
   onDeleteEntry: (id: string) => void;
   onUpdateJournalEntry: (id: string, fullTranscript: ChatMessage[]) => void;
   onToast?: (message: string) => void;
-  onDownloadKnowledgeBase?: () => void;
+  /** Sidebar: download all journals as `Journals/` zip (explorer-aligned tree). */
+  onDownloadJournals?: () => void | Promise<void>;
   onImportKnowledgeBaseFile?: (file: File) => void;
   /** If provided, runs before opening the file picker; return false to cancel (e.g. user dismissed confirm). */
   onPrepareKnowledgeBaseUpload?: () => boolean;
@@ -71,20 +120,6 @@ function countJournalText(entries: JournalEntry[], mode: "tokens" | "words"): nu
     }
   }
   return mode === "tokens" ? Math.ceil(total / 4) : total;
-}
-
-function groupJournalMonthByCalendarDay(monthEntries: JournalEntry[]): { dayKey: string; entries: JournalEntry[] }[] {
-  const m = new Map<string, JournalEntry[]>();
-  for (const e of monthEntries) {
-    const k = localCalendarDayKey(e.date);
-    if (!m.has(k)) m.set(k, []);
-    m.get(k)!.push(e);
-  }
-  const keys = [...m.keys()].sort();
-  return keys.map((dayKey) => ({
-    dayKey,
-    entries: (m.get(dayKey) ?? []).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
-  }));
 }
 
 /** Local wall-clock time for an entry (Knowledge base header + sidebar). */
@@ -109,29 +144,10 @@ function formatRelativeSaved(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
-function buildThinkingLogsText(entry: JournalEntry, getFormattedDate: (e: JournalEntry) => string): string {
-  const lines: string[] = [`AI Thinking Logs — ${getFormattedDate(entry)}`, "=".repeat(50), ""];
-  let aiIndex = 0;
-  entry.fullTranscript.forEach((msg) => {
-    if (msg.role === "ai") {
-      aiIndex += 1;
-      lines.push(`--- AI Response ${aiIndex} ---`, "", "Reply:", msg.text, "");
-      if (msg.retrievalLog) {
-        lines.push("Memory context from vector DB:", msg.retrievalLog);
-      } else {
-        lines.push("(No memory context retrieved for this response.)");
-      }
-      lines.push("");
-    }
-  });
-  if (aiIndex === 0) lines.push("No AI responses in this entry.");
-  return lines.join("\n");
-}
-
 const knowledgeBaseToolbarBtnClass =
-  "rounded-full border border-gray-300 bg-transparent px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-100 dark:border-white/20 dark:text-white/85 dark:hover:bg-white/10";
+  "rounded-full border border-[rgba(120,180,200,0.14)] bg-[rgba(20,37,52,0.8)] px-3 py-1.5 text-xs font-medium text-[#E8F1F5] backdrop-blur-sm transition-colors hover:bg-[rgba(27,46,64,0.9)]";
 const journalDumpBtnClass =
-  "w-full rounded-xl border border-white/15 bg-white/5 px-2 py-2 text-center text-xs font-medium text-white/80 transition-colors hover:bg-white/10 hover:text-white leading-snug";
+  "w-full rounded-xl border border-[rgba(120,180,200,0.14)] bg-[rgba(20,37,52,0.8)] px-2 py-2 text-center text-xs font-medium text-[#E8F1F5] backdrop-blur-sm transition-colors hover:bg-[rgba(27,46,64,0.9)] leading-snug";
 
 export const BrainLayout: FC<BrainLayoutProps> = ({
   entries,
@@ -139,7 +155,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   onDeleteEntry,
   onUpdateJournalEntry,
   onToast,
-  onDownloadKnowledgeBase,
+  onDownloadJournals,
   onImportKnowledgeBaseFile,
   onPrepareKnowledgeBaseUpload,
   onImportJournalDumpFolder,
@@ -180,13 +196,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   }, [onPrepareJournalDumpUpload]);
 
   const [journalEditing, setJournalEditing] = useState(false);
-  const [journalDraft, setJournalDraft] = useState<ChatMessage[]>([]);
-  const [writingHints, setWritingHints] = useState<{
-    similar_past_entries?: { excerpt: string; date?: string }[];
-    insights?: { insight_text?: string; insight_kind?: string }[];
-    patterns?: { summary?: string; window_label?: string }[];
-  } | null>(null);
-  const [writingHintsLoading, setWritingHintsLoading] = useState(false);
+  const [journalMarkdownDraft, setJournalMarkdownDraft] = useState("");
+  const editBaselineMarkdownRef = useRef("");
 
   const journalSorted = useMemo(() => {
     const list = entries.filter((e) => !isConversationEntry(e));
@@ -234,15 +245,17 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
     (next: ExplorerTab) => {
       if (next === explorerTab) return;
       if (journalEditing) {
-        if (!confirm("Discard unsaved edits to switch tabs?")) return;
+        const dirty = journalMarkdownDraft !== editBaselineMarkdownRef.current;
+        if (dirty && !confirm("Discard unsaved edits to switch tabs?")) return;
         setJournalEditing(false);
-        setJournalDraft([]);
+        setJournalMarkdownDraft("");
+        editBaselineMarkdownRef.current = "";
       }
       setExplorerTab(next);
       setSelection(selectFirstForTab(next));
       setExpandedLogKey(null);
     },
-    [explorerTab, journalEditing, selectFirstForTab]
+    [explorerTab, journalEditing, journalMarkdownDraft, selectFirstForTab]
   );
 
   useEffect(() => {
@@ -288,61 +301,33 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const trySelect = useCallback(
     (next: Selection) => {
       if (journalEditing && (selection?.kind === "journal" || selection?.kind === "conversation")) {
-        const leaving = next.kind !== selection.kind || next.id !== selection.id;
-        if (leaving && !confirm("Discard unsaved edits to this entry?")) return;
+        const leaving =
+          next.kind !== selection.kind
+            ? true
+            : selection.kind === "journal" && next.kind === "journal"
+              ? next.id !== selection.id
+              : selection.kind === "conversation" && next.kind === "conversation"
+                ? next.id !== selection.id
+                : true;
+        const dirty = journalMarkdownDraft !== editBaselineMarkdownRef.current;
+        if (leaving && dirty && !confirm("Discard unsaved edits to this entry?")) return;
         if (leaving) {
           setJournalEditing(false);
-          setJournalDraft([]);
+          setJournalMarkdownDraft("");
+          editBaselineMarkdownRef.current = "";
         }
       }
       setSelection(next);
       setExpandedLogKey(null);
     },
-    [journalEditing, selection]
+    [journalEditing, journalMarkdownDraft, selection]
   );
 
   useEffect(() => {
     setJournalEditing(false);
-    setJournalDraft([]);
+    setJournalMarkdownDraft("");
+    editBaselineMarkdownRef.current = "";
   }, [selectedTranscript?.id]);
-
-  const draftPlainForHints = useMemo(
-    () =>
-      journalDraft
-        .filter((m) => m.role === "user")
-        .map((m) => m.text)
-        .join("\n")
-        .trim(),
-    [journalDraft],
-  );
-
-  useEffect(() => {
-    if (!journalEditing || !selectedTranscript) {
-      setWritingHints(null);
-      setWritingHintsLoading(false);
-      return;
-    }
-    if (!draftPlainForHints) {
-      setWritingHints(null);
-      return;
-    }
-    const handle = window.setTimeout(() => {
-      setWritingHintsLoading(true);
-      backendFetch("/memory/writing-hints", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ draft: draftPlainForHints.slice(0, 8000) }),
-      })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data) => {
-          if (data && typeof data === "object") setWritingHints(data);
-          else setWritingHints(null);
-        })
-        .catch(() => setWritingHints(null))
-        .finally(() => setWritingHintsLoading(false));
-    }, 700);
-    return () => window.clearTimeout(handle);
-  }, [journalEditing, selectedTranscript?.id, draftPlainForHints]);
 
   const toggleJournalYear = (y: number) => {
     setJournalExpandedYears((prev) => {
@@ -403,22 +388,6 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
     [getFormattedDate, onToast]
   );
 
-  const downloadThinkingLogs = useCallback(
-    (entry: JournalEntry) => {
-      const content = buildThinkingLogsText(entry, getFormattedDate);
-      const dateStr = new Date(entry.date).toISOString().slice(0, 10);
-      const blob = new Blob([content], { type: "text/plain" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `AI_Thinking_Logs_${dateStr}.txt`;
-      a.click();
-      URL.revokeObjectURL(url);
-      onToast?.("Thinking logs downloaded.");
-    },
-    [getFormattedDate, onToast]
-  );
-
   const journalDayActive = (dayKey: string) => selection?.kind === "journal_day" && selection.dayKey === dayKey;
   const conversationActive = (id: string) => selection?.kind === "conversation" && selection.id === id;
 
@@ -426,12 +395,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
 
   return (
     <div className="flex flex-1 min-h-0 flex-col lg:flex-row gap-0 overflow-hidden">
-      <aside className="w-full lg:w-[min(100%,340px)] lg:flex-shrink-0 flex flex-col min-h-0 border-b lg:border-b-0 lg:border-r border-gray-100 dark:border-gray-700 bg-white/90 dark:bg-[#2f2f2f]">
-        <div className="border-b border-gray-100 bg-gray-50/90 px-4 py-3 dark:border-white/10 dark:bg-black/20 dark:backdrop-blur-md">
-          <p className="mb-2.5 text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-gray-500 dark:text-white/45">
+      <aside className={kbAsideClass}>
+        <div className={kbExplorerHeaderClass}>
+          <p className="mb-2.5 text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-[#5F7585]">
             Explorer
           </p>
-          <div className="flex w-full gap-0.5 rounded-xl border border-gray-200/90 bg-gray-100/90 p-1 dark:border-white/[0.08] dark:bg-black/20 dark:backdrop-blur-md">
+          <div className={kbTabRailClass}>
             {(
               [
                 { key: "journals", label: "Manual Journals" },
@@ -443,9 +412,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 type="button"
                 onClick={() => switchExplorerTab(tab.key)}
                 className={`flex-1 rounded-lg px-2 py-1.5 text-[0.7rem] font-medium leading-tight transition-colors ${
-                  explorerTab === tab.key
-                    ? "bg-white text-gray-900 shadow-sm dark:bg-white/90"
-                    : "text-gray-500 hover:bg-gray-200/80 hover:text-gray-900 dark:text-white/50 dark:hover:bg-white/10 dark:hover:text-white"
+                  explorerTab === tab.key ? kbTabSelectedClass : kbTabIdleClass
                 }`}
               >
                 {tab.label}
@@ -458,27 +425,29 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
             <div className="mb-2">
               {journalTree.length > 0 && (
                 <div className="mb-1.5 flex items-center justify-end px-2">
-                  <div className="flex items-center rounded-full border border-gray-200 dark:border-gray-600 bg-gray-100 dark:bg-[#2a2a2a] p-0.5 text-[0.6rem] font-medium">
+                  <div
+                    className={`flex items-center rounded-full border ${kbTreeBorder} bg-[rgba(20,37,52,0.75)] p-0.5 text-[0.6rem] font-medium backdrop-blur-sm`}
+                  >
                     <button
                       type="button"
                       onClick={() => setJournalCountMode("tokens")}
-                      className={`rounded-full px-2 py-0.5 transition-colors ${journalCountMode === "tokens" ? "bg-white dark:bg-[#404040] text-gray-900 dark:text-white shadow-sm" : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"}`}
+                      className={`rounded-full px-2 py-0.5 transition-colors ${journalCountMode === "tokens" ? "bg-white/95 text-gray-900 shadow-sm" : "text-[#9BB1BE] hover:text-[#E8F1F5]"}`}
                     >
                       tokens
                     </button>
                     <button
                       type="button"
                       onClick={() => setJournalCountMode("words")}
-                      className={`rounded-full px-2 py-0.5 transition-colors ${journalCountMode === "words" ? "bg-white dark:bg-[#404040] text-gray-900 dark:text-white shadow-sm" : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"}`}
+                      className={`rounded-full px-2 py-0.5 transition-colors ${journalCountMode === "words" ? "bg-white/95 text-gray-900 shadow-sm" : "text-[#9BB1BE] hover:text-[#E8F1F5]"}`}
                     >
                       words
                     </button>
                   </div>
                 </div>
               )}
-              <div className="ml-1 border-l border-gray-100 dark:border-gray-600 pl-2">
+              <div className={`ml-1 border-l ${kbTreeBorder} pl-2`}>
                 {journalTree.length === 0 ? (
-                  <p className="text-xs text-gray-400 py-1 px-1">No manual journal entries yet.</p>
+                  <p className={kbEmptyListClass}>No manual journal entries yet.</p>
                 ) : (
                   journalTree.map(({ year, months }) => {
                     const yearEntries = months.flatMap((m) => m.entries);
@@ -487,10 +456,10 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                       <button
                         type="button"
                         onClick={() => toggleJournalYear(year)}
-                        className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm font-semibold text-gray-800 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-[#404040]"
+                        className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm font-semibold text-[#E8F1F5] ${kbHoverRow}`}
                       >
                         <svg
-                          className={`h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform ${journalExpandedYears.has(year) ? "rotate-90" : ""}`}
+                          className={`h-3.5 w-3.5 shrink-0 text-[#5F7585] transition-transform ${journalExpandedYears.has(year) ? "rotate-90" : ""}`}
                           fill="none"
                           viewBox="0 0 24 24"
                           stroke="currentColor"
@@ -498,12 +467,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                         </svg>
                         <span className="flex-1">{year}</span>
-                        <span className="ml-auto shrink-0 text-[0.6rem] font-normal text-gray-400 dark:text-gray-500">
+                        <span className="ml-auto shrink-0 text-[0.6rem] font-normal text-[#5F7585]">
                           {countJournalText(yearEntries, journalCountMode).toLocaleString()} {journalCountMode === "tokens" ? "tok" : "w"}
                         </span>
                       </button>
                       {journalExpandedYears.has(year) && (
-                        <div className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-0.5">
+                        <div className={`ml-3 border-l ${kbTreeBorder} pl-2 space-y-0.5`}>
                           {months.map(({ month, monthLabel, entries: monthEntries }) => {
                             const mKey = `${year}-${month}`;
                             return (
@@ -511,10 +480,10 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                 <button
                                   type="button"
                                   onClick={() => toggleJournalMonth(mKey)}
-                                  className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-xs font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#404040]"
+                                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-xs font-medium text-[#9BB1BE] ${kbHoverRow}`}
                                 >
                                   <svg
-                                    className={`h-3 w-3 shrink-0 text-gray-400 transition-transform ${journalExpandedMonths.has(mKey) ? "rotate-90" : ""}`}
+                                    className={`h-3 w-3 shrink-0 text-[#5F7585] transition-transform ${journalExpandedMonths.has(mKey) ? "rotate-90" : ""}`}
                                     fill="none"
                                     viewBox="0 0 24 24"
                                     stroke="currentColor"
@@ -522,12 +491,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                                   </svg>
                                   <span className="flex-1">{monthLabel}</span>
-                                  <span className="ml-auto shrink-0 text-[0.6rem] text-gray-400 dark:text-gray-500">
+                                  <span className="ml-auto shrink-0 text-[0.6rem] text-[#5F7585]">
                                     {countJournalText(monthEntries, journalCountMode).toLocaleString()} {journalCountMode === "tokens" ? "tok" : "w"}
                                   </span>
                                 </button>
                                 {journalExpandedMonths.has(mKey) && (
-                                  <div className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-2 pb-1">
+                                  <div className={`ml-3 border-l ${kbTreeBorder} pl-2 space-y-2 pb-1`}>
                                     {groupJournalMonthByCalendarDay(monthEntries).map((dayGroup) => (
                                       <div key={dayGroup.dayKey}>
                                         <button
@@ -536,14 +505,14 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                           className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition-colors ${
                                             journalDayActive(dayGroup.dayKey)
                                               ? "bg-white text-gray-900 shadow-sm dark:bg-white dark:text-gray-900"
-                                              : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#404040]"
+                                              : "text-[#C5D4DE] hover:bg-white/[0.06] hover:text-[#E8F1F5]"
                                           }`}
                                         >
                                           <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
                                           </svg>
                                           <span className="min-w-0 flex-1 truncate font-medium">{formatCalendarDayHeading(dayGroup.dayKey)}</span>
-                                          <span className="ml-1 shrink-0 text-[0.6rem] text-gray-400 dark:text-gray-500">
+                                          <span className="ml-1 shrink-0 text-[0.6rem] text-[#5F7585]">
                                             {countJournalText(dayGroup.entries, journalCountMode).toLocaleString()} {journalCountMode === "tokens" ? "tok" : "w"}
                                           </span>
                                         </button>
@@ -566,19 +535,19 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
 
           {explorerTab === "conversations" && (
             <div className="mb-2">
-              <div className="ml-1 border-l border-gray-100 dark:border-gray-600 pl-2">
+              <div className={`ml-1 border-l ${kbTreeBorder} pl-2`}>
                 {conversationTree.length === 0 ? (
-                  <p className="text-xs text-gray-400 py-1 px-1">No AI-assisted journal entries yet.</p>
+                  <p className={kbEmptyListClass}>No AI-assisted journal entries yet.</p>
                 ) : (
                   conversationTree.map(({ year, months }) => (
                     <div key={`conv-${year}`} className="mb-1">
                       <button
                         type="button"
                         onClick={() => toggleConvYear(year)}
-                        className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm font-semibold text-gray-800 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-[#404040]"
+                        className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm font-semibold text-[#E8F1F5] ${kbHoverRow}`}
                       >
                         <svg
-                          className={`h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform ${convExpandedYears.has(year) ? "rotate-90" : ""}`}
+                          className={`h-3.5 w-3.5 shrink-0 text-[#5F7585] transition-transform ${convExpandedYears.has(year) ? "rotate-90" : ""}`}
                           fill="none"
                           viewBox="0 0 24 24"
                           stroke="currentColor"
@@ -588,7 +557,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                         {year}
                       </button>
                       {convExpandedYears.has(year) && (
-                        <div className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-0.5">
+                        <div className={`ml-3 border-l ${kbTreeBorder} pl-2 space-y-0.5`}>
                           {months.map(({ month, monthLabel, entries: monthEntries }) => {
                             const mKey = `c-${year}-${month}`;
                             return (
@@ -596,10 +565,10 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                 <button
                                   type="button"
                                   onClick={() => toggleConvMonth(mKey)}
-                                  className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-xs font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#404040]"
+                                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-xs font-medium text-[#9BB1BE] ${kbHoverRow}`}
                                 >
                                   <svg
-                                    className={`h-3 w-3 shrink-0 text-gray-400 transition-transform ${convExpandedMonths.has(mKey) ? "rotate-90" : ""}`}
+                                    className={`h-3 w-3 shrink-0 text-[#5F7585] transition-transform ${convExpandedMonths.has(mKey) ? "rotate-90" : ""}`}
                                     fill="none"
                                     viewBox="0 0 24 24"
                                     stroke="currentColor"
@@ -609,7 +578,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                   {monthLabel}
                                 </button>
                                 {convExpandedMonths.has(mKey) && (
-                                  <ul className="ml-3 border-l border-gray-100 dark:border-gray-600 pl-2 space-y-0.5 pb-1">
+                                  <ul className={`ml-3 border-l ${kbTreeBorder} pl-2 space-y-0.5 pb-1`}>
                                     {monthEntries.map((entry) => {
                                       const timeLbl = formatEntryTimeLabel(entry.date);
                                       return (
@@ -622,7 +591,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                             className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition-colors ${
                                               conversationActive(entry.id)
                                                 ? "bg-white text-gray-900 shadow-sm dark:bg-white dark:text-gray-900"
-                                                : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#404040]"
+                                                : "text-[#C5D4DE] hover:bg-white/[0.06] hover:text-[#E8F1F5]"
                                             }`}
                                           >
                                             <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -651,83 +620,99 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
           )}
 
         </nav>
-        {onImportJournalDumpFolder && (
-          <div className="border-t border-white/10 p-2">
-            <input
-              ref={journalDumpFolderRef}
-              type="file"
-              multiple
-              accept=".md,text/markdown,.txt,text/plain"
-              className="hidden"
-              aria-hidden
-              {...({ webkitdirectory: "" } as any)}
-              onChange={(e) => {
-                if (e.target.files && e.target.files.length > 0) onImportJournalDumpFolder(e.target.files);
-                e.target.value = "";
-              }}
-            />
-            <input
-              ref={journalDumpFilesRef}
-              type="file"
-              multiple
-              accept=".md,text/markdown,.txt,text/plain"
-              className="hidden"
-              aria-hidden
-              onChange={(e) => {
-                if (e.target.files && e.target.files.length > 0) onImportJournalDumpFolder(e.target.files);
-                e.target.value = "";
-              }}
-            />
-            <div className="relative w-full" ref={journalImportMenuRef}>
-              <button
-                type="button"
-                className={`${journalDumpBtnClass} inline-flex items-center justify-center gap-1.5`}
-                onClick={() => setJournalImportOpen((o) => !o)}
-                aria-expanded={journalImportOpen}
-                aria-haspopup="menu"
-                title="Import .md/.txt journals from a folder or pick one or more files; filing dates from path/name (API)"
-              >
-                Import journals
-                <span className="text-white/50" aria-hidden>
-                  {journalImportOpen ? "▴" : "▾"}
-                </span>
-              </button>
-              {journalImportOpen && (
-                <div
-                  className="absolute bottom-full left-0 right-0 z-30 mb-1 overflow-hidden rounded-xl border border-white/15 bg-[#1e1e2e] py-1 shadow-lg dark:bg-[#252530]"
-                  role="menu"
-                >
+        {(onDownloadJournals || onImportJournalDumpFolder) && (
+          <div className={`border-t ${kbTreeBorder} p-2`}>
+            {onImportJournalDumpFolder ? (
+              <>
+                <input
+                  ref={journalDumpFolderRef}
+                  type="file"
+                  multiple
+                  accept=".md,text/markdown,.txt,text/plain"
+                  className="hidden"
+                  aria-hidden
+                  {...({ webkitdirectory: "" } as any)}
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files.length > 0) onImportJournalDumpFolder(e.target.files);
+                    e.target.value = "";
+                  }}
+                />
+                <input
+                  ref={journalDumpFilesRef}
+                  type="file"
+                  multiple
+                  accept=".md,text/markdown,.txt,text/plain"
+                  className="hidden"
+                  aria-hidden
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files.length > 0) onImportJournalDumpFolder(e.target.files);
+                    e.target.value = "";
+                  }}
+                />
+                <div className="relative w-full" ref={journalImportMenuRef}>
                   <button
                     type="button"
-                    role="menuitem"
-                    className="block w-full px-3 py-2.5 text-left text-xs font-medium text-white/90 transition-colors hover:bg-white/10"
-                    onClick={() => {
-                      setJournalImportOpen(false);
-                      openJournalDumpFolderPicker();
-                    }}
+                    className={`${journalDumpBtnClass} inline-flex items-center justify-center gap-1.5`}
+                    onClick={() => setJournalImportOpen((o) => !o)}
+                    aria-expanded={journalImportOpen}
+                    aria-haspopup="menu"
+                    title="Import .md/.txt journals from a folder or pick one or more files; filing dates from path/name (API)"
                   >
-                    Choose folder…
+                    Import journals
+                    <span className="text-[#9BB1BE]" aria-hidden>
+                      {journalImportOpen ? "▴" : "▾"}
+                    </span>
                   </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className="block w-full px-3 py-2.5 text-left text-xs font-medium text-white/90 transition-colors hover:bg-white/10"
-                    onClick={() => {
-                      setJournalImportOpen(false);
-                      openJournalDumpFilesPicker();
-                    }}
-                  >
-                    Choose files…
-                  </button>
+                  {journalImportOpen && (
+                    <div
+                      className={`absolute bottom-full left-0 right-0 z-30 mb-1 overflow-hidden rounded-xl border border-[rgba(120,180,200,0.18)] bg-[rgba(12,22,36,0.95)] py-1 shadow-lg backdrop-blur-md`}
+                      role="menu"
+                    >
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="block w-full px-3 py-2.5 text-left text-xs font-medium text-[#E8F1F5] transition-colors hover:bg-white/[0.08]"
+                        onClick={() => {
+                          setJournalImportOpen(false);
+                          openJournalDumpFolderPicker();
+                        }}
+                      >
+                        Choose folder…
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="block w-full px-3 py-2.5 text-left text-xs font-medium text-[#E8F1F5] transition-colors hover:bg-white/[0.08]"
+                        onClick={() => {
+                          setJournalImportOpen(false);
+                          openJournalDumpFilesPicker();
+                        }}
+                      >
+                        Choose files…
+                      </button>
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
+              </>
+            ) : null}
+            {onDownloadJournals ? (
+              <div className={onImportJournalDumpFolder ? "mt-3" : ""}>
+                <button
+                  type="button"
+                  onClick={() => void onDownloadJournals()}
+                  className={journalDumpBtnClass}
+                  title="Download all journals as a .zip (Manual and AI-Assisted, explorer folder layout)"
+                >
+                  Download Journals
+                </button>
+              </div>
+            ) : null}
             {onStartFresh && (
-              <div className="mt-3 rounded-xl border border-red-200/90 bg-red-50/80 p-2 dark:border-red-400/25 dark:bg-red-950/30">
+              <div className="mt-3">
                 <button
                   type="button"
                   onClick={() => void onStartFresh()}
-                  className="w-full rounded-lg border border-red-300/80 bg-white px-3 py-2 text-left text-xs font-semibold text-red-900 shadow-sm transition-colors hover:bg-red-50 dark:border-red-400/35 dark:bg-red-500/15 dark:text-red-100 dark:hover:bg-red-500/25"
+                  className="w-full rounded-lg border border-[rgba(244,63,94,0.4)] bg-[rgba(244,63,94,0.12)] px-3 py-2 text-left text-xs font-semibold text-[#F43F5E] transition-colors hover:bg-[rgba(244,63,94,0.18)]"
                 >
                   Start fresh
                 </button>
@@ -737,82 +722,52 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
         )}
       </aside>
 
-      <section className="flex-1 flex flex-col min-h-0 min-w-0 bg-[#F9FAFB] dark:bg-[#212121]">
+      <section className="flex-1 flex flex-col min-h-0 min-w-0 bg-transparent">
         {selectedTranscript ? (
-          <div className="flex-1 flex flex-col min-h-0 m-3 md:m-4 rounded-2xl bg-white border border-gray-100 shadow-sm dark:bg-[#2f2f2f] dark:border-gray-700 overflow-hidden">
-            {onDownloadKnowledgeBase && onImportKnowledgeBaseFile && (
-              <>
-                <input
-                  ref={knowledgeBaseFileRef}
-                  type="file"
-                  accept=".zip,application/zip,application/x-zip-compressed,application/json,.json"
-                  className="hidden"
-                  aria-hidden
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) onImportKnowledgeBaseFile(f);
-                    e.target.value = "";
-                  }}
-                />
-                <div className="flex shrink-0 justify-end gap-2 border-b border-gray-100 px-4 pb-2.5 pt-3 dark:border-white/10 dark:bg-[#252525]">
-                  <button
-                    type="button"
-                    onClick={onDownloadKnowledgeBase}
-                    className={knowledgeBaseToolbarBtnClass}
-                    title="Download a .zip: journals/ (manual) and conversations/ (AI-assisted)"
-                  >
-                    Download Markdown folder
-                  </button>
-                  <button
-                    type="button"
-                    onClick={openKnowledgeBaseFilePicker}
-                    className={knowledgeBaseToolbarBtnClass}
-                    title="Upload a .zip export (or legacy .json). Layout matches The Brain explorer."
-                  >
-                    Upload Markdown folder
-                  </button>
-                </div>
-              </>
-            )}
-            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-[#343541]/40">
-              <span className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">The Brain</span>
+          <div className={kbDetailShellClass}>
+            <div className={kbMetaRowClass}>
+              <span className="text-xs font-semibold uppercase tracking-widest text-[#5F7585]">The Brain</span>
               <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs text-gray-400 dark:text-gray-500">Last saved: {formatRelativeSaved(selectedTranscript.date)}</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!selectedTranscript) return;
-                    if (journalEditing) {
-                      const hasText = journalDraft.some((m) => m.text.trim().length > 0);
+                {journalEditing ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!selectedTranscript) return;
+                      const parsed = markdownToTranscript(journalMarkdownDraft);
+                      const hasText = parsed.some((m) => m.text.trim().length > 0);
                       if (!hasText) {
                         onToast?.("Add some text before saving.");
                         return;
                       }
-                      onUpdateJournalEntry(selectedTranscript.id, journalDraft);
+                      onUpdateJournalEntry(selectedTranscript.id, parsed);
                       setJournalEditing(false);
-                      setJournalDraft([]);
+                      setJournalMarkdownDraft("");
+                      editBaselineMarkdownRef.current = "";
                       onToast?.("Saved on this device.");
-                      return;
-                    }
-                    onToast?.("Already saved in your browser. Use the pencil to edit this entry.");
-                  }}
-                  className="rounded-full bg-white px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition-colors hover:bg-white/90 dark:bg-white dark:text-gray-900 dark:hover:bg-white/90"
-                >
-                  {journalEditing ? "Save changes" : "Quick Save"}
-                </button>
+                    }}
+                    className="rounded-full bg-white/95 px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition-colors hover:bg-white"
+                  >
+                    Save changes
+                  </button>
+                ) : null}
                 <button
                   type="button"
-                  className={`rounded-lg p-2 ${journalEditing ? "bg-gray-200 text-gray-900 dark:bg-white/15 dark:text-white" : "text-gray-500 hover:bg-gray-100 dark:hover:bg-[#404040]"}`}
-                  aria-label={journalEditing ? "Stop editing" : "Edit transcript"}
-                  title={journalEditing ? "Stop editing (discard unsaved changes)" : "Edit transcript text"}
+                  className={`rounded-lg p-2 ${journalEditing ? "bg-white/15 text-white" : "text-[#9BB1BE] hover:bg-white/[0.08] hover:text-[#E8F1F5]"}`}
+                  aria-label={journalEditing ? "Discard edit" : "Edit transcript"}
+                  title={journalEditing ? "Discard edit (cancel)" : "Edit transcript as Markdown"}
                   onClick={() => {
                     if (!selectedTranscript) return;
                     if (journalEditing) {
+                      const dirty = journalMarkdownDraft !== editBaselineMarkdownRef.current;
+                      if (dirty && !confirm("Discard unsaved changes?")) return;
                       setJournalEditing(false);
-                      setJournalDraft([]);
+                      setJournalMarkdownDraft("");
+                      editBaselineMarkdownRef.current = "";
                       return;
                     }
-                    setJournalDraft(selectedTranscript.fullTranscript.map((m) => ({ ...m })));
+                    const md = transcriptToMarkdownForEdit(selectedTranscript.fullTranscript);
+                    editBaselineMarkdownRef.current = md;
+                    setJournalMarkdownDraft(md);
                     setJournalEditing(true);
                   }}
                 >
@@ -824,7 +779,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                   <button
                     type="button"
                     onClick={() => setMoreOpen((o) => !o)}
-                    className="p-2 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-[#404040]"
+                    className="p-2 rounded-lg text-[#9BB1BE] hover:bg-white/[0.08] hover:text-[#E8F1F5]"
                     aria-label="More actions"
                     aria-expanded={moreOpen}
                   >
@@ -833,10 +788,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                     </svg>
                   </button>
                   {moreOpen && (
-                    <div className="absolute right-0 top-full mt-1 z-20 min-w-[200px] rounded-xl border border-gray-100 bg-white py-1 shadow-lg dark:bg-[#343541] dark:border-gray-600">
+                    <div
+                      className={`absolute right-0 top-full mt-1 z-20 min-w-[200px] rounded-xl border ${kbTreeBorder} bg-[rgba(12,22,36,0.96)] py-1 shadow-lg backdrop-blur-md`}
+                    >
                       <button
                         type="button"
-                        className="block w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-50 dark:text-gray-200 dark:hover:bg-[#404040]"
+                        className="block w-full px-4 py-2 text-left text-sm text-[#E8F1F5] hover:bg-white/[0.08]"
                         onClick={() => {
                           exportEntryToFile(selectedTranscript);
                           setMoreOpen(false);
@@ -846,21 +803,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                       </button>
                       <button
                         type="button"
-                        className="block w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-50 dark:text-gray-200 dark:hover:bg-[#404040]"
-                        onClick={() => {
-                          downloadThinkingLogs(selectedTranscript);
-                          setMoreOpen(false);
-                        }}
-                      >
-                        AI thinking logs
-                      </button>
-                      <button
-                        type="button"
-                        className="block w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                        className="block w-full px-4 py-2 text-left text-sm text-[#F43F5E] hover:bg-[rgba(244,63,94,0.12)]"
                         onClick={() => {
                           if (confirm("Delete this entry? This cannot be undone.")) {
                             setJournalEditing(false);
-                            setJournalDraft([]);
+                            setJournalMarkdownDraft("");
+                            editBaselineMarkdownRef.current = "";
                             onDeleteEntry(selectedTranscript.id);
                             setMoreOpen(false);
                           }
@@ -873,196 +821,87 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 </div>
               </div>
             </div>
-            <div className="flex-1 overflow-y-auto scrollbar px-6 py-8 md:px-10 md:py-10">
-              <h3
-                className={`text-2xl md:text-3xl font-semibold text-gray-900 dark:text-gray-100 tracking-tight ${journalEditing ? "mb-2" : "mb-2"}`}
-              >
+            <div
+              className={`flex min-h-0 flex-1 flex-col px-6 py-8 md:px-10 md:py-10 ${journalEditing ? "overflow-hidden" : "overflow-y-auto scrollbar"}`}
+            >
+              <h3 className="text-2xl font-semibold tracking-tight text-[#E8F1F5] md:text-3xl shrink-0">
                 {getFormattedDate(selectedTranscript)}
               </h3>
               {formatEntryTimeLabel(selectedTranscript.date) ? (
-                <p
-                  className={`text-lg font-medium text-gray-600 dark:text-white/80 tabular-nums ${journalEditing ? "mb-4" : "mb-6"}`}
-                >
+                <p className={`shrink-0 text-lg font-medium tabular-nums text-[#9BB1BE] ${journalEditing ? "mt-1 mb-3" : "mt-1 mb-6"}`}>
                   {formatEntryTimeLabel(selectedTranscript.date)}
                 </p>
               ) : null}
               {journalEditing ? (
-                <p className="mb-6 text-sm text-gray-600 dark:text-white/70">
-                  Editing — use <span className="font-medium">Save changes</span> to keep edits, or the pencil to discard.
-                </p>
-              ) : null}
-              {journalEditing && (writingHintsLoading || (writingHints && (writingHints.similar_past_entries?.length || writingHints.insights?.length || writingHints.patterns?.length))) ? (
-                <aside className="mb-6 max-w-3xl rounded-xl border border-gray-200 bg-gray-50/80 p-4 text-sm text-gray-700 dark:border-gray-600 dark:bg-[#343541]/90 dark:text-gray-200">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">Memory-informed continuations</p>
-                  {writingHintsLoading && !writingHints ? <p className="text-xs text-gray-500 dark:text-gray-400">Looking for related past entries…</p> : null}
-                  {writingHints?.similar_past_entries && writingHints.similar_past_entries.length > 0 ? (
-                    <div className="mb-3 space-y-2">
-                      <p className="text-xs font-medium text-gray-600 dark:text-gray-300">Resembles past journal themes</p>
-                      <ul className="list-disc pl-4 space-y-1.5 text-xs leading-relaxed text-gray-600 dark:text-gray-400">
-                        {writingHints.similar_past_entries.map((row, i) => (
-                          <li key={i}>
-                            {row.date ? <span className="tabular-nums text-gray-500 dark:text-gray-500">{row.date.slice(0, 10)}: </span> : null}
-                            {(row.excerpt || "").slice(0, 320)}
-                            {(row.excerpt || "").length > 320 ? "…" : ""}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-                  {writingHints?.patterns && writingHints.patterns.length > 0 ? (
-                    <div className="mb-3 space-y-1">
-                      <p className="text-xs font-medium text-gray-600 dark:text-gray-300">Patterns across recent entries</p>
-                      {writingHints.patterns.map((p, i) => (
-                        <p key={i} className="text-xs leading-relaxed text-gray-600 dark:text-gray-400">
-                          {(p.summary || "").slice(0, 400)}
-                        </p>
-                      ))}
-                    </div>
-                  ) : null}
-                  {writingHints?.insights && writingHints.insights.length > 0 ? (
-                    <div className="space-y-1">
-                      <p className="text-xs font-medium text-gray-600 dark:text-gray-300">Reflections (optional prompts)</p>
-                      <ul className="list-disc pl-4 space-y-1 text-xs text-gray-600 dark:text-gray-400">
-                        {writingHints.insights.slice(0, 4).map((ins, i) => (
-                          <li key={i}>{(ins.insight_text || "").slice(0, 280)}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-                </aside>
-              ) : null}
-              <div className="max-w-3xl space-y-8 text-[15px] md:text-base leading-[1.75] text-gray-800 dark:text-gray-200 font-sans">
-                {journalEditing
-                  ? journalDraft.map((msg, i) => (
-                      <div key={i} className="space-y-2">
-                        <p className="text-xs font-semibold uppercase tracking-widest text-gray-400 dark:text-gray-500">{msg.role === "user" ? "You" : "AI"}</p>
-                        <textarea
-                          value={msg.text}
-                          onChange={(e) => {
-                            const t = e.target.value;
-                            setJournalDraft((d) => {
-                              const next = [...d];
-                              next[i] = { ...next[i], text: t };
-                              return next;
-                            });
-                          }}
-                          rows={Math.max(4, Math.min(24, msg.text.split("\n").length + 2))}
-                          className="min-h-[100px] w-full resize-y rounded-xl border border-gray-200 bg-white px-3 py-3 text-gray-900 shadow-sm placeholder-gray-400 focus:border-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-400/25 dark:border-gray-600 dark:bg-[#343541] dark:text-gray-100 dark:focus:border-white/30 dark:focus:ring-white/15"
-                          aria-label={msg.role === "user" ? "Your message" : "AI message"}
-                        />
-                        {msg.role === "ai" && msg.retrievalLog && (
-                          <div className="pt-2">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setExpandedLogKey((prev) =>
-                                  prev === `${selectedTranscript.id}:${i}` ? null : `${selectedTranscript.id}:${i}`
-                                )
-                              }
-                              className="text-xs font-medium text-gray-700 hover:underline dark:text-white/80"
+                <textarea
+                  value={journalMarkdownDraft}
+                  onChange={(e) => setJournalMarkdownDraft(e.target.value)}
+                  spellCheck
+                  aria-label="Journal entry (Markdown)"
+                  className="mt-3 min-h-[min(50vh,20rem)] w-full max-w-3xl flex-1 resize-y rounded-lg border border-[rgba(120,180,200,0.14)] bg-transparent px-3 py-3 font-sans text-[15px] leading-[1.75] text-[#E8F1F5] placeholder:text-[#5F7585] focus:border-[rgba(45,212,191,0.45)] focus:outline-none focus:ring-2 focus:ring-[rgba(45,212,191,0.2)] md:text-base"
+                />
+              ) : (
+                <div className="max-w-3xl space-y-8 text-[15px] md:text-base leading-[1.75] font-sans text-[#E8F1F5]">
+                  {selectedTranscript.fullTranscript.map((msg, i) => (
+                    <div key={i} className="space-y-2">
+                      <p className="text-xs font-semibold uppercase tracking-widest text-[#5F7585]">{msg.role === "user" ? "You" : "AI"}</p>
+                      <p className="whitespace-pre-wrap">{msg.text}</p>
+                      {msg.role === "ai" && msg.retrievalLog && (
+                        <div className="pt-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedLogKey((prev) => (prev === `${selectedTranscript.id}:${i}` ? null : `${selectedTranscript.id}:${i}`))
+                            }
+                            className="text-xs font-medium text-[#9BB1BE] hover:underline hover:text-[#E8F1F5]"
+                          >
+                            {expandedLogKey === `${selectedTranscript.id}:${i}` ? "Hide" : "Show"} memory context (vector DB)
+                          </button>
+                          {expandedLogKey === `${selectedTranscript.id}:${i}` && (
+                            <pre
+                              className={`mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-xl border ${kbTreeBorder} bg-[rgba(10,18,28,0.7)] p-3 text-xs text-[#C5D4DE] backdrop-blur-sm`}
                             >
-                              {expandedLogKey === `${selectedTranscript.id}:${i}` ? "Hide" : "Show"} memory context (vector DB)
-                            </button>
-                            {expandedLogKey === `${selectedTranscript.id}:${i}` && (
-                              <pre className="mt-2 p-3 rounded-xl bg-gray-50 text-gray-600 text-xs whitespace-pre-wrap break-words border border-gray-100 max-h-48 overflow-y-auto dark:bg-[#343541] dark:text-gray-400 dark:border-gray-600">
-                                {msg.retrievalLog}
-                              </pre>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    ))
-                  : selectedTranscript.fullTranscript.map((msg, i) => (
-                      <div key={i} className="space-y-2">
-                        <p className="text-xs font-semibold uppercase tracking-widest text-gray-400 dark:text-gray-500">{msg.role === "user" ? "You" : "AI"}</p>
-                        <p className="whitespace-pre-wrap">{msg.text}</p>
-                        {msg.role === "ai" && msg.retrievalLog && (
-                          <div className="pt-2">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setExpandedLogKey((prev) => (prev === `${selectedTranscript.id}:${i}` ? null : `${selectedTranscript.id}:${i}`))
-                              }
-                              className="text-xs font-medium text-gray-700 hover:underline dark:text-white/80"
-                            >
-                              {expandedLogKey === `${selectedTranscript.id}:${i}` ? "Hide" : "Show"} memory context (vector DB)
-                            </button>
-                            {expandedLogKey === `${selectedTranscript.id}:${i}` && (
-                              <pre className="mt-2 p-3 rounded-xl bg-gray-50 text-gray-600 text-xs whitespace-pre-wrap break-words border border-gray-100 max-h-48 overflow-y-auto dark:bg-[#343541] dark:text-gray-400 dark:border-gray-600">
-                                {msg.retrievalLog}
-                              </pre>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-              </div>
+                              {msg.retrievalLog}
+                            </pre>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         ) : selectedJournalDayEntries && selectedJournalDayEntries.length > 0 ? (
-          <div className="flex-1 flex flex-col min-h-0 m-3 md:m-4 rounded-2xl bg-white border border-gray-100 shadow-sm dark:bg-[#2f2f2f] dark:border-gray-700 overflow-hidden">
-            {onDownloadKnowledgeBase && onImportKnowledgeBaseFile && (
-              <>
-                <input
-                  ref={knowledgeBaseFileRef}
-                  type="file"
-                  accept=".zip,application/zip,application/x-zip-compressed,application/json,.json"
-                  className="hidden"
-                  aria-hidden
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) onImportKnowledgeBaseFile(f);
-                    e.target.value = "";
-                  }}
-                />
-                <div className="flex shrink-0 justify-end gap-2 border-b border-gray-100 px-4 pb-2.5 pt-3 dark:border-white/10 dark:bg-[#252525]">
-                  <button
-                    type="button"
-                    onClick={onDownloadKnowledgeBase}
-                    className={knowledgeBaseToolbarBtnClass}
-                    title="Download a .zip: journals/ (manual) and conversations/ (AI-assisted)"
-                  >
-                    Download Markdown folder
-                  </button>
-                  <button
-                    type="button"
-                    onClick={openKnowledgeBaseFilePicker}
-                    className={knowledgeBaseToolbarBtnClass}
-                    title="Upload a .zip export (or legacy .json). Layout matches The Brain explorer."
-                  >
-                    Upload Markdown folder
-                  </button>
-                </div>
-              </>
-            )}
-            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-[#343541]/40">
-              <span className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-widest">The Brain</span>
-              <span className="text-xs text-gray-400 dark:text-gray-500">
+          <div className={kbDetailShellClass}>
+            <div className={kbMetaRowClass}>
+              <span className="text-xs font-semibold uppercase tracking-widest text-[#5F7585]">The Brain</span>
+              <span className="text-xs text-[#9BB1BE]">
                 {selectedJournalDayEntries.length} entr{selectedJournalDayEntries.length === 1 ? "y" : "ies"} · scroll to read oldest → newest
               </span>
             </div>
             <div className="flex-1 overflow-y-auto scrollbar px-6 py-8 md:px-10 md:py-10">
-              <h3 className="text-2xl md:text-3xl font-semibold text-gray-900 dark:text-gray-100 tracking-tight mb-8">
+              <h3 className="mb-8 text-2xl font-semibold tracking-tight text-[#E8F1F5] md:text-3xl">
                 {formatCalendarDayHeading(localCalendarDayKey(selectedJournalDayEntries[0].date))}
               </h3>
-              <div className="max-w-3xl space-y-12 text-[15px] md:text-base leading-[1.75] text-gray-800 dark:text-gray-200 font-sans">
+              <div className="max-w-3xl space-y-12 text-[15px] font-sans leading-[1.75] text-[#E8F1F5] md:text-base">
                 {selectedJournalDayEntries.map((entry, entryIdx) => {
                   const timeLbl = formatEntryTimeLabel(entry.date);
                   return (
-                    <article key={entry.id} className={entryIdx > 0 ? "pt-12 border-t border-gray-100 dark:border-white/10" : ""}>
-                      <div className="flex flex-wrap items-start justify-between gap-2 mb-6">
+                    <article key={entry.id} className={entryIdx > 0 ? `pt-12 border-t ${kbTreeBorder}` : ""}>
+                      <div className="mb-6 flex flex-wrap items-start justify-between gap-2">
                         <div>
                           {timeLbl ? (
-                            <p className="text-lg font-medium text-gray-600 dark:text-white/80 tabular-nums">{timeLbl}</p>
+                            <p className="text-lg font-medium tabular-nums text-[#9BB1BE]">{timeLbl}</p>
                           ) : (
-                            <p className="text-lg font-medium text-gray-600 dark:text-white/80">{getFormattedDate(entry)}</p>
+                            <p className="text-lg font-medium text-[#9BB1BE]">{getFormattedDate(entry)}</p>
                           )}
-                          <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">Saved {formatRelativeSaved(entry.date)}</p>
+                          <p className="mt-0.5 text-xs text-[#5F7585]">Saved {formatRelativeSaved(entry.date)}</p>
                         </div>
                         <button
                           type="button"
                           onClick={() => trySelect({ kind: "journal", id: entry.id })}
-                          className="shrink-0 rounded-full border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-800 shadow-sm hover:bg-gray-50 dark:border-white/15 dark:bg-white/10 dark:text-white dark:hover:bg-white/15"
+                          className="shrink-0 rounded-full border border-[rgba(120,180,200,0.2)] bg-white/10 px-3 py-1.5 text-xs font-medium text-[#E8F1F5] shadow-sm backdrop-blur-sm transition-colors hover:bg-white/[0.16]"
                         >
                           Edit this entry
                         </button>
@@ -1072,7 +911,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                           const logKey = `${entry.id}:${i}`;
                           return (
                             <div key={i} className="space-y-2">
-                              <p className="text-xs font-semibold uppercase tracking-widest text-gray-400 dark:text-gray-500">
+                              <p className="text-xs font-semibold uppercase tracking-widest text-[#5F7585]">
                                 {msg.role === "user" ? "You" : "AI"}
                               </p>
                               <p className="whitespace-pre-wrap">{msg.text}</p>
@@ -1081,12 +920,14 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                                   <button
                                     type="button"
                                     onClick={() => setExpandedLogKey((prev) => (prev === logKey ? null : logKey))}
-                                    className="text-xs font-medium text-gray-700 hover:underline dark:text-white/80"
+                                    className="text-xs font-medium text-[#9BB1BE] hover:underline hover:text-[#E8F1F5]"
                                   >
                                     {expandedLogKey === logKey ? "Hide" : "Show"} memory context (vector DB)
                                   </button>
                                   {expandedLogKey === logKey && (
-                                    <pre className="mt-2 p-3 rounded-xl bg-gray-50 text-gray-600 text-xs whitespace-pre-wrap break-words border border-gray-100 max-h-48 overflow-y-auto dark:bg-[#343541] dark:text-gray-400 dark:border-gray-600">
+                                    <pre
+                                      className={`mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-xl border ${kbTreeBorder} bg-[rgba(10,18,28,0.7)] p-3 text-xs text-[#C5D4DE] backdrop-blur-sm`}
+                                    >
                                       {msg.retrievalLog}
                                     </pre>
                                   )}
@@ -1103,7 +944,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
             </div>
           </div>
         ) : !hasAnyContent ? (
-          <div className="flex flex-1 min-h-0 flex-col m-3 md:m-4 overflow-hidden rounded-2xl border border-gray-100 bg-white shadow-sm dark:border-gray-700 dark:bg-[#2f2f2f]">
+          <div className="m-3 flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-[rgba(120,180,200,0.14)] bg-[rgba(15,28,40,0.45)] shadow-sm backdrop-blur-md md:m-4">
             {onImportKnowledgeBaseFile && (
               <>
                 <input
@@ -1118,17 +959,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                     e.target.value = "";
                   }}
                 />
-                <div className="flex shrink-0 flex-wrap justify-end gap-2 border-b border-gray-100 px-4 pb-2.5 pt-3 dark:border-white/10 dark:bg-[#252525]">
-                  {onDownloadKnowledgeBase && hasAnyContent ? (
-                    <button
-                      type="button"
-                      onClick={onDownloadKnowledgeBase}
-                      className={knowledgeBaseToolbarBtnClass}
-                      title="Download a .zip: journals/ (manual) and conversations/ (AI-assisted)"
-                    >
-                      Download Markdown folder
-                    </button>
-                  ) : null}
+                <div className={kbToolbarStripWrapClass}>
                   <button
                     type="button"
                     onClick={openKnowledgeBaseFilePicker}
@@ -1140,34 +971,35 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 </div>
               </>
             )}
-            <div className="flex flex-1 items-center justify-center p-6 min-h-[200px]">
-              <div className="w-full max-w-lg rounded-2xl border-2 border-dashed border-gray-200 bg-gray-50 px-6 py-10 text-center dark:border-gray-600 dark:bg-[#343541]">
-                <h3 className="mb-2 text-sm font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-300">
+            <div className="flex min-h-[200px] flex-1 items-center justify-center p-6">
+              <div className="w-full max-w-lg rounded-2xl border-2 border-dashed border-[rgba(120,180,200,0.28)] bg-[rgba(20,37,52,0.35)] px-6 py-10 text-center backdrop-blur-sm">
+                <h3 className="mb-2 text-sm font-semibold uppercase tracking-wider text-[#E8F1F5]">
                   Knowledge base is empty
                 </h3>
-                <p className="mb-6 text-sm leading-relaxed text-gray-500 dark:text-gray-400">
-                  Import a Markdown <strong className="font-medium text-gray-700 dark:text-gray-300">.zip</strong> to load manual journals and
-                  AI-assisted journals. Or use <strong className="font-medium text-gray-700 dark:text-gray-300">Import journals</strong>{" "}
-                  in the sidebar — a folder or one or more <code className="rounded bg-gray-200/80 px-1 text-xs dark:bg-black/30">.md</code> files (filing dates from path/name via the API).
+                <p className="mb-6 text-sm leading-relaxed text-[#9BB1BE]">
+                  Import a Markdown <strong className="font-medium text-[#C5D4DE]">.zip</strong> to load manual journals and
+                  AI-assisted journals. Or use <strong className="font-medium text-[#C5D4DE]">Import journals</strong>{" "}
+                  in the sidebar — a folder or one or more{" "}
+                  <code className="rounded bg-[rgba(10,18,28,0.6)] px-1 text-xs text-[#C5D4DE]">.md</code> files (filing dates from path/name via the API).
                   New entries from AI-Assisted Journal Mode appear here after you save.
                 </p>
                 {onImportKnowledgeBaseFile ? (
                   <button
                     type="button"
                     onClick={openKnowledgeBaseFilePicker}
-                    className="rounded-full bg-gray-900 px-6 py-2.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-gray-800 dark:bg-white dark:text-gray-900 dark:hover:bg-white/90"
+                    className="rounded-full border border-[rgba(120,180,200,0.14)] bg-[rgba(20,37,52,0.9)] px-6 py-2.5 text-sm font-medium text-[#E8F1F5] shadow-sm backdrop-blur-sm transition-colors hover:bg-[rgba(27,46,64,0.95)]"
                   >
                     Upload Markdown folder
                   </button>
                 ) : null}
                 {!onImportKnowledgeBaseFile && (
-                  <p className="text-xs text-gray-400 dark:text-gray-500">Upload is not available in this context.</p>
+                  <p className="text-xs text-[#5F7585]">Upload is not available in this context.</p>
                 )}
               </div>
             </div>
           </div>
         ) : (
-          <div className="flex flex-1 items-center justify-center text-gray-500 dark:text-gray-400 text-sm px-4 text-center">
+          <div className="flex flex-1 items-center justify-center px-4 text-center text-sm text-[#9BB1BE]">
             Select an item from the explorer.
           </div>
         )}

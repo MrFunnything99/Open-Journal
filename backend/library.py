@@ -1372,67 +1372,6 @@ def get_memory_for_visualization(instance_id: str = "") -> tuple[list[str], list
         return ([], [])
 
 
-def get_memory_for_date(date_iso: str, instance_id: str = "") -> tuple[list[dict], list[dict]]:
-    """Return (journal entries for date, []) for the given date (YYYY-MM-DD)."""
-    import vec_store
-
-    _ensure_storage()
-    if not date_iso or len(date_iso) < 10:
-        return ([], [])
-    d = date_iso[:10]
-    try:
-        episodic = vec_store.journal_entries_for_date_range(
-            instance_id, d, d, limit=80
-        )
-    except Exception as e:
-        print("[backend] journal_entries_for_date_range error:", e)
-        episodic = []
-    return (episodic, [])
-
-
-def generate_day_summary(
-    date_iso: str,
-    raw_transcript: str | None,
-    episodic: list[dict],
-    gist: list[dict],
-) -> str:
-    """Use the LLM to produce a short summary/highlights for the day from raw journal and DB memory."""
-    date_display = date_iso[:10] if date_iso else "this day"
-    episodic_blob = "\n".join(f"- {m.get('document', '')}" for m in episodic if m.get("document"))
-    gist_blob = "\n".join(f"- {m.get('document', '')}" for m in gist if m.get("document"))
-    raw_section = ""
-    if raw_transcript and raw_transcript.strip():
-        raw_section = f"""
-RAW JOURNAL ENTRY (user and AI conversation) for this day:
----
-{raw_transcript.strip()[:8000]}
----
-"""
-    prompt = f"""You are summarizing a single day of the user's journaling life. Given the date and any raw journal transcript plus what is stored in the memory DB for that day, return exactly TWO separate paragraphs with these exact headings.
-
-Date: {date_display}
-{raw_section}
-MEMORY DB — Episodic summaries for this day:
-{episodic_blob or "(none)"}
-
-MEMORY DB — Gist facts for this day:
-{gist_blob or "(none)"}
-
-Use exactly this format (include the headings and a blank line after each heading):
-
-Objective
-
-[One paragraph: facts only. What happened, what was said or done, concrete events or topics. No interpretation or feelings. Just the facts.]
-
-Story of the day
-
-[One paragraph: synthesis. The narrative of the day — themes, how things fit together, what it added up to. The story of the day.]
-
-If there is no journal and no DB content for this day, say so briefly under Objective and under Story of the day write something like "No recorded content to synthesize." Do not invent details."""
-    out = _call_gemini(prompt)
-    return (out or "No summary generated.").strip()
-
-
 def list_memory_facts(instance_id: str = "") -> list[dict]:
     """Return journal entries for Memory UI (legacy route name)."""
     import vec_store

@@ -14,7 +14,7 @@ from typing import Any
 _MAX_LOG_ARG_LEN = 400
 
 _ALLOWED_VIEWS = frozenset({"home", "chat", "brain"})
-_ALLOWED_BRAIN = frozenset({"knowledgeBase", "calendar"})
+_ALLOWED_BRAIN = frozenset({"knowledgeBase"})
 
 
 def tool_navigate_ui(raw_args: object) -> tuple[dict[str, Any], str, dict[str, Any] | None]:

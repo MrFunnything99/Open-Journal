@@ -3,7 +3,7 @@ import { backendFetch } from "../../backendApi";
 import type { ChatMessage } from "./hooks/useJournalHistory";
 import { JOURNAL_HISTORY_STORAGE_KEY, parseKnowledgeBaseFile, useJournalHistory } from "./hooks/useJournalHistory";
 import {
-  buildKnowledgeBaseMarkdownZip,
+  buildJournalsDownloadZip,
   extractJournalEntriesFromMarkdownDump,
   listJournalPathsInKnowledgeBaseZip,
   parseKnowledgeBaseMarkdownZip,
@@ -11,10 +11,8 @@ import {
 import { BrainLayout } from "./components/BrainLayout";
 import { VoiceMemoTab } from "./components/VoiceMemoTab";
 
-import { BrainCalendarPanel } from "./components/BrainCalendarPanel";
 import { PersonaplexChatProvider, type PersonaplexNavigateAction } from "./PersonaplexChatContext";
 import { MobileAskComposerDockGate } from "./components/GlobalAskAnythingBar";
-import { AboutTab } from "./components/AboutTab";
 import { PersonaplexGithubLink } from "./components/PersonaplexGithubLink";
 import { PersonaplexLeftRail, type PersonaplexView } from "./components/PersonaplexLeftRail";
 import { AssistedJournalUnloadSync } from "./components/AssistedJournalUnloadSync";
@@ -140,15 +138,6 @@ export const Personaplex = () => {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [railExpanded, setRailExpanded] = useState(true);
   const [mobileRailOpen, setMobileRailOpen] = useState(false);
-  const [calendarMonth, setCalendarMonth] = useState(() => {
-    const d = new Date();
-    return { year: d.getFullYear(), month: d.getMonth() };
-  });
-  const [calendarSelectedDate, setCalendarSelectedDate] = useState<string | null>(null);
-  const [calendarDaySummary, setCalendarDaySummary] = useState<string | null>(null);
-  const [calendarDaySummaryLoading, setCalendarDaySummaryLoading] = useState(false);
-  /** Left sidebar: Knowledge base vs Calendar */
-  const [brainSection, setBrainSection] = useState<"knowledgeBase" | "calendar">("knowledgeBase");
   const chatToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 4000);
@@ -160,7 +149,6 @@ export const Personaplex = () => {
         if (a.type !== "navigate") continue;
         const target: PersonaplexView = a.view === "journal" ? "voice_memo" : a.view;
         setView(target);
-        if (target === "brain" && a.brainSection) setBrainSection(a.brainSection);
         navigated = true;
       }
       if (navigated) chatToast("Opened the screen you asked for.");
@@ -218,24 +206,21 @@ export const Personaplex = () => {
       /* ignore */
     }
     clearHistory();
-    setCalendarSelectedDate(null);
-    setCalendarDaySummary(null);
-    setCalendarDaySummaryLoading(false);
     chatWorkspaceResetRef.current?.();
     setToastMessage("Started fresh: server memory wiped and local Personaplex data cleared.");
     setTimeout(() => setToastMessage(null), 5000);
   }, [clearHistory, resetServerKnowledgeBaseMemory]);
 
-  const handleDownloadKnowledgeBase = useCallback(async () => {
+  const handleDownloadJournals = useCallback(async () => {
     try {
-      const blob = await buildKnowledgeBaseMarkdownZip(entries);
+      const blob = await buildJournalsDownloadZip(entries);
       const a = document.createElement("a");
       const url = URL.createObjectURL(blob);
       a.href = url;
-      a.download = `selfmeridian-knowledge-base-${new Date().toISOString().slice(0, 10)}.zip`;
+      a.download = `selfmeridian-journals-${new Date().toISOString().slice(0, 10)}.zip`;
       a.click();
       URL.revokeObjectURL(url);
-      setToastMessage("Downloaded Markdown folder (.zip). Unzip to browse manual and AI-assisted journals.");
+      setToastMessage("Downloaded Journals (.zip).");
       setTimeout(() => setToastMessage(null), 4000);
     } catch {
       setToastMessage("Download failed.");
@@ -243,6 +228,7 @@ export const Personaplex = () => {
     }
   }, [entries]);
 
+  /** Legacy knowledge-base .zip / .json import (`journals/` + `conversations/` under selfmeridian-knowledge-base). */
   const handleImportKnowledgeBaseFile = useCallback(
     async (file: File) => {
       const applyKnowledgeBaseImport = async (exportPayload: {
@@ -464,73 +450,18 @@ export const Personaplex = () => {
 
       {/* Main content */}
       <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-        <div
-          className={`flex-1 flex flex-col min-h-0 transition-opacity duration-300 ${
-            view === "brain" ||
-              view === "voice_memo" ||
-              view === "about"
-              ? "overflow-hidden"
-              : "overflow-y-auto"
-          } opacity-100`}
-        >
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden opacity-100 transition-opacity duration-300">
           {view === "voice_memo" && (
             <VoiceMemoTab onToast={chatToast} saveEntry={saveEntry} syncUnsyncedEntries={syncUnsyncedEntries} />
           )}
           {view === "brain" && (
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
               <div className="flex-none border-b border-white/10 px-4 py-3 md:px-5">
-                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between lg:gap-4">
-                  <div className="min-w-0 flex-1">
-                    <h2 className="text-sm font-medium text-white/90 md:text-base">
-                      {brainSection === "knowledgeBase" ? "Knowledge base" : "Calendar"}
-                </h2>
-                    <p className="mt-1 text-xs text-white/50 md:text-sm">
-                      {brainSection === "knowledgeBase"
-                        ? "Manual journals and AI-assisted journals."
-                        : "Click a date for an AI summary of that day (journal entries + memory)."}
-                    </p>
-                        </div>
-                  <div
-                    className="flex shrink-0 gap-1 rounded-xl border border-white/10 bg-white/[0.06] p-1"
-                    role="tablist"
-                    aria-label="Brain section"
-                  >
-                  <button
-                    type="button"
-                      role="tab"
-                      aria-selected={brainSection === "knowledgeBase"}
-                      onClick={() => setBrainSection("knowledgeBase")}
-                      className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors md:text-sm ${
-                        brainSection === "knowledgeBase"
-                          ? "bg-white/[0.14] text-white shadow-sm ring-1 ring-white/10"
-                          : "text-white/60 hover:bg-white/10 hover:text-white"
-                      }`}
-                    >
-                      <svg className="h-4 w-4 shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                        </svg>
-                      <span className="whitespace-nowrap">Knowledge base</span>
-                      </button>
-                      <button
-                        type="button"
-                      role="tab"
-                      aria-selected={brainSection === "calendar"}
-                      onClick={() => setBrainSection("calendar")}
-                      className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors md:text-sm ${
-                        brainSection === "calendar"
-                          ? "bg-white/[0.14] text-white shadow-sm ring-1 ring-white/10"
-                          : "text-white/60 hover:bg-white/10 hover:text-white"
-                      }`}
-                    >
-                      <svg className="h-4 w-4 shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                        </svg>
-                      <span className="whitespace-nowrap">Calendar</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              {brainSection === "knowledgeBase" ? (
+                <h2 className="text-sm font-medium text-[#E8F1F5] md:text-base">Knowledge base</h2>
+                <p className="mt-1 text-xs text-[#9BB1BE] md:text-sm">
+                  Manual journals and AI-assisted journals.
+                </p>
+              </div>
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                 <BrainLayout
                   entries={entries}
@@ -541,7 +472,7 @@ export const Personaplex = () => {
                     setToastMessage(msg);
                     setTimeout(() => setToastMessage(null), 3000);
                   }}
-                  onDownloadKnowledgeBase={handleDownloadKnowledgeBase}
+                  onDownloadJournals={handleDownloadJournals}
                   onImportKnowledgeBaseFile={handleImportKnowledgeBaseFile}
                   onPrepareKnowledgeBaseUpload={prepareKnowledgeBaseUpload}
                   onImportJournalDumpFolder={handleImportJournalDumpFolder}
@@ -549,31 +480,14 @@ export const Personaplex = () => {
                   onStartFresh={handleStartFreshPersonaplex}
                 />
               </div>
-              ) : (
-                <BrainCalendarPanel
-                  entries={entries}
-                  calendarMonth={calendarMonth}
-                  setCalendarMonth={setCalendarMonth}
-                  calendarSelectedDate={calendarSelectedDate}
-                  setCalendarSelectedDate={setCalendarSelectedDate}
-                  calendarDaySummary={calendarDaySummary}
-                  setCalendarDaySummary={setCalendarDaySummary}
-                  calendarDaySummaryLoading={calendarDaySummaryLoading}
-                  setCalendarDaySummaryLoading={setCalendarDaySummaryLoading}
-                />
-              )}
             </div>
           )}
-          {view === "about" && <AboutTab />}
         </div>
       </main>
 
-      {/* Footer pinned below main on other tabs; About includes the link inside its scroll document. */}
-      {view !== "about" && (
-        <footer className="pointer-events-none relative z-10 flex-shrink-0 px-4 pb-[calc(4.5rem+env(safe-area-inset-bottom))] pt-1 text-center md:pb-5">
-          <PersonaplexGithubLink className="pointer-events-auto" />
-        </footer>
-      )}
+      <footer className="pointer-events-none relative z-10 flex-shrink-0 px-4 pb-[calc(4.5rem+env(safe-area-inset-bottom))] pt-1 text-center md:pb-5">
+        <PersonaplexGithubLink className="pointer-events-auto" />
+      </footer>
 
       <MobileAskComposerDockGate railOpen={mobileRailOpen} activeView={view} />
       </div>

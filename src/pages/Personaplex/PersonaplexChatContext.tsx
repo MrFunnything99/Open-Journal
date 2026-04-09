@@ -15,14 +15,14 @@ import {
 export type PersonaplexNavigateAction = {
   type: "navigate";
   view: "voice_memo" | "journal" | "brain";
-  brainSection?: "knowledgeBase" | "calendar";
+  brainSection?: "knowledgeBase";
 };
 
 function parseNavigateActions(raw: unknown): PersonaplexNavigateAction[] {
   if (!Array.isArray(raw)) return [];
   const out: PersonaplexNavigateAction[] = [];
   const views = new Set<string>(["voice_memo", "journal", "brain"]);
-  const brains = new Set<string>(["knowledgeBase", "calendar"]);
+  const brains = new Set<string>(["knowledgeBase"]);
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
     const o = item as Record<string, unknown>;

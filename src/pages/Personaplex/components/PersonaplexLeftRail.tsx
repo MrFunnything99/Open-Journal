@@ -1,8 +1,6 @@
 import type { Dispatch, ReactNode, SetStateAction } from "react";
-import { ThemeToggle } from "../../../components/ThemeToggle";
-import { useTheme } from "../../../hooks/useTheme";
 
-export type PersonaplexView = "voice_memo" | "brain" | "about";
+export type PersonaplexView = "voice_memo" | "brain";
 
 type Props = {
   /** Expanded width on desktop (Open WebUI–style rail). */
@@ -50,7 +48,6 @@ export function PersonaplexLeftRail({
   view,
   setView,
 }: Props) {
-  const { mode, toggle } = useTheme();
   const narrow = !expanded;
 
   const closeMobile = () => setMobileOpen(false);
@@ -103,29 +100,7 @@ export function PersonaplexLeftRail({
           </svg>,
           narrow
         )}
-        <div className="min-h-3 flex-1" aria-hidden />
-        {navRow(
-          view === "about",
-          () => {
-            setView("about");
-            closeMobile();
-          },
-          "About",
-          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-            />
-          </svg>,
-          narrow
-        )}
       </nav>
-
-      <div className="flex flex-none items-center justify-center gap-1 border-t border-white/10 p-2">
-        <ThemeToggle mode={mode} onToggle={toggle} className="border-white/15 bg-white/10 text-white hover:bg-white/15" />
-      </div>
     </div>
   );
 

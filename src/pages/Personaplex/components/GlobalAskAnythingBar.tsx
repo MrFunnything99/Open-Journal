@@ -1,5 +1,13 @@
 import { createPortal } from "react-dom";
-import { useEffect, useLayoutEffect, useRef, useState, type MutableRefObject, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MutableRefObject,
+  type RefObject,
+} from "react";
 import {
   CHAT_INTERACTION_MODE_META,
   CHAT_INTERACTION_MODES,
@@ -373,6 +381,36 @@ export function AskAnythingComposer({
 
   const showModelFooter = chatInteractionMode === "autobiography";
 
+  const assistedCenterGrow = assistedJournalMinimal && layout === "center";
+  const assistedTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const [assistedComposerTopFade, setAssistedComposerTopFade] = useState(false);
+
+  const syncAssistedTextareaHeight = useCallback(() => {
+    const el = assistedTextareaRef.current;
+    if (!el) return;
+    const maxH = Math.min(window.innerHeight * 0.4, 240);
+    const minOneLine = 56;
+    el.style.height = "auto";
+    const next = Math.min(Math.max(el.scrollHeight, minOneLine), maxH);
+    el.style.height = `${next}px`;
+    el.style.overflowY = el.scrollHeight > maxH ? "auto" : "hidden";
+    setAssistedComposerTopFade(el.scrollTop > 0);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!assistedCenterGrow) return;
+    syncAssistedTextareaHeight();
+  }, [assistedCenterGrow, draft, syncAssistedTextareaHeight]);
+
+  useLayoutEffect(() => {
+    if (!assistedCenterGrow) return;
+    const onResize = () => syncAssistedTextareaHeight();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [assistedCenterGrow, syncAssistedTextareaHeight]);
+
+  const assistedInputBg = "rgba(15, 20, 30, 0.45)";
+
   if (layout === "rail" && railNarrow) {
     return (
       <div className="flex w-full flex-col gap-1.5 border-t border-white/10 px-0.5 py-2">
@@ -485,6 +523,78 @@ export function AskAnythingComposer({
   const canSend = !sending && micPhase === "idle" && (!!draft.trim() || !!pendingAudioFile);
   const showVoice = assistedJournalMinimal && chatInteractionMode === "autobiography" && !!onStartVoiceSession && micPhase === "idle";
 
+  const composerIconButtons = (
+    <>
+      {micPhase === "recording" ? (
+        <button
+          type="button"
+          onClick={stopRecording}
+          className={`flex shrink-0 items-center justify-center rounded-full bg-red-500 text-white ${btnSize}`}
+          aria-label="Stop recording"
+          title="Stop recording"
+        >
+          <span className="h-2.5 w-2.5 rounded-full bg-white animate-pulse" />
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={() => void startRecording()}
+          disabled={composerDisabled}
+          className={`flex shrink-0 items-center justify-center rounded-full text-white/55 transition-colors hover:bg-white/[0.07] hover:text-white/85 disabled:opacity-40 ${btnSize}`}
+          aria-label="Transcribe"
+          title="Transcribe"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className={iconSize} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+          </svg>
+        </button>
+      )}
+
+      {showVoice && (
+        <button
+          type="button"
+          onClick={onStartVoiceSession}
+          disabled={composerDisabled}
+          className={`flex shrink-0 items-center justify-center rounded-full text-white/55 transition-colors hover:bg-white/[0.07] hover:text-white/85 disabled:opacity-40 ${btnSize}`}
+          aria-label="Voice conversation"
+          title="Voice to voice"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className={iconSize} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+            <line x1="2" y1="12" x2="2" y2="12" />
+            <line x1="6" y1="8" x2="6" y2="16" />
+            <line x1="10" y1="4" x2="10" y2="20" />
+            <line x1="14" y1="8" x2="14" y2="16" />
+            <line x1="18" y1="6" x2="18" y2="18" />
+            <line x1="22" y1="10" x2="22" y2="14" />
+          </svg>
+        </button>
+      )}
+
+      <div className="mx-1 h-5 w-px bg-white/[0.08]" aria-hidden />
+
+      <button
+        type="button"
+        onClick={() => void sendChat()}
+        disabled={!canSend}
+        className={`flex shrink-0 items-center justify-center rounded-full transition-all ${btnSize} ${
+          canSend ? "bg-[#10a37f] text-white shadow-sm shadow-[#10a37f]/20 hover:bg-[#0d8c6e]" : "text-white/20"
+        }`}
+        aria-label="Send message"
+        title="Send"
+      >
+        <SendIcon className={isRail ? "h-4 w-4" : "h-[18px] w-[18px]"} />
+      </button>
+    </>
+  );
+
+  const composerShellRing = micPhase === "recording" ? " ring-2 ring-red-400/50" : "";
+  const composerShellBase =
+    "rounded-2xl border border-white/[0.07] bg-[rgba(15,20,30,0.45)] backdrop-blur-[20px] transition-shadow" +
+    composerShellRing;
+  const composerShellClass = assistedCenterGrow
+    ? `relative min-h-[56px] ${composerShellBase}`
+    : `flex items-center ${composerShellBase}` + (isRail ? " min-h-[48px]" : " min-h-[56px]");
+
   return (
     <div className={`flex flex-col ${layout === "center" ? "mx-auto w-full max-w-2xl" : "w-full"}`}>
       {/* Model selector — ghost chip above the bar */}
@@ -506,13 +616,7 @@ export function AskAnythingComposer({
       )}
 
       {/* Single flat container — no nested backgrounds */}
-      <div
-        className={
-          "flex items-center rounded-2xl border border-white/[0.07] bg-[rgba(15,20,30,0.45)] backdrop-blur-[20px] transition-shadow" +
-          (micPhase === "recording" ? " ring-2 ring-red-400/50" : "") +
-          (isRail ? " min-h-[48px]" : " min-h-[56px]")
-        }
-      >
+      <div className={composerShellClass}>
         <input ref={fileInputRef as React.LegacyRef<HTMLInputElement>} type="file" accept="audio/*,.mp3,.m4a,.wav,.webm,.ogg,.flac" className="hidden" onChange={onPickFile} />
 
         {/* + button (non-assisted mode only) */}
@@ -547,97 +651,69 @@ export function AskAnythingComposer({
           </div>
         )}
 
-        {/* Textarea — seamless, no inner border */}
-        <textarea
-          id={`${idPrefix}-global-composer`}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void sendChat();
-            }
-          }}
-          disabled={composerDisabled}
-          rows={isRail ? 2 : 1}
-          placeholder={
-            pendingAudioFile
-              ? "Add a message or press send to transcribe"
-              : "What's on your mind..."
-          }
-          className={`max-h-36 min-w-0 flex-1 resize-none border-0 bg-transparent text-[0.95rem] text-white placeholder:text-white/30 focus:outline-none focus:ring-0 disabled:opacity-50 ${
-            isRail
-              ? "min-h-[44px] py-3 pl-3 pr-1 text-[0.9rem] leading-snug"
-              : `min-h-[56px] py-[18px] pr-1 ${assistedJournalMinimal ? "pl-5" : "pl-1"}`
-          }`}
-        />
-
-        {/* Right-side action buttons — flat, no nested container */}
-        <div className="flex shrink-0 items-center pr-3">
-          {micPhase === "recording" ? (
-            <button
-              type="button"
-              onClick={stopRecording}
-              className={`flex shrink-0 items-center justify-center rounded-full bg-red-500 text-white ${btnSize}`}
-              aria-label="Stop recording"
-              title="Stop recording"
-            >
-              <span className="h-2.5 w-2.5 rounded-full bg-white animate-pulse" />
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => void startRecording()}
+        {assistedCenterGrow ? (
+          <>
+            <div
+              className="pointer-events-none absolute left-0 right-0 top-0 z-10 h-6 transition-opacity duration-200 ease-out"
+              style={{
+                opacity: assistedComposerTopFade ? 1 : 0,
+                background: `linear-gradient(to bottom, ${assistedInputBg} 0%, transparent 100%)`,
+              }}
+              aria-hidden
+            />
+            <textarea
+              ref={assistedTextareaRef}
+              id={`${idPrefix}-global-composer`}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onScroll={(e) => setAssistedComposerTopFade(e.currentTarget.scrollTop > 0)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void sendChat();
+                }
+              }}
               disabled={composerDisabled}
-              className={`flex shrink-0 items-center justify-center rounded-full text-white/55 transition-colors hover:bg-white/[0.07] hover:text-white/85 disabled:opacity-40 ${btnSize}`}
-              aria-label="Transcribe"
-              title="Transcribe"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className={iconSize} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-              </svg>
-            </button>
-          )}
-
-          {showVoice && (
-            <button
-              type="button"
-              onClick={onStartVoiceSession}
+              rows={1}
+              placeholder={
+                pendingAudioFile
+                  ? "Add a message or press send to transcribe"
+                  : "What's on your mind..."
+              }
+              className="box-border min-h-[56px] min-w-0 w-full resize-none border-0 bg-transparent pb-14 pl-5 pr-40 pt-[18px] text-[0.95rem] text-white placeholder:text-white/30 focus:outline-none focus:ring-0 disabled:opacity-50"
+            />
+            <div className="pointer-events-none absolute bottom-2.5 right-3 z-20 flex items-center">
+              <div className="pointer-events-auto flex items-center">{composerIconButtons}</div>
+            </div>
+          </>
+        ) : (
+          <>
+            <textarea
+              id={`${idPrefix}-global-composer`}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void sendChat();
+                }
+              }}
               disabled={composerDisabled}
-              className={`flex shrink-0 items-center justify-center rounded-full text-white/55 transition-colors hover:bg-white/[0.07] hover:text-white/85 disabled:opacity-40 ${btnSize}`}
-              aria-label="Voice conversation"
-              title="Voice to voice"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className={iconSize} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
-                <line x1="2" y1="12" x2="2" y2="12" />
-                <line x1="6" y1="8" x2="6" y2="16" />
-                <line x1="10" y1="4" x2="10" y2="20" />
-                <line x1="14" y1="8" x2="14" y2="16" />
-                <line x1="18" y1="6" x2="18" y2="18" />
-                <line x1="22" y1="10" x2="22" y2="14" />
-              </svg>
-            </button>
-          )}
-
-          {/* Divider between voice buttons and send */}
-          <div className="mx-1 h-5 w-px bg-white/[0.08]" aria-hidden />
-
-          {/* Send button */}
-          <button
-            type="button"
-            onClick={() => void sendChat()}
-            disabled={!canSend}
-            className={`flex shrink-0 items-center justify-center rounded-full transition-all ${btnSize} ${
-              canSend
-                ? "bg-[#10a37f] text-white shadow-sm shadow-[#10a37f]/20 hover:bg-[#0d8c6e]"
-                : "text-white/20"
-            }`}
-            aria-label="Send message"
-            title="Send"
-          >
-            <SendIcon className={isRail ? "h-4 w-4" : "h-[18px] w-[18px]"} />
-          </button>
-        </div>
+              rows={isRail ? 2 : 1}
+              placeholder={
+                pendingAudioFile
+                  ? "Add a message or press send to transcribe"
+                  : "What's on your mind..."
+              }
+              className={`max-h-36 min-w-0 flex-1 resize-none border-0 bg-transparent text-[0.95rem] text-white placeholder:text-white/30 focus:outline-none focus:ring-0 disabled:opacity-50 ${
+                isRail
+                  ? "min-h-[44px] py-3 pl-3 pr-1 text-[0.9rem] leading-snug"
+                  : `min-h-[56px] py-[18px] pr-1 ${assistedJournalMinimal ? "pl-5" : "pl-1"}`
+              }`}
+            />
+            <div className="flex shrink-0 items-center pr-3">{composerIconButtons}</div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -676,7 +752,7 @@ export function MobileAskComposerDockGate({
   /** Home uses only the in-column composers (see VoiceMemoTab). Other tabs may use this dock on mobile. */
   return (
     <MobileAskComposerDock
-      hidden={railOpen || homeIdle || activeView === "voice_memo" || activeView === "about"}
+      hidden={railOpen || homeIdle || activeView === "voice_memo"}
     />
   );
 }

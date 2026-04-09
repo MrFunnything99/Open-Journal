@@ -33,6 +33,55 @@ export function formatCalendarDayHeading(dayKey: string): string {
   });
 }
 
+/** Same Year → Month → entries bucketing as The Brain explorer sidebar (descending years/months). */
+export type YearMonthTree = {
+  year: number;
+  months: { month: number; monthLabel: string; entries: JournalEntry[] }[];
+}[];
+
+export function buildYearMonthTree(sorted: JournalEntry[]): YearMonthTree {
+  const byYear = new Map<number, Map<number, JournalEntry[]>>();
+  for (const e of sorted) {
+    const d = new Date(e.date);
+    const y = d.getFullYear();
+    const m = d.getMonth();
+    if (!byYear.has(y)) byYear.set(y, new Map());
+    const ym = byYear.get(y)!;
+    if (!ym.has(m)) ym.set(m, []);
+    ym.get(m)!.push(e);
+  }
+  const years = [...byYear.keys()].sort((a, b) => b - a);
+  return years.map((year) => {
+    const monthsMap = byYear.get(year)!;
+    const months = [...monthsMap.keys()].sort((a, b) => b - a);
+    return {
+      year,
+      months: months.map((month) => ({
+        month,
+        monthLabel: new Date(year, month, 1).toLocaleString("en-US", { month: "long" }),
+        entries: monthsMap.get(month)!,
+      })),
+    };
+  });
+}
+
+/** Calendar-day sub-groups within a month — same ordering as explorer day rows. */
+export function groupJournalMonthByCalendarDay(
+  monthEntries: JournalEntry[]
+): { dayKey: string; entries: JournalEntry[] }[] {
+  const m = new Map<string, JournalEntry[]>();
+  for (const e of monthEntries) {
+    const k = localCalendarDayKey(e.date);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k)!.push(e);
+  }
+  const keys = [...m.keys()].sort();
+  return keys.map((dayKey) => ({
+    dayKey,
+    entries: (m.get(dayKey) ?? []).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
+  }));
+}
+
 function dayBundleRelPath(iso: string, section: "journals" | "conversations"): string {
   const d = new Date(iso);
   const year = d.getFullYear();
@@ -113,6 +162,10 @@ function readme(): string {
   ].join("\n");
 }
 
+/**
+ * Legacy export layout: `selfmeridian-knowledge-base/` with `journals/` and `conversations/` day-combined `.md` files.
+ * Kept for compatibility and importers; UI uses {@link buildJournalsDownloadZip} instead.
+ */
 export async function buildKnowledgeBaseMarkdownZip(entries: JournalEntry[]): Promise<Blob> {
   const zip = new JSZip();
   const root = zip.folder(ROOT);
@@ -132,6 +185,56 @@ export async function buildKnowledgeBaseMarkdownZip(entries: JournalEntry[]): Pr
     const combined = dayEntries.map((e) => entryToMarkdown(e)).join(`\n\n${KNOWLEDGE_BASE_ENTRY_BOUNDARY}\n\n`);
     root.file(path, combined);
   }
+
+  return zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+}
+
+const JOURNALS_EXPORT_ROOT = "Journals";
+const JOURNALS_MANUAL_DIR = "Manual Journals";
+const JOURNALS_ASSISTED_DIR = "AI-Assisted Journals";
+
+function safeJournalEntryFileName(id: string): string {
+  return `${id.replace(/[/\\:?*"<>|]/g, "_")}.md`;
+}
+
+/**
+ * One `.md` per entry under explorer-aligned paths, using {@link buildYearMonthTree} + {@link groupJournalMonthByCalendarDay}.
+ * Each file body uses the same `entryToMarkdown` pipeline as the legacy knowledge-base zip (YAML + transcript + JSON block).
+ */
+export async function buildJournalsDownloadZip(entries: JournalEntry[]): Promise<Blob> {
+  const zip = new JSZip();
+  const root = zip.folder(JOURNALS_EXPORT_ROOT);
+  if (!root) throw new Error("Failed to create zip root");
+
+  const journalSorted = entries
+    .filter((e) => !isConversationEntry(e))
+    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  const conversationSorted = entries
+    .filter(isConversationEntry)
+    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+  function writeExplorerTree(base: JSZip, tree: YearMonthTree): void {
+    for (const { year, months } of tree) {
+      const yearFolder = base.folder(String(year));
+      if (!yearFolder) continue;
+      for (const { monthLabel, entries: monthEntries } of months) {
+        const monthFolder = yearFolder.folder(monthLabel);
+        if (!monthFolder) continue;
+        for (const { dayKey, entries: dayEntries } of groupJournalMonthByCalendarDay(monthEntries)) {
+          const dayFolder = monthFolder.folder(dayKey);
+          if (!dayFolder) continue;
+          for (const e of dayEntries) {
+            dayFolder.file(safeJournalEntryFileName(e.id), entryToMarkdown(e));
+          }
+        }
+      }
+    }
+  }
+
+  const manualRoot = root.folder(JOURNALS_MANUAL_DIR);
+  const assistedRoot = root.folder(JOURNALS_ASSISTED_DIR);
+  if (manualRoot) writeExplorerTree(manualRoot, buildYearMonthTree(journalSorted));
+  if (assistedRoot) writeExplorerTree(assistedRoot, buildYearMonthTree(conversationSorted));
 
   return zip.generateAsync({ type: "blob", compression: "DEFLATE" });
 }

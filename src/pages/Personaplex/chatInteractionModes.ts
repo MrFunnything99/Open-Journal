@@ -12,13 +12,13 @@ export const CHAT_INTERACTION_MODE_META: Record<
     sublabel: "Reflect",
     composerChipLabel: "Manual Journal Mode",
     description:
-      "Your private writing space: type or dictate, optionally run AI Spelling Correction/Reformatting, get feedback, and save. Switch to AI-Assisted Journal Mode when you want a reflective chat with the model.",
+      "Your private writing space: type or dictate, optionally run AI Spelling Correction/Reformatting, and save. Switch to AI-Assisted Journal Mode when you want a reflective chat with the model.",
   },
   autobiography: {
     label: "AI-Assisted Journal Mode",
     sublabel: "Reflect with AI",
     composerChipLabel: "AI-Assisted Journal Mode",
     description:
-      "Chat with the AI to reflect—on today, on memories from your manual journals, or on where to steer your writing. When you are ready, use Save to Journal to move the thread into Manual Journal Mode for editing and saving.",
+      "Use the model control above the input to choose which AI replies. Model-data training is turned off for these API calls; however disclose at your own discretion.",
   },
 };
