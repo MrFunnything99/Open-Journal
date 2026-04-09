@@ -107,7 +107,6 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const [error, setError] = useState<string | null>(null);
   const [rawTranscript, setRawTranscript] = useState("");
   const [reviewText, setReviewText] = useState("");
-  const [journalCleanupModel, setJournalCleanupModel] = useState("openai/gpt-5.4");
   const [journalCleanupBusy, setJournalCleanupBusy] = useState(false);
   const [journalEntryDate, setJournalEntryDate] = useState("");
   const [journalEntryTime, setJournalEntryTime] = useState("");
@@ -343,7 +342,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       const res = await backendFetch("/journal-cleanup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, model: journalCleanupModel.trim() || undefined }),
+        body: JSON.stringify({ text }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         detail?: string;
@@ -364,7 +363,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     } finally {
       setJournalCleanupBusy(false);
     }
-  }, [reviewText, journalCleanupBusy, journalCleanupModel, onToast]);
+  }, [reviewText, journalCleanupBusy, onToast]);
 
   const startAnotherEntry = useCallback(() => {
     setRawTranscript("");
@@ -676,19 +675,6 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                       >
                         {journalCleanupBusy ? "Applying…" : "AI Spelling Correction/Reformatting"}
                       </button>
-                      <div className="flex items-center gap-1.5">
-                        <label className="text-[0.65rem] text-white/45" htmlFor={`${idPrefix}-cleanup-model`}>Model</label>
-                        <select
-                          id={`${idPrefix}-cleanup-model`}
-                          value={journalCleanupModel}
-                          onChange={(e) => setJournalCleanupModel(e.target.value)}
-                          className="rounded-full border border-white/15 bg-black/30 px-2 py-1 text-[0.65rem] text-white focus:border-white/25 focus:outline-none"
-                        >
-                          <option value="openai/gpt-5.4">gpt-5.4</option>
-                          <option value="anthropic/claude-sonnet-4.6">claude-sonnet-4.6</option>
-                          <option value="anthropic/claude-opus-4.6">claude-opus-4.6</option>
-                        </select>
-                      </div>
                     </div>
                   </div>
               </div>

@@ -1,22 +1,36 @@
 # SelfMeridian
 
-SelfMeridian is a local-first journaling app: type, dictate, or import entries, chat with an AI assistant, and build searchable memory (SQLite + vectors) for richer follow-up conversations and recommendations.
+SelfMeridian is a local-first journaling app: type, dictate, or import entries, and chat with an AI journaling companion. **This build is centered on the journaling experience itself**—not on semantic search over your past entries.
 
 This document is the **single source of truth** for setup, API keys, environment variables, and deployment. The Python backend loads `.env` from the **project root** (parent of `backend/`).
 
 ---
 
+## Current functionality (what actually matters right now)
+
+| Area | Behavior in this build |
+|------|-------------------------|
+| **AI-Assisted Journal** (default home experience) | The model replies using **only the current thread** (and system instructions). It does **not** run **vector / semantic search** over older journals to retrieve context. |
+| **Manual journal** | Write and save in the editor; dictation and cleanup helpers use the LLM/STT stack as implemented in the UI. |
+| **Vector search / RAG** | **Not used for AI-Assisted Journal** (`autobiography`, the default home mode): replies use the **current thread only**. The backend may still expose **journal** / **conversation** `/chat` paths that *can* pull vector context when enabled; this README describes the **assisted-journal–first** product. Storage and embedding code remains for **future** work. |
+| **OpenRouter** | Required for chat, transcription, and most model-backed helpers. |
+| **Perplexity** | Optional here: only needed if you turn on workflows that **embed or query** the vector store (not required to use assisted or manual journaling as described above). |
+| **Mistral** | Optional: text-to-speech (read-aloud) only. |
+
+---
+
 ## Table of contents
 
-1. [What you need](#what-you-need)
-2. [Getting API keys](#getting-api-keys)
-3. [Quick start (local)](#quick-start-local)
-4. [Environment variables](#environment-variables)
-5. [How the app is structured](#how-the-app-is-structured)
-6. [Architecture](#architecture)
-7. [Deployment (Fly.io)](#deployment-flyio)
-8. [Troubleshooting](#troubleshooting)
-9. [License](#license)
+1. [Current functionality](#current-functionality-what-actually-matters-right-now)
+2. [What you need](#what-you-need)
+3. [Getting API keys](#getting-api-keys)
+4. [Quick start (local)](#quick-start-local)
+5. [Environment variables](#environment-variables)
+6. [How the app is structured](#how-the-app-is-structured)
+7. [Architecture](#architecture)
+8. [Deployment (Fly.io)](#deployment-flyio)
+9. [Troubleshooting](#troubleshooting)
+10. [License](#license)
 
 ---
 
@@ -27,7 +41,7 @@ This document is the **single source of truth** for setup, API keys, environment
 | **Node.js 18+** | For Vite and the dev toolchain |
 | **Python 3.11+** | Recommended for the FastAPI backend |
 | **OpenRouter account** | Powers chat, speech-to-text (via multimodal models), transcript polish, and most LLM-backed helpers |
-| **Perplexity API key** | Vector embeddings for memory (gist / episodic / library). Without it, embedding-related features degrade or use placeholders |
+| **Perplexity API key** | **Optional in this build**—only for embedding/indexing flows if you use them; **not** required for assisted-journal chat (no vector retrieval there) |
 | **Mistral API key** | Optional; required only for **text-to-speech** (read-aloud / voice playback) via Mistral Voxtral |
 
 You do **not** need separate API keys for OpenAI, Anthropic, or Google **if** you run those models **through OpenRouter** (one key, many providers).
@@ -64,15 +78,19 @@ OpenRouter is an API gateway: one key can call models from OpenAI, Anthropic, Go
 | **Google (Gemini)** | [aistudio.google.com](https://aistudio.google.com/) | Not required for this repo’s default path; extraction/helpers use **OpenRouter** (`OPENROUTER_EXTRACTION_MODEL`, etc.) |
 | **xAI (Grok)** | [console.x.ai](https://console.x.ai/) | Optional; Grok is often used **through OpenRouter** (e.g. `x-ai/grok-4.1-fast`) |
 
-**Practical rule:** start with **only `OPENROUTER_API_KEY`**. Add Perplexity for memory vectors; add Mistral if you want TTS.
+**Practical rule:** start with **only `OPENROUTER_API_KEY`**. Add **Mistral** if you want TTS. Add **Perplexity** only when you need embedding-backed features (not required for the current no–vector-search journaling path).
 
-### 3. Perplexity (embeddings + search)
+### 3. Perplexity (optional—embeddings / future memory pipelines)
+
+Skip this section if you are only testing **assisted** and **manual** journaling: those flows do **not** depend on Perplexity today.
+
+When you need it:
 
 1. Open **[perplexity.ai](https://www.perplexity.ai/)** and sign in.
-2. Open API settings: **[docs.perplexity.ai](https://docs.perplexity.ai/docs/getting-started/quickstart)** (API keys live in your account / developer settings).
+2. Open API settings: **[docs.perplexity.ai](https://docs.perplexity.ai/docs/getting-started/quickstart)**.
 3. Create an API key and set `PERPLEXITY_API_KEY` in `.env`.
 
-Used for contextual embeddings (default model configurable via `PERPLEXITY_EMBEDDING_MODEL`). Align `EMBEDDING_DIM` with the model output if you change models.
+Used for contextual embeddings when those code paths are active (`PERPLEXITY_EMBEDDING_MODEL`, `EMBEDDING_DIM`, etc.).
 
 ### 4. Mistral (TTS only)
 
@@ -112,10 +130,9 @@ Edit `.env` and set at minimum:
 
 ```env
 OPENROUTER_API_KEY=sk-or-v1-...
-PERPLEXITY_API_KEY=pplx-...
 ```
 
-Add `MISTRAL_API_KEY` if you want TTS.
+Add `MISTRAL_API_KEY` if you want read-aloud TTS. Add `PERPLEXITY_API_KEY` only if you are using embedding-heavy features (not needed for the default journaling experience without vector retrieval).
 
 ### 3. Python backend
 
@@ -144,25 +161,25 @@ By default, Vite proxies **`/api`** to **`http://localhost:8000`** (`VITE_API_UR
 
 ### 5. Smoke test
 
-- Open the app, switch modes as needed, send a short journal message.
-- Open **History** / memory-related views; confirm the backend logs show successful requests and no missing-key errors.
+- Open the app, send a short message in **AI-Assisted Journal** or use **Manual Journal** as you prefer.
+- Confirm the backend logs show successful `/chat` or voice-memo requests and no missing **`OPENROUTER_API_KEY`** errors.
 
 ---
 
 ## Environment variables
 
-### Essential
+### Essential for the current journaling UX
 
 | Variable | Purpose |
 |----------|---------|
-| `OPENROUTER_API_KEY` | Chat (`/chat`), dictation STT, voice-memo transcription, polish/validation helpers, library LLM tasks |
-| `PERPLEXITY_API_KEY` | Embeddings for sqlite-vec memory (gist, episodic, library) |
+| `OPENROUTER_API_KEY` | Chat (`/chat`), dictation STT, voice-memo transcription, polish/validation helpers |
 
-### Strongly recommended for full UX
+### Optional
 
 | Variable | Purpose |
 |----------|---------|
 | `MISTRAL_API_KEY` | `/api/voice` TTS (read-aloud, voice playback) |
+| `PERPLEXITY_API_KEY` | Embeddings when ingest/vector workflows are used—not required for assisted-journal chat without retrieval |
 
 ### Auth (optional)
 
@@ -205,8 +222,8 @@ See **`.env.example`** for additional optional keys (Tavily, Semantic Scholar, L
 ├── backend/                  # FastAPI + LangGraph
 │   ├── main.py               # Routes, app entry
 │   ├── graph.py              # Chat graph (journal vs assisted journal, tools)
-│   ├── library.py            # Memory, extraction helpers, recommendations glue
-│   └── vec_store.py          # SQLite + sqlite-vec
+│   ├── library.py            # Ingest helpers and related logic (vector search not used for assisted journal replies)
+│   └── vec_store.py          # SQLite + sqlite-vec (used when embedding pipelines run)
 ├── api/                      # Node route handlers (used by api-server / serverless paths)
 ├── scripts/api-server.ts     # Local Node server (optional; see Vite proxy)
 ├── .env.example
@@ -224,15 +241,15 @@ More backend-only operational notes: **`backend/STORAGE.md`**. Short backend run
 flowchart LR
   U[User] --> FE[React + Vite]
   FE --> API[FastAPI backend]
-  API --> OR[OpenRouter]
-  API --> PPLX[Perplexity embeddings]
-  API --> DB[(SQLite + sqlite-vec)]
+  API --> OR[OpenRouter chat + STT]
   API --> MIST[Mistral TTS optional]
-  DB --> API
+  API -.-> DB[(SQLite / vectors optional)]
+  API -.-> PPLX[Perplexity optional]
 ```
 
-- **History** (browser) holds transcripts the user sees; **memory** is extracted/indexed data in SQLite.
-- **LightRAG** is optional (`LIGHTRAG_ENABLED`); primary retrieval is sqlite-vec.
+- **Assisted journal `/chat`**: model sees **this session’s messages** only—**no vector retrieval** step in that path.
+- **History** (browser) holds what the user saves; backend may still persist or index data for **future** features—see code and `.env.example` if you enable those paths.
+- **LightRAG** (`LIGHTRAG_ENABLED`) and **Perplexity** are optional add-ons, not part of the default journaling loop described above.
 
 ---
 
@@ -244,7 +261,7 @@ Single app: FastAPI serves the API and the built SPA.
 fly deploy
 ```
 
-**Persistent SQLite:** Fly machines are ephemeral. Create a volume and set `VECTOR_DB_PATH` to a path on that volume (see `.env.example` comments and Fly docs).
+**Persistent data:** Fly machines are ephemeral. If you rely on a local SQLite file (any feature that writes to disk), create a volume and set `VECTOR_DB_PATH` (or your DB path) on that volume (see `.env.example` and Fly docs).
 
 ```bash
 fly volumes create data --size 1 --region iad
@@ -261,7 +278,7 @@ Mount the volume in `fly.toml` under `[mounts]` if not already configured.
 | Symptom | What to check |
 |---------|----------------|
 | Chat or STT fails immediately | `OPENROUTER_API_KEY` in **project root** `.env`; restart `uvicorn` after edits |
-| Memory stats stay at zero | `PERPLEXITY_API_KEY`; entries ingested; `VECTOR_DB_PATH` persistent on Fly |
+| Embedding or ingest features fail | `PERPLEXITY_API_KEY` and matching `EMBEDDING_DIM`; persistent `VECTOR_DB_PATH` on Fly if using disk-backed stores |
 | No read-aloud / TTS | `MISTRAL_API_KEY` on the server that handles `/api/voice` |
 | Frontend 404 on `/api/*` | FastAPI running on the host/port `VITE_API_URL` points to |
 | CORS / wrong API in prod | Production is same-origin; avoid pointing the built app at the wrong backend URL |
