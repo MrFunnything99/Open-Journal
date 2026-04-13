@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import os
 import re
 import ssl
@@ -127,7 +128,7 @@ async def lifespan(app: FastAPI):
 
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     chat_model = (os.getenv("OPENROUTER_CHAT_MODEL") or "openai/gpt-4.1-mini").strip()
-    chat_fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or "openai/gpt-5.4").strip()
+    chat_fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or "anthropic/claude-opus-4.6").strip()
     convo_model = (os.getenv("OPENROUTER_CONVERSATION_MODEL") or "x-ai/grok-4.1-fast").strip()
     if or_key:
         print(
@@ -562,27 +563,42 @@ VOICE_MEMO_POLISH_INSTRUCTION = """You are editing a voice memo transcript. Clea
 - Do NOT add new content, headings, sign-offs, or commentary.
 Output ONLY the cleaned text with no title or preamble."""
 
-JOURNAL_FEEDBACK_INSTRUCTION = """You are a warm, perceptive companion reading someone's personal journal. Your job is to give thoughtful, substantive feedback that helps the writer understand themselves better.
+JOURNAL_FEEDBACK_INSTRUCTION = """You are a warm, perceptive companion reading someone's personal journal. Your job is to give thoughtful feedback that helps the writer understand themselves better.
+
+The block at the top labeled \"=== ENTRY METRICS ===\" was computed from today's entry **before** this request was sent — treat those numbers as authoritative for length.
 
 You have been given:
-1. The journal entry the writer just composed.
+1. The journal entry the writer just composed (at the end, after \"--- Today's Journal Entry ---\").
 2. Their most recent previous entries (if any) for continuity.
-3. Semantically related passages from their journal history found by vector search — these reveal recurring themes, patterns, and echoes across time.
+3. Semantically related passages from their journal history (if any).
 
 How to respond:
-- Start by genuinely engaging with what they wrote today. Reflect back what you notice — the emotions, the undercurrents, the things said between the lines.
-- Then weave in connections to their past writing. Name patterns you see: recurring themes, evolving perspectives, unresolved tensions, or growth arcs. Quote or paraphrase specific past passages when relevant.
-- Offer gentle observations or reframings that might help them see their situation from a new angle. You may name difficult realities in a protective, caring way (e.g. a situation sounds unsafe, or someone is treating them poorly).
-- Be substantial — aim for several rich paragraphs, not a few sentences. The writer values depth.
-- Stay warm, honest, and supportive. Never condescending or preachy. Write like a trusted friend who has been reading their journal for months and genuinely cares.
-- Do not ask questions or prompt for replies; the writer will respond on their own.
-- Do not reformat or rewrite their entry. Focus entirely on feedback and reflection.
+- Write **one continuous piece of prose** in ===FEEDBACK=== only. No bullet points, no numbered lists, no \"OBSERVATIONS\" section, no markdown headings after the opening.
+- Stay at or under the **maximum words** stated in ENTRY METRICS. Never pad to fill space; short entries deserve short replies.
+- Start by engaging with what they wrote today; weave in past context only when it fits the word budget.
+- Stay warm, honest, and supportive. Do not ask questions or prompt for replies.
+- Do not reformat or rewrite their entry.
 
-Respond in this exact format:
+Output format (exactly):
 ===FEEDBACK===
-<your multi-paragraph feedback>
-===OBSERVATIONS===
-- <2–5 bullet points: specific patterns, themes, or growth you noticed across entries; reference dates or content where possible>"""
+<your prose only>"""
+
+
+def _journal_entry_metrics_block(
+    *,
+    input_words: int,
+    input_chars: int,
+    input_token_est: int,
+    max_response_words: int,
+) -> str:
+    return (
+        "=== ENTRY METRICS (measured from today's journal text before this LLM request) ===\n"
+        f"Word count: {input_words}\n"
+        f"Character count: {input_chars}\n"
+        f"Rough token estimate (max(words, chars/4)): {input_token_est}\n"
+        f"Maximum words allowed in your entire reply: {max_response_words} (= ceil(1.25 × word count))\n"
+        "=== END ENTRY METRICS ===\n\n"
+    )
 
 
 def _guess_audio_filename(filename: Optional[str], mime_type: Optional[str]) -> str:
@@ -832,7 +848,7 @@ async def _polish_voice_memo_openrouter(raw: str, model_override: Optional[str] 
         return text
     model = (
         (model_override or "").strip()
-        or (os.getenv("OPENROUTER_VOICE_MEMO_POLISH_MODEL") or "openai/gpt-5.4").strip()
+        or (os.getenv("OPENROUTER_VOICE_MEMO_POLISH_MODEL") or "anthropic/claude-opus-4.6").strip()
     )
     prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
 
@@ -869,7 +885,22 @@ async def _validate_journal_openrouter(
         import time as _time
 
         t0 = _time.perf_counter()
-        model = (model_override or os.getenv("OPENROUTER_JOURNAL_VALIDATE_MODEL", "")).strip() or "openai/gpt-5.4"
+        model = (model_override or os.getenv("OPENROUTER_JOURNAL_VALIDATE_MODEL", "")).strip() or "anthropic/claude-opus-4.6"
+
+        # --- 0. Measure today's entry first (words / chars / token estimate) — drives prompt + max_tokens ---
+        entry_body = text[:48000].strip()
+        input_words = max(1, len(entry_body.split()))
+        input_chars = len(entry_body)
+        input_token_est = max(input_words, input_chars // 4)
+        max_response_words = max(1, int(math.ceil(input_words * 1.25)))
+        max_tokens = int(input_token_est * 1.25) + 32
+        max_tokens = max(120, min(8192, max_tokens))
+        metrics_block = _journal_entry_metrics_block(
+            input_words=input_words,
+            input_chars=input_chars,
+            input_token_est=input_token_est,
+            max_response_words=max_response_words,
+        )
 
         # --- 1. Fetch the last 2 saved journal entries for continuity ---
         recent_entries: list[dict] = []
@@ -883,7 +914,7 @@ async def _validate_journal_openrouter(
         # --- 2. Vector search for thematic echoes across journal history ---
         vec_chunks: list[dict] = []
         try:
-            embs = await asyncio.to_thread(_embed_texts, [text[:2000]])
+            embs = await asyncio.to_thread(_embed_texts, [entry_body[:2000]])
             if embs and embs[0]:
                 vec_chunks = await asyncio.to_thread(
                     vec_store.query_journal_chunks, embs[0], instance_id or "", k=12
@@ -929,18 +960,20 @@ async def _validate_journal_openrouter(
                 + "\n=== END CONTEXT ===\n"
             )
 
-        # --- 4. Build final prompt ---
+        # --- 4. Build final prompt (metrics already computed in step 0) ---
         prompt = (
-            JOURNAL_FEEDBACK_INSTRUCTION
+            metrics_block
+            + JOURNAL_FEEDBACK_INSTRUCTION
             + context_block
             + "\n\n--- Today's Journal Entry ---\n"
-            + text[:48000]
+            + entry_body
         )
 
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.45,
+            "max_tokens": max_tokens,
         }
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -982,7 +1015,10 @@ async def _validate_journal_openrouter(
 
         out = await asyncio.to_thread(_call)
         t_llm = _time.perf_counter()
-        print(f"[backend] journal-feedback: LLM response in {t_llm - t_ctx:.1f}s (total {t_llm - t0:.1f}s)")
+        print(
+            f"[backend] journal-feedback: LLM {t_llm - t_ctx:.1f}s (total {t_llm - t0:.1f}s); "
+            f"entry_words={input_words} max_response_words={max_response_words} max_tokens={max_tokens}"
+        )
 
         if not out:
             return text, "AI returned empty output.", [], model
@@ -997,28 +1033,27 @@ async def _validate_journal_openrouter(
             j = src.find(end, i)
             return src[i:j].strip() if j != -1 else src[i:].strip()
 
-        feedback = _between(out, "===FEEDBACK===", "===OBSERVATIONS===")
-        observations_block = _between(out, "===OBSERVATIONS===", None)
-
-        # If the model didn't use the delimiters, treat the whole output as feedback
+        feedback = _between(out, "===FEEDBACK===", None)
+        # If the model didn't use the delimiter, treat the whole output as feedback
         if not feedback:
             feedback = out.strip()
 
-        notes: list[str] = []
-        for line in observations_block.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("-"):
-                line = line[1:].strip()
-            if line:
-                notes.append(line)
+        def _trim_feedback_words(fb: str, budget: int) -> str:
+            w = fb.split()
+            if len(w) <= budget:
+                return fb
+            if budget < 1:
+                return ""
+            return " ".join(w[:budget]).rstrip(",.;:—- ") + "…"
 
-        return text, feedback, notes[:8], model
+        if len(feedback.split()) > max_response_words:
+            feedback = _trim_feedback_words(feedback, max_response_words)
+
+        return text, feedback, [], model
     except Exception as e:
         print("[backend] journal feedback openrouter error:", e)
         import traceback; traceback.print_exc()
-        return text, "Feedback failed; please try again.", [str(e)[:180]], None
+        return text, "Feedback failed; please try again.", [], None
 
 
 @api_router.post("/voice")

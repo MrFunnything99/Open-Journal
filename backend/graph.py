@@ -51,16 +51,15 @@ class JournalState(TypedDict):
 
 
 DEFAULT_OPENROUTER_CHAT_MODEL = "openai/gpt-4.1-mini"
-DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL = "openai/gpt-5.4"
+DEFAULT_OPENROUTER_PRIMARY_MODEL = "anthropic/claude-opus-4.6"
+DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL = DEFAULT_OPENROUTER_PRIMARY_MODEL
 DEFAULT_OPENROUTER_CONVERSATION_MODEL = "x-ai/grok-4.1-fast"
-DEFAULT_ASSISTED_JOURNAL_MODEL = "openai/gpt-5-mini"
+DEFAULT_ASSISTED_JOURNAL_MODEL = DEFAULT_OPENROUTER_PRIMARY_MODEL
 
-# UI allowlist for Conversation + Assisted Journal (must match frontend chatCompletionModels.ts)
+# Allowlist for client-provided OpenRouter id (must match frontend chatCompletionModels.ts)
 USER_SELECTABLE_CHAT_MODELS: frozenset[str] = frozenset(
     {
-        "openai/gpt-5.4",
-        "anthropic/claude-sonnet-4.6",
-        "openai/gpt-5-nano",
+        DEFAULT_OPENROUTER_PRIMARY_MODEL,
     }
 )
 

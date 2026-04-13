@@ -144,6 +144,14 @@ function formatRelativeSaved(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
+function PencilEditIcon({ className = "h-5 w-5" }: { className?: string }) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+    </svg>
+  );
+}
+
 const knowledgeBaseToolbarBtnClass =
   "rounded-full border border-[rgba(120,180,200,0.14)] bg-[rgba(20,37,52,0.8)] px-3 py-1.5 text-xs font-medium text-[#E8F1F5] backdrop-blur-sm transition-colors hover:bg-[rgba(27,46,64,0.9)]";
 const journalDumpBtnClass =
@@ -198,6 +206,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const [journalEditing, setJournalEditing] = useState(false);
   const [journalMarkdownDraft, setJournalMarkdownDraft] = useState("");
   const editBaselineMarkdownRef = useRef("");
+  /** When set, selecting this transcript id opens the Markdown editor immediately (one-step from day list). */
+  const openTranscriptEditAfterSelectIdRef = useRef<string | null>(null);
 
   const journalSorted = useMemo(() => {
     const list = entries.filter((e) => !isConversationEntry(e));
@@ -292,6 +302,9 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
     return null;
   }, [selection, journalSorted, conversationSorted]);
 
+  const selectedTranscriptRef = useRef<JournalEntry | null>(null);
+  selectedTranscriptRef.current = selectedTranscript;
+
   const selectedJournalDayEntries = useMemo(() => {
     if (selection?.kind !== "journal_day") return null;
     return journalSorted.filter((e) => localCalendarDayKey(e.date) === selection.dayKey);
@@ -299,7 +312,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
 
   /** User-driven selection changes; prompts if leaving a transcript with unsaved edits. */
   const trySelect = useCallback(
-    (next: Selection) => {
+    (next: Selection, opts?: { openEdit?: boolean }) => {
       if (journalEditing && (selection?.kind === "journal" || selection?.kind === "conversation")) {
         const leaving =
           next.kind !== selection.kind
@@ -317,6 +330,9 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
           editBaselineMarkdownRef.current = "";
         }
       }
+      if (opts?.openEdit && (next.kind === "journal" || next.kind === "conversation")) {
+        openTranscriptEditAfterSelectIdRef.current = next.id;
+      }
       setSelection(next);
       setExpandedLogKey(null);
     },
@@ -324,6 +340,22 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   );
 
   useEffect(() => {
+    const entry = selectedTranscriptRef.current;
+    const id = entry?.id;
+    if (!id || !entry) {
+      setJournalEditing(false);
+      setJournalMarkdownDraft("");
+      editBaselineMarkdownRef.current = "";
+      return;
+    }
+    if (openTranscriptEditAfterSelectIdRef.current === id) {
+      openTranscriptEditAfterSelectIdRef.current = null;
+      const md = transcriptToMarkdownForEdit(entry.fullTranscript);
+      editBaselineMarkdownRef.current = md;
+      setJournalMarkdownDraft(md);
+      setJournalEditing(true);
+      return;
+    }
     setJournalEditing(false);
     setJournalMarkdownDraft("");
     editBaselineMarkdownRef.current = "";
@@ -753,8 +785,8 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                 <button
                   type="button"
                   className={`rounded-lg p-2 ${journalEditing ? "bg-white/15 text-white" : "text-[#9BB1BE] hover:bg-white/[0.08] hover:text-[#E8F1F5]"}`}
-                  aria-label={journalEditing ? "Discard edit" : "Edit transcript"}
-                  title={journalEditing ? "Discard edit (cancel)" : "Edit transcript as Markdown"}
+                  aria-label={journalEditing ? "Discard edit" : "Edit entry"}
+                  title={journalEditing ? "Discard edit (cancel)" : "Edit as Markdown"}
                   onClick={() => {
                     if (!selectedTranscript) return;
                     if (journalEditing) {
@@ -771,9 +803,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                     setJournalEditing(true);
                   }}
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
-                  </svg>
+                  <PencilEditIcon />
                 </button>
                 <div className="relative" ref={moreRef}>
                   <button
@@ -900,10 +930,12 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                         </div>
                         <button
                           type="button"
-                          onClick={() => trySelect({ kind: "journal", id: entry.id })}
-                          className="shrink-0 rounded-full border border-[rgba(120,180,200,0.2)] bg-white/10 px-3 py-1.5 text-xs font-medium text-[#E8F1F5] shadow-sm backdrop-blur-sm transition-colors hover:bg-white/[0.16]"
+                          onClick={() => trySelect({ kind: "journal", id: entry.id }, { openEdit: true })}
+                          className="shrink-0 rounded-lg p-2 text-[#9BB1BE] transition-colors hover:bg-white/[0.08] hover:text-[#E8F1F5]"
+                          aria-label="Edit this entry"
+                          title="Edit this entry"
                         >
-                          Edit this entry
+                          <PencilEditIcon />
                         </button>
                       </div>
                       <div className="space-y-8">

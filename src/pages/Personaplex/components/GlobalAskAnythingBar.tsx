@@ -13,10 +13,6 @@ import {
   CHAT_INTERACTION_MODES,
   type ChatInteractionMode,
 } from "../chatInteractionModes";
-import {
-  CHAT_COMPLETION_MODEL_OPTIONS,
-  type UserSelectableChatModelId,
-} from "../chatCompletionModels";
 import { usePersonaplexChat } from "../PersonaplexChatContext";
 
 function ModeChipIcon({ mode }: { mode: ChatInteractionMode }) {
@@ -117,70 +113,6 @@ export function LiveDictationBubble({ className = "" }: { className?: string }) 
 }
 
 export type AskAnythingLayout = "dock" | "rail" | "center";
-
-function ComposerChatModelSelect({ idPrefix, embedded }: { idPrefix: string; embedded?: boolean }) {
-  const { userChatModel, setUserChatModel, composerDisabled } = usePersonaplexChat();
-  if (embedded) {
-    return (
-      <select
-        id={`${idPrefix}-chat-model`}
-        aria-label="Chat model"
-        value={userChatModel}
-        onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
-        disabled={composerDisabled}
-        title="Model for replies (retrieval + tools use this model)"
-        className="min-w-0 flex-1 rounded-lg border border-white/12 bg-black/40 px-2.5 py-1.5 text-[0.7rem] text-white focus:border-white/25 focus:outline-none focus:ring-1 focus:ring-white/15 disabled:opacity-50 sm:max-w-[16rem] sm:flex-none sm:text-xs"
-      >
-        {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
-          <option key={o.id} value={o.id}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    );
-  }
-  return (
-    <select
-      id={`${idPrefix}-chat-model`}
-      aria-label="Chat model"
-      value={userChatModel}
-      onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
-      disabled={composerDisabled}
-      title="Model for replies (retrieval + tools use this model)"
-      className="appearance-none rounded-full border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[0.65rem] font-medium text-white/55 backdrop-blur-sm transition-colors hover:bg-white/[0.07] hover:text-white/70 focus:border-white/20 focus:outline-none focus:ring-1 focus:ring-white/10 disabled:opacity-40"
-      style={{ backgroundImage: "none" }}
-    >
-      {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
-        <option key={o.id} value={o.id}>
-          {o.label} ▾
-        </option>
-      ))}
-    </select>
-  );
-}
-
-function ModelChipAboveComposer({ idPrefix }: { idPrefix: string }) {
-  const { userChatModel, setUserChatModel, composerDisabled } = usePersonaplexChat();
-  return (
-    <div className="mb-1 flex items-center">
-      <select
-        id={`${idPrefix}-chat-model-above`}
-        aria-label="Chat model"
-        value={userChatModel}
-        onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
-        disabled={composerDisabled}
-        title="Model for replies"
-        className="cursor-pointer appearance-none rounded-full border border-white/[0.06] bg-transparent px-2 py-[2px] text-[0.6rem] font-medium text-white/40 transition-colors hover:border-white/12 hover:text-white/55 focus:border-white/15 focus:outline-none disabled:opacity-40"
-      >
-        {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
-          <option key={o.id} value={o.id}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
 
 type AskAnythingComposerProps = {
   layout: AskAnythingLayout;
@@ -379,8 +311,6 @@ export function AskAnythingComposer({
     return () => document.removeEventListener("mousedown", onDoc);
   }, [plusOpen]);
 
-  const showModelFooter = chatInteractionMode === "autobiography";
-
   const assistedCenterGrow = assistedJournalMinimal && layout === "center";
   const assistedTextareaRef = useRef<HTMLTextAreaElement>(null);
   const [assistedComposerTopFade, setAssistedComposerTopFade] = useState(false);
@@ -504,12 +434,6 @@ export function AskAnythingComposer({
               <SendIcon className="h-4 w-4" />
             </button>
           </div>
-          {showModelFooter && (
-            <div className="flex items-center gap-2 border-t border-white/10 bg-black/25 px-2 py-1.5">
-              <span className="shrink-0 text-[0.6rem] font-semibold uppercase tracking-[0.14em] text-white/40">Model</span>
-              <ComposerChatModelSelect idPrefix={idPrefix} embedded />
-            </div>
-          )}
         </div>
       </div>
     );
@@ -597,9 +521,6 @@ export function AskAnythingComposer({
 
   return (
     <div className={`flex flex-col ${layout === "center" ? "mx-auto w-full max-w-2xl" : "w-full"}`}>
-      {/* Model selector — ghost chip above the bar */}
-      {showModelFooter && <ModelChipAboveComposer idPrefix={idPrefix} />}
-
       {/* Pending audio attachment */}
       {pendingAudioFile && (
         <div className="mb-1 flex items-center gap-2 rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-1.5">

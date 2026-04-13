@@ -19,6 +19,6 @@ export const CHAT_INTERACTION_MODE_META: Record<
     sublabel: "Reflect with AI",
     composerChipLabel: "AI-Assisted Journal Mode",
     description:
-      "Use the model control above the input to choose which AI replies. Model-data training is turned off for these API calls; however disclose at your own discretion.",
+      "Reflective chat with Claude Opus via OpenRouter. Model-data training is turned off for these API calls; however disclose at your own discretion.",
   },
 };

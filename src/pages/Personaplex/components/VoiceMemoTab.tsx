@@ -1,5 +1,6 @@
 import { FC, useCallback, useEffect, useId, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
+import { DEFAULT_OPENROUTER_PRIMARY_MODEL } from "../chatCompletionModels";
 import { CHAT_INTERACTION_MODE_META } from "../chatInteractionModes";
 import type { ChatMessage } from "../hooks/useJournalHistory";
 import { useVoiceSession } from "../hooks/useVoiceSession";
@@ -107,6 +108,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const [error, setError] = useState<string | null>(null);
   const [rawTranscript, setRawTranscript] = useState("");
   const [reviewText, setReviewText] = useState("");
+  const [gettingFeedback, setGettingFeedback] = useState(false);
+  const [journalMessages, setJournalMessages] = useState<ChatMessage[]>([]);
   const [journalCleanupBusy, setJournalCleanupBusy] = useState(false);
   const [journalEntryDate, setJournalEntryDate] = useState("");
   const [journalEntryTime, setJournalEntryTime] = useState("");
@@ -115,6 +118,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const [savingAssistedJournal, setSavingAssistedJournal] = useState(false);
 
   const listRef = useRef<HTMLDivElement>(null);
+  const journalScrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const journalTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const reviewTextRef = useRef(reviewText);
@@ -174,6 +178,12 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [messages, sending, isChatActive]);
+
+  useEffect(() => {
+    const el = journalScrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [journalMessages, gettingFeedback]);
 
   useEffect(() => {
     if (chatInteractionMode === "journal" && !journalEntryDate && !journalEntryTime) {
@@ -332,9 +342,48 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     }
   }, [journalTextToProcess, chatInteractionMode, clearJournalTextToProcess, journalEntryDate, journalEntryTime]);
 
+  const getJournalFeedback = useCallback(async () => {
+    const text = reviewText.trim();
+    if (!text || gettingFeedback) return;
+
+    setJournalMessages((prev) => [...prev, { role: "user", text }]);
+    setReviewText("");
+    setRawTranscript("");
+    setGettingFeedback(true);
+    setError(null);
+
+    try {
+      const res = await backendFetch("/journal-validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, model: DEFAULT_OPENROUTER_PRIMARY_MODEL }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        detail?: string;
+        reformatted_journal?: string;
+        feedback?: string;
+        model_used?: string;
+      };
+      if (!res.ok) {
+        const d = data.detail;
+        throw new Error(typeof d === "string" ? d : `Feedback failed (${res.status})`);
+      }
+      const feedback = (data.feedback || "").trim();
+      const aiText = feedback || "Looks good — no notes.";
+      setJournalMessages((prev) => [...prev, { role: "ai", text: aiText }]);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Feedback failed";
+      setError(msg);
+      onToast(msg);
+      setJournalMessages((prev) => [...prev, { role: "ai", text: `Error: ${msg}` }]);
+    } finally {
+      setGettingFeedback(false);
+    }
+  }, [reviewText, gettingFeedback, onToast]);
+
   const runJournalCleanup = useCallback(async () => {
     const text = reviewText.trim();
-    if (!text || journalCleanupBusy) return;
+    if (!text || journalCleanupBusy || gettingFeedback) return;
 
     setJournalCleanupBusy(true);
     setError(null);
@@ -342,7 +391,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       const res = await backendFetch("/journal-cleanup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, model: DEFAULT_OPENROUTER_PRIMARY_MODEL }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         detail?: string;
@@ -363,11 +412,12 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     } finally {
       setJournalCleanupBusy(false);
     }
-  }, [reviewText, journalCleanupBusy, onToast]);
+  }, [reviewText, journalCleanupBusy, gettingFeedback, onToast]);
 
   const startAnotherEntry = useCallback(() => {
     setRawTranscript("");
     setReviewText("");
+    setJournalMessages([]);
     setJournalEntryDate("");
     setJournalEntryTime("");
     setError(null);
@@ -376,7 +426,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const saveToJournal = useCallback(async () => {
     if (!saveEntry || savingJournal) return;
     const pendingText = reviewText.trim();
-    if (!pendingText) {
+    const hasMessages = journalMessages.length > 0;
+    if (!pendingText && !hasMessages) {
       onToast("Nothing to save yet.");
       return;
     }
@@ -384,7 +435,14 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       onToast("Set entry date and time before saving.");
       return;
     }
-    const transcript: ChatMessage[] = [{ role: "user", text: pendingText }];
+    const transcript: ChatMessage[] = [...journalMessages];
+    if (pendingText) {
+      transcript.push({ role: "user", text: pendingText });
+    }
+    if (transcript.length === 0) {
+      onToast("Nothing to save yet.");
+      return;
+    }
     const dateIso = dateAndTimeToIso(journalEntryDate, journalEntryTime);
     setSavingJournal(true);
     try {
@@ -402,7 +460,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     }
   }, [
     saveEntry, syncUnsyncedEntries, savingJournal,
-    reviewText,
+    journalMessages, reviewText,
     journalEntryDate, journalEntryTime,
     onToast, startAnotherEntry, resetAssistedWorkspace,
   ]);
@@ -477,7 +535,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     [processMicAudio, chatInteractionMode, captureJournalVoiceInsertPosition]
   );
 
-  const journalRecorderBusy = journalMicPhase !== "idle" || journalCleanupBusy;
+  const journalRecorderBusy = journalMicPhase !== "idle" || gettingFeedback || journalCleanupBusy;
   const journalProcessing = chatInteractionMode === "journal" && journalMicPhase === "processing";
   const hasConversation = messages.length > 0 || sending;
   const assistedHero =
@@ -552,7 +610,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                         </p>
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
-                        {(reviewText.trim() || rawTranscript.trim()) && (
+                        {(journalMessages.length > 0 || reviewText.trim() || rawTranscript.trim()) && (
                           <button
                             type="button"
                             onClick={startAnotherEntry}
@@ -628,8 +686,63 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                       )}
                     </div>
 
+                    {/* Feedback thread (manual journal + /journal-validate) */}
+                    {journalMessages.length > 0 && (
+                      <div
+                        ref={journalScrollRef}
+                        className="mt-4 max-h-[50vh] space-y-4 overflow-y-auto rounded-xl border border-white/10 bg-black/15 p-3"
+                      >
+                        {journalMessages.map((m, i) => (
+                          <div
+                            key={`jm-${i}`}
+                            className={`w-full ${m.role === "user" ? "flex justify-end" : ""}`}
+                          >
+                            {m.role === "ai" ? (
+                              <div className="max-w-[95%] rounded-2xl border border-white/10 bg-white/[0.06] px-4 py-3">
+                                <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-white/90">{m.text}</p>
+                                <div className="mt-1.5 flex items-center gap-0.5 text-white/40">
+                                  <button
+                                    type="button"
+                                    onClick={() => void copyText(m.text)}
+                                    className="rounded-md p-1 hover:bg-white/10 hover:text-white"
+                                    title="Copy"
+                                  >
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                      <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                    </svg>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => readAloud(m.text)}
+                                    disabled={readAloudBusy}
+                                    aria-busy={readAloudBusy}
+                                    className="rounded-md p-1 hover:bg-white/10 hover:text-white disabled:pointer-events-none disabled:opacity-35"
+                                    title={readAloudBusy ? "Loading audio…" : "Read aloud"}
+                                  >
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                      <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                                    </svg>
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="max-w-[85%] rounded-2xl bg-white/[0.12] px-4 py-3">
+                                <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-white/95">{m.text}</p>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                        {gettingFeedback && (
+                          <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.06] px-4 py-3 text-sm text-white/60">
+                            <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
+                            Thinking…
+                          </div>
+                        )}
+                      </div>
+                    )}
+
                     {/* Transcribing indicator (before any text arrives) */}
-                    {journalProcessing && !(reviewText || rawTranscript).trim() && (
+                    {journalProcessing && !(reviewText || rawTranscript).trim() && journalMessages.length === 0 && (
                       <div className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-black/20 p-3 text-sm text-white/70">
                         <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
                         Transcribing audio…
@@ -642,10 +755,10 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                         ref={journalTextareaRef}
                         value={reviewText}
                         onChange={(e) => setReviewText(e.target.value)}
-                        rows={12}
-                        placeholder="Transcript will appear here — or type directly…"
+                        rows={journalMessages.length > 0 ? 6 : 12}
+                        placeholder={journalMessages.length > 0 ? "Continue journaling or record more audio…" : "Transcript will appear here — or type directly…"}
                         className="mt-3 w-full resize-y rounded-xl border border-white/15 bg-black/25 px-3 py-3 text-sm leading-relaxed text-white placeholder:text-white/40 focus:border-white/25 focus:outline-none focus:ring-2 focus:ring-white/10"
-                        style={{ minHeight: "12rem" }}
+                        style={{ minHeight: journalMessages.length > 0 ? "6rem" : "12rem" }}
                       />
                     )}
 
@@ -658,9 +771,10 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                           disabled={
                             savingJournal ||
                             journalCleanupBusy ||
+                            gettingFeedback ||
                             !journalEntryDate.trim() ||
                             !journalEntryTime.trim() ||
-                            !reviewText.trim()
+                            (!reviewText.trim() && journalMessages.length === 0)
                           }
                           className="rounded-full bg-white px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition hover:bg-white/90 disabled:opacity-50"
                         >
@@ -670,10 +784,18 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                       <button
                         type="button"
                         onClick={() => void runJournalCleanup()}
-                        disabled={!reviewText.trim() || journalCleanupBusy}
+                        disabled={!reviewText.trim() || journalCleanupBusy || gettingFeedback}
                         className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
                       >
                         {journalCleanupBusy ? "Applying…" : "AI Spelling Correction/Reformatting"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void getJournalFeedback()}
+                        disabled={!reviewText.trim() || gettingFeedback || journalCleanupBusy}
+                        className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
+                      >
+                        {gettingFeedback ? "Getting feedback…" : "AI feedback"}
                       </button>
                     </div>
                   </div>

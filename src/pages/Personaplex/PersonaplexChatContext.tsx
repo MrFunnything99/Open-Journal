@@ -43,12 +43,7 @@ function parseNavigateActions(raw: unknown): PersonaplexNavigateAction[] {
 import { backendFetch } from "../../backendApi";
 import type { ChatMessage } from "./hooks/useJournalHistory";
 import type { ChatInteractionMode } from "./chatInteractionModes";
-import {
-  DEFAULT_USER_CHAT_MODEL,
-  readStoredUserChatModel,
-  type UserSelectableChatModelId,
-  USER_CHAT_MODEL_STORAGE_KEY,
-} from "./chatCompletionModels";
+import { DEFAULT_USER_CHAT_MODEL, type UserSelectableChatModelId } from "./chatCompletionModels";
 import { blobToBase64, micBlobToTranscriptionPayload } from "./utils/audioToWav";
 import {
   attachDictationLevelMonitor,
@@ -178,9 +173,8 @@ type PersonaplexChatContextValue = {
   resetAssistedWorkspace: () => void;
   chatInteractionMode: ChatInteractionMode;
   setChatInteractionMode: (m: ChatInteractionMode) => void;
-  /** OpenRouter model for AI-Assisted Journal Mode only (/chat with tools + model picker). */
+  /** OpenRouter model for AI-Assisted Journal Mode /chat (fixed; server allowlist matches). */
   userChatModel: UserSelectableChatModelId;
-  setUserChatModel: (id: UserSelectableChatModelId) => void;
 };
 
 const PersonaplexChatContext = createContext<PersonaplexChatContextValue | null>(null);
@@ -220,9 +214,7 @@ export function PersonaplexChatProvider({
   const [chatError, setChatError] = useState<string | null>(null);
   const [isChatActive, setIsChatActive] = useState(false);
   const [chatInteractionMode, setChatInteractionMode] = useState<ChatInteractionMode>("autobiography");
-  const [userChatModel, setUserChatModelState] = useState<UserSelectableChatModelId>(() =>
-    typeof window !== "undefined" ? readStoredUserChatModel() : DEFAULT_USER_CHAT_MODEL
-  );
+  const [userChatModel] = useState<UserSelectableChatModelId>(DEFAULT_USER_CHAT_MODEL);
   const [activityLog, setActivityLog] = useState<AgentActivityEntry[]>([]);
 
   const [pendingAudioFile, setPendingAudioFile] = useState<File | null>(null);
@@ -735,15 +727,6 @@ export function PersonaplexChatProvider({
   const clearJournalFileToProcess = useCallback(() => setJournalFileToProcess(null), []);
   const clearJournalTextToProcess = useCallback(() => setJournalTextToProcess(null), []);
 
-  const setUserChatModel = useCallback((id: UserSelectableChatModelId) => {
-    setUserChatModelState(id);
-    try {
-      localStorage.setItem(USER_CHAT_MODEL_STORAGE_KEY, id);
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
   const composerDisabled = sending || micPhase !== "idle";
 
   const clearActivityLog = useCallback(() => setActivityLog([]), []);
@@ -820,7 +803,6 @@ export function PersonaplexChatProvider({
       chatInteractionMode,
       setChatInteractionMode,
       userChatModel,
-      setUserChatModel,
     }),
     [
       idPrefix,
@@ -847,7 +829,6 @@ export function PersonaplexChatProvider({
       clearActivityLog,
       chatInteractionMode,
       userChatModel,
-      setUserChatModel,
     ]
   );
 
