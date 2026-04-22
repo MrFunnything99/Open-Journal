@@ -43,7 +43,11 @@ function parseNavigateActions(raw: unknown): PersonaplexNavigateAction[] {
 import { backendFetch } from "../../backendApi";
 import type { ChatMessage } from "./hooks/useJournalHistory";
 import type { ChatInteractionMode } from "./chatInteractionModes";
-import { DEFAULT_USER_CHAT_MODEL, type UserSelectableChatModelId } from "./chatCompletionModels";
+import {
+  readStoredUserChatModel,
+  USER_CHAT_MODEL_STORAGE_KEY,
+  type UserSelectableChatModelId,
+} from "./chatCompletionModels";
 import { blobToBase64, micBlobToTranscriptionPayload } from "./utils/audioToWav";
 import {
   attachDictationLevelMonitor,
@@ -83,16 +87,6 @@ export type PersonaplexChatMessage = {
   agentSteps?: Array<{ kind?: string; name?: string; summary?: string }>;
   actions?: PersonaplexNavigateAction[];
 };
-
-export type AgentActivityEntry = {
-  id: string;
-  ts: number;
-  kind: "user" | "assistant" | "retrieval" | "tool" | "system";
-  summary: string;
-  detail?: string;
-};
-
-const MAX_ACTIVITY = 60;
 
 function effectiveRecorderMime(recorder: MediaRecorder): string {
   const t = recorder.mimeType?.trim();
@@ -166,15 +160,14 @@ type PersonaplexChatContextValue = {
   journalTextToProcess: string | null;
   clearJournalTextToProcess: () => void;
   composerDisabled: boolean;
-  activityLog: AgentActivityEntry[];
-  clearActivityLog: () => void;
   newChat: () => void;
   /** Clear assisted /chat workspace (after handoff to journal or intentional new reflection). */
   resetAssistedWorkspace: () => void;
   chatInteractionMode: ChatInteractionMode;
   setChatInteractionMode: (m: ChatInteractionMode) => void;
-  /** OpenRouter model for AI-Assisted Journal Mode /chat (fixed; server allowlist matches). */
+  /** OpenRouter model for AI-Assisted Journal Mode /chat (allowlisted on server). */
   userChatModel: UserSelectableChatModelId;
+  setUserChatModel: (m: UserSelectableChatModelId) => void;
 };
 
 const PersonaplexChatContext = createContext<PersonaplexChatContextValue | null>(null);
@@ -214,8 +207,15 @@ export function PersonaplexChatProvider({
   const [chatError, setChatError] = useState<string | null>(null);
   const [isChatActive, setIsChatActive] = useState(false);
   const [chatInteractionMode, setChatInteractionMode] = useState<ChatInteractionMode>("autobiography");
-  const [userChatModel] = useState<UserSelectableChatModelId>(DEFAULT_USER_CHAT_MODEL);
-  const [activityLog, setActivityLog] = useState<AgentActivityEntry[]>([]);
+  const [userChatModel, setUserChatModel] = useState<UserSelectableChatModelId>(() => readStoredUserChatModel());
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(USER_CHAT_MODEL_STORAGE_KEY, userChatModel);
+    } catch {
+      /* ignore */
+    }
+  }, [userChatModel]);
 
   const [pendingAudioFile, setPendingAudioFile] = useState<File | null>(null);
   const [journalFileToProcess, setJournalFileToProcess] = useState<File | null>(null);
@@ -292,15 +292,6 @@ export function PersonaplexChatProvider({
     } catch {
       speechRecRef.current = null;
     }
-  }, []);
-
-  const pushActivity = useCallback((entry: Omit<AgentActivityEntry, "id" | "ts">) => {
-    const full: AgentActivityEntry = {
-      ...entry,
-      id: `a_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
-      ts: Date.now(),
-    };
-    setActivityLog((prev) => [...prev.slice(-(MAX_ACTIVITY - 1)), full]);
   }, []);
 
   const transcribeBlob = useCallback(
@@ -395,12 +386,10 @@ export function PersonaplexChatProvider({
     if (audioFile) setPendingAudioFile(null);
 
     if (audioFile) {
-      pushActivity({ kind: "system", summary: `Transcribing attached audio: ${audioFile.name}` });
       setSending(true);
       const t = await transcribeBlob(audioFile);
       if (t) {
         text = text ? `${text}\n\n${t.polished}` : t.polished;
-        pushActivity({ kind: "system", summary: "Transcribed audio file." });
       } else {
         setSending(false);
         return;
@@ -410,7 +399,6 @@ export function PersonaplexChatProvider({
     if (!text) { setSending(false); return; }
 
     setMessages((m) => [...m, { id: `u_${Date.now()}`, role: "user", content: text }]);
-    pushActivity({ kind: "user", summary: `You: ${text.length > 120 ? `${text.slice(0, 120)}…` : text}` });
     if (!audioFile) setSending(true);
 
     const controller = new AbortController();
@@ -444,6 +432,7 @@ export function PersonaplexChatProvider({
         retrieval_log?: string;
         agent_steps?: Array<{ kind?: string; name?: string; summary?: string }>;
         actions?: unknown[];
+        library_items_added?: number;
       } = {};
       if (rawText.trim()) {
         try {
@@ -461,19 +450,6 @@ export function PersonaplexChatProvider({
       setChatSessionId(data.session_id);
 
       const steps = Array.isArray(data.agent_steps) ? data.agent_steps : [];
-      for (const s of steps) {
-        const kind = (s.kind || "").toLowerCase();
-        const summary = typeof s.summary === "string" ? s.summary : "";
-        if (!summary) continue;
-        if (kind === "retrieval") {
-          pushActivity({ kind: "retrieval", summary });
-        } else if (kind === "tool") {
-          const name = typeof s.name === "string" ? s.name : "tool";
-          pushActivity({ kind: "tool", summary, detail: name });
-        } else {
-          pushActivity({ kind: "system", summary });
-        }
-      }
 
       const retrievalLog =
         typeof data.retrieval_log === "string" && data.retrieval_log.trim() ? data.retrieval_log.trim() : undefined;
@@ -491,20 +467,16 @@ export function PersonaplexChatProvider({
         },
       ]);
 
-      const replyPreview =
-        data.response!.length > 160 ? `${data.response!.slice(0, 160)}…` : data.response!;
-      pushActivity({ kind: "assistant", summary: `Assistant: ${replyPreview}` });
+      const libN =
+        typeof data.library_items_added === "number" && data.library_items_added > 0
+          ? Math.floor(data.library_items_added)
+          : 0;
+      if (libN > 0) {
+        onToast(libN === 1 ? "Added 1 item to your Library." : `Added ${libN} items to your Library.`);
+      }
 
       if (navActions.length > 0) {
         onAgentActionRef.current?.(navActions);
-        for (const na of navActions) {
-          if (na.type === "navigate") {
-            pushActivity({
-              kind: "system",
-              summary: `Opened ${na.view}${na.brainSection ? ` · ${na.brainSection}` : ""}`,
-            });
-          }
-        }
       }
     } catch (e) {
       const msg =
@@ -515,7 +487,6 @@ export function PersonaplexChatProvider({
             : "Something went wrong";
       setChatError(msg);
       onToast(msg);
-      pushActivity({ kind: "system", summary: `Error: ${msg}` });
     } finally {
       setSending(false);
     }
@@ -524,7 +495,6 @@ export function PersonaplexChatProvider({
     sending,
     chatSessionId,
     onToast,
-    pushActivity,
     pendingAudioFile,
     transcribeBlob,
     chatInteractionMode,
@@ -538,7 +508,6 @@ export function PersonaplexChatProvider({
     setIsChatActive(true);
     setChatError(null);
     setMessages((m) => [...m, { id: `u_${Date.now()}`, role: "user", content: t }]);
-    pushActivity({ kind: "user", summary: `You: ${t.length > 120 ? `${t.slice(0, 120)}…` : t}` });
     setSending(true);
 
     const controller = new AbortController();
@@ -570,6 +539,7 @@ export function PersonaplexChatProvider({
         retrieval_log?: string;
         agent_steps?: Array<{ kind?: string; name?: string; summary?: string }>;
         actions?: unknown[];
+        library_items_added?: number;
       } = {};
       if (rawText.trim()) {
         try {
@@ -587,19 +557,6 @@ export function PersonaplexChatProvider({
       setChatSessionId(data.session_id);
 
       const steps = Array.isArray(data.agent_steps) ? data.agent_steps : [];
-      for (const s of steps) {
-        const kind = (s.kind || "").toLowerCase();
-        const summary = typeof s.summary === "string" ? s.summary : "";
-        if (!summary) continue;
-        if (kind === "retrieval") {
-          pushActivity({ kind: "retrieval", summary });
-        } else if (kind === "tool") {
-          const name = typeof s.name === "string" ? s.name : "tool";
-          pushActivity({ kind: "tool", summary, detail: name });
-        } else {
-          pushActivity({ kind: "system", summary });
-        }
-      }
 
       const retrievalLog =
         typeof data.retrieval_log === "string" && data.retrieval_log.trim() ? data.retrieval_log.trim() : undefined;
@@ -617,20 +574,16 @@ export function PersonaplexChatProvider({
         },
       ]);
 
-      const replyPreview =
-        data.response!.length > 160 ? `${data.response!.slice(0, 160)}…` : data.response!;
-      pushActivity({ kind: "assistant", summary: `Assistant: ${replyPreview}` });
+      const libN =
+        typeof data.library_items_added === "number" && data.library_items_added > 0
+          ? Math.floor(data.library_items_added)
+          : 0;
+      if (libN > 0) {
+        onToast(libN === 1 ? "Added 1 item to your Library." : `Added ${libN} items to your Library.`);
+      }
 
       if (navActions.length > 0) {
         onAgentActionRef.current?.(navActions);
-        for (const na of navActions) {
-          if (na.type === "navigate") {
-            pushActivity({
-              kind: "system",
-              summary: `Opened ${na.view}${na.brainSection ? ` · ${na.brainSection}` : ""}`,
-            });
-          }
-        }
       }
     } catch (e) {
       const msg =
@@ -641,11 +594,10 @@ export function PersonaplexChatProvider({
             : "Something went wrong";
       setChatError(msg);
       onToast(msg);
-      pushActivity({ kind: "system", summary: `Error: ${msg}` });
     } finally {
       setSending(false);
     }
-  }, [sending, chatSessionId, onToast, pushActivity, userChatModel]);
+  }, [sending, chatSessionId, onToast, userChatModel]);
 
   const startRecording = useCallback(async () => {
     if (micPhase !== "idle" || sending) return;
@@ -682,7 +634,6 @@ export function PersonaplexChatProvider({
           const t = await transcribeBlob(blob);
           if (t) {
             setDraft((d) => (d.trim() ? `${d.trim()}\n\n${t.polished}` : t.polished));
-            pushActivity({ kind: "system", summary: "Transcribed voice into your message — edit or send." });
           }
         })();
       };
@@ -698,7 +649,7 @@ export function PersonaplexChatProvider({
       setChatError(e instanceof Error ? e.message : "Microphone unavailable");
       setMicPhase("idle");
     }
-  }, [micPhase, sending, transcribeBlob, pushActivity, beginLiveSpeechCaption, stopSpeechRecognition]);
+  }, [micPhase, sending, transcribeBlob, beginLiveSpeechCaption, stopSpeechRecognition]);
 
   const stopRecording = useCallback(() => {
     stopSpeechRecognition();
@@ -729,8 +680,6 @@ export function PersonaplexChatProvider({
 
   const composerDisabled = sending || micPhase !== "idle";
 
-  const clearActivityLog = useCallback(() => setActivityLog([]), []);
-
   const newChat = useCallback(() => {
     setChatSessionId(null);
     setMessages([]);
@@ -738,8 +687,7 @@ export function PersonaplexChatProvider({
     setLiveDictationText("");
     setIsChatActive(false);
     setChatError(null);
-    pushActivity({ kind: "system", summary: "Started a new chat." });
-  }, [pushActivity]);
+  }, []);
 
   const resetAssistedWorkspace = useCallback(() => {
     setChatSessionId(null);
@@ -757,7 +705,6 @@ export function PersonaplexChatProvider({
     setJournalTextToProcess(null);
     setMicPhase("idle");
     stopSpeechRecognition();
-    setActivityLog([]);
   }, [resetAssistedWorkspace, stopSpeechRecognition]);
 
   useEffect(() => {
@@ -796,13 +743,12 @@ export function PersonaplexChatProvider({
       journalTextToProcess,
       clearJournalTextToProcess,
       composerDisabled,
-      activityLog,
-      clearActivityLog,
       newChat,
       resetAssistedWorkspace,
       chatInteractionMode,
       setChatInteractionMode,
       userChatModel,
+      setUserChatModel,
     }),
     [
       idPrefix,
@@ -823,12 +769,11 @@ export function PersonaplexChatProvider({
       pendingAudioFile,
       journalFileToProcess,
       journalTextToProcess,
-      activityLog,
       newChat,
       resetAssistedWorkspace,
-      clearActivityLog,
       chatInteractionMode,
       userChatModel,
+      setUserChatModel,
     ]
   );
 

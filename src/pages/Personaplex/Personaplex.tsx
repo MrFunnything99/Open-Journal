@@ -9,6 +9,7 @@ import {
   parseKnowledgeBaseMarkdownZip,
 } from "./knowledgeBaseMarkdownZip";
 import { BrainLayout } from "./components/BrainLayout";
+import { SemanticMemoryLayout } from "./components/SemanticMemoryLayout";
 import { VoiceMemoTab } from "./components/VoiceMemoTab";
 
 import { PersonaplexChatProvider, type PersonaplexNavigateAction } from "./PersonaplexChatContext";
@@ -467,6 +468,7 @@ export const Personaplex = () => {
                   entries={entries}
                   onDeleteEntry={deleteEntry}
                   onUpdateJournalEntry={updateJournalEntry}
+                  syncUnsyncedEntries={syncUnsyncedEntries}
                   getFormattedDate={getFormattedDate}
                   onToast={(msg) => {
                     setToastMessage(msg);
@@ -478,6 +480,24 @@ export const Personaplex = () => {
                   onImportJournalDumpFolder={handleImportJournalDumpFolder}
                   onPrepareJournalDumpUpload={prepareJournalDumpUpload}
                   onStartFresh={handleStartFreshPersonaplex}
+                />
+              </div>
+            </div>
+          )}
+          {view === "semantic_memory" && (
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <div className="flex-none border-b border-white/10 px-4 py-3 md:px-5">
+                <h2 className="text-sm font-medium text-[#E8F1F5] md:text-base">Semantic memory</h2>
+                <p className="mt-1 text-xs text-[#9BB1BE] md:text-sm">
+                  Books, podcasts, and research articles you've consumed.
+                </p>
+              </div>
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                <SemanticMemoryLayout
+                  onToast={(msg) => {
+                    setToastMessage(msg);
+                    setTimeout(() => setToastMessage(null), 3000);
+                  }}
                 />
               </div>
             </div>

@@ -179,3 +179,64 @@ export async function authMe(): Promise<{ user_id: number; email: string; userna
     username: data.username ?? data.email ?? "",
   };
 }
+
+export type SemanticMemoryCategory = "book" | "podcast" | "research_article";
+
+export type SemanticConsumedItem = {
+  id: number;
+  category: SemanticMemoryCategory;
+  title: string;
+  creator_or_source: string;
+  notes: string;
+  consumed_on: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export async function apiSemanticConsumedList(category?: SemanticMemoryCategory): Promise<SemanticConsumedItem[]> {
+  const qs = category ? `?category=${encodeURIComponent(category)}` : "";
+  const res = await backendFetch(`/semantic-memory/consumed${qs}`);
+  if (!res.ok) throw new Error(`Failed to load semantic memory (${res.status})`);
+  const data = (await res.json().catch(() => ({}))) as { items?: SemanticConsumedItem[] };
+  return Array.isArray(data.items) ? data.items : [];
+}
+
+export async function apiSemanticConsumedCreate(payload: {
+  category: SemanticMemoryCategory;
+  title: string;
+  creator_or_source?: string;
+  notes?: string;
+  consumed_on?: string | null;
+}): Promise<boolean> {
+  const res = await backendFetch("/semantic-memory/consumed", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return res.ok;
+}
+
+export async function apiSemanticConsumedUpdate(
+  id: number,
+  payload: {
+    category: SemanticMemoryCategory;
+    title: string;
+    creator_or_source?: string;
+    notes?: string;
+    consumed_on?: string | null;
+  }
+): Promise<boolean> {
+  const res = await backendFetch(`/semantic-memory/consumed/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return res.ok;
+}
+
+export async function apiSemanticConsumedDelete(id: number): Promise<boolean> {
+  const res = await backendFetch(`/semantic-memory/consumed/${id}`, {
+    method: "DELETE",
+  });
+  return res.ok;
+}

@@ -47,8 +47,10 @@ from lightrag_bridge import query_for_context, schedule_lightrag_index_after_ing
 from graph import build_graph, build_librarian_graph, JournalState
 from langchain_core.messages import AIMessage, HumanMessage
 from library import (
+    add_consumed_media,
     add_memory_fact,
     add_memory_summary,
+    delete_consumed_media,
     delete_memory_fact,
     delete_memory_summary,
     DEFAULT_PERPLEXITY_EMBEDDING_MODEL,
@@ -58,6 +60,7 @@ from library import (
     get_memory_for_visualization,
     get_person_events,
     get_writing_loop_hints,
+    list_consumed_media,
     list_memory_facts,
     list_memory_summaries,
     run_person_facts_agent,
@@ -69,6 +72,7 @@ from library import (
     _openrouter_chat_completion,
     update_memory_fact,
     update_memory_summary,
+    update_consumed_media,
     wipe_memory,
 )
 
@@ -202,6 +206,8 @@ class ChatResponse(BaseModel):
     agent_steps: Optional[List[Dict[str, Any]]] = None  # retrieval + tool summaries for UI
     # Allowlisted UI actions from journal chat agent (e.g. navigate). Frontend must ignore unknown types.
     actions: Optional[List[Dict[str, Any]]] = None
+    # Items persisted to Semantic Memory (consumed_media) via chat tools this turn
+    library_items_added: Optional[int] = None
 
 
 class ChatSessionHistoryMessage(BaseModel):
@@ -286,6 +292,33 @@ class MemoryStats(BaseModel):
     episodic_metadata_count: int = 0  # unused; journal chunks have no episodic metadata
     journal_entry_count: int = 0
     journal_chunk_count: int = 0
+
+
+class ConsumedMediaItem(BaseModel):
+    id: int
+    category: str
+    title: str
+    creator_or_source: str = ""
+    notes: str = ""
+    consumed_on: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class ConsumedMediaCreate(BaseModel):
+    category: str
+    title: str
+    creator_or_source: Optional[str] = ""
+    notes: Optional[str] = ""
+    consumed_on: Optional[str] = None
+
+
+class ConsumedMediaUpdate(BaseModel):
+    category: str
+    title: str
+    creator_or_source: Optional[str] = ""
+    notes: Optional[str] = ""
+    consumed_on: Optional[str] = None
 
 
 class BrainPersonNode(BaseModel):
@@ -533,6 +566,23 @@ class VoiceMemoRequest(BaseModel):
     journal_mode: bool = False
 
 
+# Manual Journal AI feedback + cleanup: client may pass model; only these OpenRouter ids are accepted.
+_JOURNAL_MANUAL_AI_MODEL_ALLOWLIST = frozenset(
+    {
+        "anthropic/claude-opus-4.6",
+        "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.4",
+    }
+)
+
+
+def _resolve_journal_manual_ai_model(requested: Optional[str], *, env_fallback: str, hard_default: str) -> str:
+    r = (requested or "").strip()
+    if r in _JOURNAL_MANUAL_AI_MODEL_ALLOWLIST:
+        return r
+    return ((os.getenv(env_fallback) or "").strip() or hard_default)
+
+
 class JournalValidateRequest(BaseModel):
     text: str
     model: Optional[str] = None
@@ -563,25 +613,36 @@ VOICE_MEMO_POLISH_INSTRUCTION = """You are editing a voice memo transcript. Clea
 - Do NOT add new content, headings, sign-offs, or commentary.
 Output ONLY the cleaned text with no title or preamble."""
 
-JOURNAL_FEEDBACK_INSTRUCTION = """You are a warm, perceptive companion reading someone's personal journal. Your job is to give thoughtful feedback that helps the writer understand themselves better.
+JOURNAL_FEEDBACK_INSTRUCTION = """You are a warm, perceptive reader of someone's journal. Write in ===FEEDBACK=== as if you are a thoughtful friend—trust your instincts on tone, pacing, and imagery; you don't need to follow a template.
 
-The block at the top labeled \"=== ENTRY METRICS ===\" was computed from today's entry **before** this request was sent — treat those numbers as authoritative for length.
+\"=== ENTRY METRICS ===\" gives a soft upper bound on length—stay within it when you can, but never pad or echo the entry's length.
 
-You have been given:
-1. The journal entry the writer just composed (at the end, after \"--- Today's Journal Entry ---\").
-2. Their most recent previous entries (if any) for continuity.
-3. Semantically related passages from their journal history (if any).
+Today's text appears after \"--- Today's Journal Entry ---\". If CONTEXT appears above the entry, you may draw lightly on it; otherwise stay with today.
 
-How to respond:
-- Write **one continuous piece of prose** in ===FEEDBACK=== only. No bullet points, no numbered lists, no \"OBSERVATIONS\" section, no markdown headings after the opening.
-- Stay at or under the **maximum words** stated in ENTRY METRICS. Never pad to fill space; short entries deserve short replies.
-- Start by engaging with what they wrote today; weave in past context only when it fits the word budget.
-- Stay warm, honest, and supportive. Do not ask questions or prompt for replies.
-- Do not reformat or rewrite their entry.
+Offer something real: notice tensions, patterns, or blind spots (never invent facts). You may be plainspoken or a little poetic—whatever serves the person and the moment.
+
+**Closing:** End your entire reply with **exactly one** reflective question—your only question in the whole message. Put it in the **final sentence**. Aim the question at a **broad theme** (e.g. what they want, what changed, what they're carrying, how they relate to pressure or hope)—not at **specific people, names, or concrete things** in the story, which is easy to misunderstand without full context. It should still grow from today's emotional through-line and invite deeper reflection, not feel like homework.
+
+Do not rewrite or quote their entry at length. Skip bullet lists and section headings; keep it as natural prose.
 
 Output format (exactly):
 ===FEEDBACK===
-<your prose only>"""
+<your prose, last sentence is the single question>"""
+
+
+# Upper bound for journal feedback length (prompt target; full model output is still returned).
+JOURNAL_FEEDBACK_MAX_REPLY_WORDS = 250
+
+
+def _journal_feedback_reply_word_target(input_words: int) -> int:
+    """Scales slightly with entry length but stays compact; long entries still get a brief note."""
+    w = max(1, input_words)
+    # Short entries: room for a real note without dwarfing the entry.
+    if w <= 45:
+        return min(55, max(14, w + 12))
+    # Longer entries: cap so feedback stays bounded.
+    scaled = int(w * 0.22) + 18
+    return min(JOURNAL_FEEDBACK_MAX_REPLY_WORDS, max(22, scaled))
 
 
 def _journal_entry_metrics_block(
@@ -589,14 +650,16 @@ def _journal_entry_metrics_block(
     input_words: int,
     input_chars: int,
     input_token_est: int,
-    max_response_words: int,
+    reply_word_target: int,
+    reply_token_est: int,
 ) -> str:
     return (
         "=== ENTRY METRICS (measured from today's journal text before this LLM request) ===\n"
-        f"Word count: {input_words}\n"
-        f"Character count: {input_chars}\n"
-        f"Rough token estimate (max(words, chars/4)): {input_token_est}\n"
-        f"Maximum words allowed in your entire reply: {max_response_words} (= ceil(1.25 × word count))\n"
+        f"Entry word count: {input_words}\n"
+        f"Entry character count: {input_chars}\n"
+        f"Entry rough token estimate (max(words, chars/4)): {input_token_est}\n"
+        f"Target reply words (stay brief; do not exceed): {reply_word_target}\n"
+        f"Target reply rough tokens (same order of magnitude): ~{reply_token_est}\n"
         "=== END ENTRY METRICS ===\n\n"
     )
 
@@ -846,9 +909,10 @@ async def _polish_voice_memo_openrouter(raw: str, model_override: Optional[str] 
     text = (raw or "").strip()
     if not text or not (os.getenv("OPENROUTER_API_KEY") or "").strip():
         return text
-    model = (
-        (model_override or "").strip()
-        or (os.getenv("OPENROUTER_VOICE_MEMO_POLISH_MODEL") or "anthropic/claude-opus-4.6").strip()
+    model = _resolve_journal_manual_ai_model(
+        model_override,
+        env_fallback="OPENROUTER_VOICE_MEMO_POLISH_MODEL",
+        hard_default="anthropic/claude-opus-4.6",
     )
     prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
 
@@ -885,46 +949,34 @@ async def _validate_journal_openrouter(
         import time as _time
 
         t0 = _time.perf_counter()
-        model = (model_override or os.getenv("OPENROUTER_JOURNAL_VALIDATE_MODEL", "")).strip() or "anthropic/claude-opus-4.6"
+        model = _resolve_journal_manual_ai_model(
+            model_override,
+            env_fallback="OPENROUTER_JOURNAL_VALIDATE_MODEL",
+            hard_default="anthropic/claude-opus-4.6",
+        )
 
         # --- 0. Measure today's entry first (words / chars / token estimate) — drives prompt + max_tokens ---
         entry_body = text[:48000].strip()
         input_words = max(1, len(entry_body.split()))
         input_chars = len(entry_body)
         input_token_est = max(input_words, input_chars // 4)
-        max_response_words = max(1, int(math.ceil(input_words * 1.25)))
-        max_tokens = int(input_token_est * 1.25) + 32
-        max_tokens = max(120, min(8192, max_tokens))
+        reply_word_target = _journal_feedback_reply_word_target(input_words)
+        reply_token_est = max(1, reply_word_target)
+        # Brief note in prompt; generous cap so longer replies still complete if the model drifts.
+        max_tokens = min(8192, max(256, int(reply_token_est * 4) + 256))
         metrics_block = _journal_entry_metrics_block(
             input_words=input_words,
             input_chars=input_chars,
             input_token_est=input_token_est,
-            max_response_words=max_response_words,
+            reply_word_target=reply_word_target,
+            reply_token_est=reply_token_est,
         )
 
-        # --- 1. Fetch the last 2 saved journal entries for continuity ---
+        # --- 1–2. Recent entries + vector journal context (off for now; prompt = metrics + instruction + entry only) ---
         recent_entries: list[dict] = []
-        try:
-            recent_entries = await asyncio.to_thread(
-                vec_store.list_journal_entries_recent, instance_id or "", limit=2
-            )
-        except Exception as e:
-            print(f"[backend] journal-feedback: recent entries fetch failed: {e}")
-
-        # --- 2. Vector search for thematic echoes across journal history ---
         vec_chunks: list[dict] = []
-        try:
-            embs = await asyncio.to_thread(_embed_texts, [entry_body[:2000]])
-            if embs and embs[0]:
-                vec_chunks = await asyncio.to_thread(
-                    vec_store.query_journal_chunks, embs[0], instance_id or "", k=12
-                )
-        except Exception as e:
-            print(f"[backend] journal-feedback: vector search failed: {e}")
-
         t_ctx = _time.perf_counter()
-        print(f"[backend] journal-feedback: context retrieval in {t_ctx - t0:.1f}s "
-              f"({len(recent_entries)} recent, {len(vec_chunks)} vec chunks)")
+        print("[backend] journal-feedback: retrieval disabled (no recent-entry or vector context)")
 
         # --- 3. Assemble context block for the prompt ---
         context_parts: list[str] = []
@@ -972,7 +1024,7 @@ async def _validate_journal_openrouter(
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.45,
+            "temperature": 0.525,
             "max_tokens": max_tokens,
         }
         req = urllib.request.Request(
@@ -1017,7 +1069,7 @@ async def _validate_journal_openrouter(
         t_llm = _time.perf_counter()
         print(
             f"[backend] journal-feedback: LLM {t_llm - t_ctx:.1f}s (total {t_llm - t0:.1f}s); "
-            f"entry_words={input_words} max_response_words={max_response_words} max_tokens={max_tokens}"
+            f"entry_words={input_words} reply_word_target={reply_word_target} max_tokens={max_tokens}"
         )
 
         if not out:
@@ -1037,17 +1089,6 @@ async def _validate_journal_openrouter(
         # If the model didn't use the delimiter, treat the whole output as feedback
         if not feedback:
             feedback = out.strip()
-
-        def _trim_feedback_words(fb: str, budget: int) -> str:
-            w = fb.split()
-            if len(w) <= budget:
-                return fb
-            if budget < 1:
-                return ""
-            return " ".join(w[:budget]).rstrip(",.;:—- ") + "…"
-
-        if len(feedback.split()) > max_response_words:
-            feedback = _trim_feedback_words(feedback, max_response_words)
 
         return text, feedback, [], model
     except Exception as e:
@@ -1146,11 +1187,11 @@ async def chat(req: ChatRequest, request: Request):
     instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     mode = (req.mode or "journal").strip().lower()
-    if mode not in ("journal", "conversation", "autobiography"):
+    if mode not in ("journal", "conversation", "autobiography", "learning"):
         mode = "journal"
 
     messages = sessions[session_id]
-    # Full memory retrieval (vec store + gist) for all graph-backed modes; not client-tunable.
+    # personalization is passed to the graph; vector/gist injection is gated in graph.py (_GRAPH_RETRIEVAL_ENABLED).
     personalization = 1.0
     intrusiveness = req.intrusiveness if req.intrusiveness is not None else 0.5
     try:
@@ -1210,12 +1251,17 @@ async def chat(req: ChatRequest, request: Request):
         actions = [a for a in raw_actions if isinstance(a, dict) and a.get("type") == "navigate"]
         if not actions:
             actions = None
+    raw_lib = result.get("library_items_added")
+    library_items_added: Optional[int] = None
+    if isinstance(raw_lib, int) and raw_lib > 0:
+        library_items_added = raw_lib
     return ChatResponse(
         response=response_text,
         session_id=session_id,
         retrieval_log=retrieval_log,
         agent_steps=agent_steps,
         actions=actions,
+        library_items_added=library_items_added,
     )
 
 
@@ -1753,6 +1799,71 @@ async def get_memory_summaries(request: Request):
     except Exception as e:
         print("[backend] GET /memory/summaries error:", e)
         return {"summaries": []}
+
+
+@api_router.get("/semantic-memory/consumed")
+async def semantic_memory_list_consumed(request: Request, category: Optional[str] = Query(default=None)):
+    instance_id = _instance_id(request)
+    try:
+        items = await asyncio.to_thread(list_consumed_media, instance_id, category)
+        return {"items": [ConsumedMediaItem(**x) for x in items]}
+    except Exception as e:
+        print("[backend] GET /semantic-memory/consumed error:", e)
+        return {"items": []}
+
+
+@api_router.post("/semantic-memory/consumed")
+async def semantic_memory_create_consumed(req: ConsumedMediaCreate, request: Request):
+    instance_id = _instance_id(request)
+    try:
+        item_id = await asyncio.to_thread(
+            add_consumed_media,
+            instance_id=instance_id,
+            category=req.category,
+            title=req.title,
+            creator_or_source=req.creator_or_source,
+            notes=req.notes,
+            consumed_on=req.consumed_on,
+        )
+        if not item_id:
+            raise HTTPException(status_code=400, detail="Invalid consumed item payload")
+        return {"ok": True, "id": item_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[backend] POST /semantic-memory/consumed error:", e)
+        return {"ok": False}
+
+
+@api_router.patch("/semantic-memory/consumed/{item_id}")
+async def semantic_memory_update_consumed(item_id: int, req: ConsumedMediaUpdate, request: Request):
+    instance_id = _instance_id(request)
+    try:
+        ok = await asyncio.to_thread(
+            update_consumed_media,
+            instance_id=instance_id,
+            item_id=item_id,
+            category=req.category,
+            title=req.title,
+            creator_or_source=req.creator_or_source,
+            notes=req.notes,
+            consumed_on=req.consumed_on,
+        )
+        return {"ok": ok}
+    except Exception as e:
+        print("[backend] PATCH /semantic-memory/consumed error:", e)
+        return {"ok": False}
+
+
+@api_router.delete("/semantic-memory/consumed/{item_id}")
+async def semantic_memory_delete_consumed(item_id: int, request: Request):
+    instance_id = _instance_id(request)
+    try:
+        ok = await asyncio.to_thread(delete_consumed_media, instance_id=instance_id, item_id=item_id)
+        return {"ok": ok}
+    except Exception as e:
+        print("[backend] DELETE /semantic-memory/consumed error:", e)
+        return {"ok": False}
 
 
 @api_router.patch("/memory/facts/{fact_id}")

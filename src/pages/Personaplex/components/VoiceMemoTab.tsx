@@ -1,6 +1,11 @@
 import { FC, useCallback, useEffect, useId, useRef, useState } from "react";
 import { backendFetch } from "../../../backendApi";
-import { DEFAULT_OPENROUTER_PRIMARY_MODEL } from "../chatCompletionModels";
+import {
+  JOURNAL_MANUAL_AI_MODEL_OPTIONS,
+  readStoredJournalManualAiModel,
+  type JournalManualAiModelId,
+  JOURNAL_MANUAL_AI_MODEL_STORAGE_KEY,
+} from "../chatCompletionModels";
 import { CHAT_INTERACTION_MODE_META } from "../chatInteractionModes";
 import type { ChatMessage } from "../hooks/useJournalHistory";
 import { useVoiceSession } from "../hooks/useVoiceSession";
@@ -41,6 +46,60 @@ function toDateInputValue(date: Date): string {
 function toTimeInputValue(date: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** localStorage draft for Manual Journal (reset with Cmd/Ctrl+Shift+L). */
+const LS_MANUAL_JOURNAL_KEY = "selfmeridian:manual-journal:v1";
+
+type ManualJournalPersistedV1 = {
+  v: 1;
+  draftText: string;
+};
+
+let _cachedInitialManualJournal: ManualJournalPersistedV1 | undefined;
+
+function readManualJournalStorage(): ManualJournalPersistedV1 {
+  if (typeof window === "undefined") {
+    return { v: 1, draftText: "" };
+  }
+  try {
+    const raw = localStorage.getItem(LS_MANUAL_JOURNAL_KEY);
+    if (!raw) {
+      return { v: 1, draftText: "" };
+    }
+    const j = JSON.parse(raw) as Partial<ManualJournalPersistedV1 & { feedbackGateStarted?: boolean; feedbackGateStartAtMs?: number | null }>;
+    if (j.v !== 1 || typeof j.draftText !== "string") {
+      return { v: 1, draftText: "" };
+    }
+    return { v: 1, draftText: j.draftText };
+  } catch {
+    return { v: 1, draftText: "" };
+  }
+}
+
+function writeManualJournalStorage(p: ManualJournalPersistedV1): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(LS_MANUAL_JOURNAL_KEY, JSON.stringify(p));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+function clearManualJournalStorage(): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.removeItem(LS_MANUAL_JOURNAL_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function getInitialManualJournalOnce(): ManualJournalPersistedV1 {
+  if (_cachedInitialManualJournal === undefined) {
+    _cachedInitialManualJournal = readManualJournalStorage();
+  }
+  return _cachedInitialManualJournal;
 }
 
 function dateAndTimeToIso(dateStr: string, timeStr: string): string {
@@ -106,8 +165,8 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const idPrefix = useId();
   const [journalMicPhase, setJournalMicPhase] = useState<"idle" | "recording" | "processing">("idle");
   const [error, setError] = useState<string | null>(null);
-  const [rawTranscript, setRawTranscript] = useState("");
-  const [reviewText, setReviewText] = useState("");
+  const [rawTranscript, setRawTranscript] = useState(() => getInitialManualJournalOnce().draftText);
+  const [reviewText, setReviewText] = useState(() => getInitialManualJournalOnce().draftText);
   const [gettingFeedback, setGettingFeedback] = useState(false);
   const [journalMessages, setJournalMessages] = useState<ChatMessage[]>([]);
   const [journalCleanupBusy, setJournalCleanupBusy] = useState(false);
@@ -116,6 +175,9 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
   const [savingJournal, setSavingJournal] = useState(false);
   const [readAloudBusy, setReadAloudBusy] = useState(false);
   const [savingAssistedJournal, setSavingAssistedJournal] = useState(false);
+  const [journalManualAiModel, setJournalManualAiModel] = useState<JournalManualAiModelId>(() =>
+    readStoredJournalManualAiModel()
+  );
 
   const listRef = useRef<HTMLDivElement>(null);
   const journalScrollRef = useRef<HTMLDivElement>(null);
@@ -160,10 +222,6 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     prevMsgCountRef.current = messages.length;
   }, [messages, voiceActive, speakResponse]);
 
-  const latestAssistant = voiceActive
-    ? [...messages].reverse().find((m) => m.role === "assistant")
-    : undefined;
-
   const captureJournalVoiceInsertPosition = useCallback(() => {
     const ta = journalTextareaRef.current;
     if (ta && document.activeElement === ta) {
@@ -192,6 +250,40 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       setJournalEntryTime(toTimeInputValue(now));
     }
   }, [chatInteractionMode, journalEntryDate, journalEntryTime]);
+
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      writeManualJournalStorage({ v: 1, draftText: reviewText });
+    }, 300);
+    return () => window.clearTimeout(id);
+  }, [reviewText]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(JOURNAL_MANUAL_AI_MODEL_STORAGE_KEY, journalManualAiModel);
+    } catch {
+      /* ignore */
+    }
+  }, [journalManualAiModel]);
+
+  const resetPersistedManualJournal = useCallback(() => {
+    clearManualJournalStorage();
+    _cachedInitialManualJournal = { v: 1, draftText: "" };
+    setReviewText("");
+    setRawTranscript("");
+    onToast("Manual journal draft cleared (this device).");
+  }, [onToast]);
+
+  useEffect(() => {
+    if (chatInteractionMode !== "journal") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || !e.shiftKey || e.key.toLowerCase() !== "l") return;
+      e.preventDefault();
+      resetPersistedManualJournal();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [chatInteractionMode, resetPersistedManualJournal]);
 
   /** Same persistence as tab close (AssistedJournalUnloadSync): transcript + now + conversation source. */
   const saveAssistedConversation = useCallback(async () => {
@@ -356,7 +448,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       const res = await backendFetch("/journal-validate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, model: DEFAULT_OPENROUTER_PRIMARY_MODEL }),
+        body: JSON.stringify({ text, model: journalManualAiModel }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         detail?: string;
@@ -378,8 +470,9 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       setJournalMessages((prev) => [...prev, { role: "ai", text: `Error: ${msg}` }]);
     } finally {
       setGettingFeedback(false);
+      writeManualJournalStorage({ v: 1, draftText: reviewTextRef.current });
     }
-  }, [reviewText, gettingFeedback, onToast]);
+  }, [reviewText, gettingFeedback, onToast, journalManualAiModel]);
 
   const runJournalCleanup = useCallback(async () => {
     const text = reviewText.trim();
@@ -391,7 +484,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       const res = await backendFetch("/journal-cleanup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, model: DEFAULT_OPENROUTER_PRIMARY_MODEL }),
+        body: JSON.stringify({ text, model: journalManualAiModel }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         detail?: string;
@@ -412,7 +505,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     } finally {
       setJournalCleanupBusy(false);
     }
-  }, [reviewText, journalCleanupBusy, gettingFeedback, onToast]);
+  }, [reviewText, journalCleanupBusy, gettingFeedback, onToast, journalManualAiModel]);
 
   const startAnotherEntry = useCallback(() => {
     setRawTranscript("");
@@ -602,25 +695,11 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
 
               <div className="glass-panel rounded-2xl border border-white/10 px-4 py-4 md:px-5">
                     {/* Header */}
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <p className="text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/50">Manual Journal Mode</p>
-                        <p className="mt-1 text-sm text-white/70">
-                          Write directly in the journal box below — type, record, or attach audio.
-                        </p>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-1">
-                        {(journalMessages.length > 0 || reviewText.trim() || rawTranscript.trim()) && (
-                          <button
-                            type="button"
-                            onClick={startAnotherEntry}
-                            className="rounded-lg px-2 py-1 text-[0.65rem] font-medium text-white/50 hover:bg-white/10 hover:text-white"
-                            title="Clear and start fresh"
-                          >
-                            New entry
-                          </button>
-                        )}
-                      </div>
+                    <div>
+                      <p className="text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-white/50">Manual Journal Mode</p>
+                      <p className="mt-1 text-sm text-white/70">
+                        Write directly in the journal box below — type, record, or attach audio.
+                      </p>
                     </div>
 
                     {/* Audio controls + date/time */}
@@ -789,14 +868,34 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                       >
                         {journalCleanupBusy ? "Applying…" : "AI Spelling Correction/Reformatting"}
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => void getJournalFeedback()}
-                        disabled={!reviewText.trim() || gettingFeedback || journalCleanupBusy}
-                        className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
-                      >
-                        {gettingFeedback ? "Getting feedback…" : "AI feedback"}
-                      </button>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void getJournalFeedback()}
+                          disabled={!reviewText.trim() || gettingFeedback || journalCleanupBusy}
+                          className="rounded-full border border-white/25 bg-white/10 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-white/15 disabled:opacity-50"
+                        >
+                          {gettingFeedback ? "Getting feedback…" : "AI feedback"}
+                        </button>
+                        <div className="flex items-center gap-1.5">
+                          <label className="text-[0.65rem] text-white/45" htmlFor={`${idPrefix}-journal-ai-model`}>
+                            Model
+                          </label>
+                          <select
+                            id={`${idPrefix}-journal-ai-model`}
+                            value={journalManualAiModel}
+                            onChange={(e) => setJournalManualAiModel(e.target.value as JournalManualAiModelId)}
+                            disabled={gettingFeedback || journalCleanupBusy}
+                            className="rounded-full border border-white/15 bg-black/30 px-2 py-1 text-[0.65rem] text-white focus:border-white/25 focus:outline-none disabled:opacity-50"
+                          >
+                            {JOURNAL_MANUAL_AI_MODEL_OPTIONS.map((o) => (
+                              <option key={o.id} value={o.id}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
                     </div>
                   </div>
               </div>
@@ -831,66 +930,6 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
                         <div className="text-[0.95rem] leading-7 text-white/95">
                           <p className="whitespace-pre-wrap break-words">{m.content}</p>
                         </div>
-                        {(m.agentSteps && m.agentSteps.length > 0) || (m.actions && m.actions.length > 0) || m.retrievalLog ? (
-                          <details className="mt-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-white/80">
-                            <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-[0.15em] text-white/60">
-                              Agent activity
-                            </summary>
-                            <div className="mt-2 space-y-3 text-xs">
-                              {m.actions && m.actions.length > 0 ? (
-                                <div>
-                                  <p className="font-semibold text-white/70">Actions</p>
-                                  <ul className="mt-1 list-disc space-y-1 pl-5 text-white/75">
-                                    {m.actions.map((a, idx) => (
-                                      <li key={`${m.id}-act-${idx}`}>
-                                        Opened <span className="font-medium text-white/85">{a.view}</span>
-                                        {a.brainSection ? (
-                                          <>
-                                            {" "}· <span className="font-medium text-white/85">{a.brainSection}</span>
-                                          </>
-                                        ) : null}
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              ) : null}
-                              {m.agentSteps && m.agentSteps.length > 0 ? (
-                                <div>
-                                  <p className="font-semibold text-white/70">Steps</p>
-                                  <ul className="mt-1 list-disc space-y-1 pl-5 text-white/75">
-                                    {m.agentSteps
-                                      .filter((s) => typeof s?.summary === "string" && (s.summary ?? "").trim())
-                                      .slice(0, 12)
-                                      .map((s, idx) => {
-                                        const kind = typeof s.kind === "string" ? s.kind : "";
-                                        const name = typeof s.name === "string" ? s.name : "";
-                                        const summary = (s.summary ?? "").trim();
-                                        return (
-                                          <li key={`${m.id}-step-${idx}`}>
-                                            {kind ? <span className="font-medium text-white/85">{kind}</span> : "step"}
-                                            {name ? <span className="text-white/55"> · {name}</span> : null}
-                                            {": "}
-                                            {summary}
-                                          </li>
-                                        );
-                                      })}
-                                  </ul>
-                                  {m.agentSteps.length > 12 ? (
-                                    <p className="mt-1 text-[11px] text-white/50">Showing first 12 steps.</p>
-                                  ) : null}
-                                </div>
-                              ) : null}
-                              {m.retrievalLog ? (
-                                <div>
-                                  <p className="font-semibold text-white/70">Memory context (vector DB)</p>
-                                  <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-white/10 bg-black/30 p-2 text-[11px] text-white/70">
-                                    {m.retrievalLog}
-                                  </pre>
-                                </div>
-                              ) : null}
-                            </div>
-                          </details>
-                        ) : null}
                         <div className="mt-2 flex items-center gap-0.5 text-white/50 opacity-90 transition-opacity group-hover:opacity-100">
                           <button
                             type="button"
@@ -962,7 +1001,6 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
             onToggleMute={voiceSession.toggleMute}
             onExitVoiceMode={exitVoiceMode}
             onSkipResponse={voiceSession.skipResponse}
-            latestAssistant={latestAssistant}
           />
         )}
       </div>

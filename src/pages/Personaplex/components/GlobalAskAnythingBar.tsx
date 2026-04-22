@@ -13,6 +13,7 @@ import {
   CHAT_INTERACTION_MODES,
   type ChatInteractionMode,
 } from "../chatInteractionModes";
+import { CHAT_COMPLETION_MODEL_OPTIONS, type UserSelectableChatModelId } from "../chatCompletionModels";
 import { usePersonaplexChat } from "../PersonaplexChatContext";
 
 function ModeChipIcon({ mode }: { mode: ChatInteractionMode }) {
@@ -294,6 +295,8 @@ export function AskAnythingComposer({
     composerDisabled,
     chatInteractionMode,
     setChatInteractionMode,
+    userChatModel,
+    setUserChatModel,
   } = usePersonaplexChat();
   const [plusOpen, setPlusOpen] = useState(false);
   const plusWrapRef = useRef<HTMLDivElement>(null);
@@ -533,6 +536,27 @@ export function AskAnythingComposer({
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
+        </div>
+      )}
+
+      {assistedJournalMinimal && chatInteractionMode === "autobiography" && (
+        <div className="mb-1.5 flex flex-wrap items-center gap-2">
+          <label className="text-[0.65rem] text-white/45" htmlFor={`${idPrefix}-chat-model`}>
+            Model
+          </label>
+          <select
+            id={`${idPrefix}-chat-model`}
+            value={userChatModel}
+            onChange={(e) => setUserChatModel(e.target.value as UserSelectableChatModelId)}
+            disabled={composerDisabled}
+            className="rounded-full border border-white/15 bg-black/30 px-2 py-1 text-[0.65rem] text-white focus:border-white/25 focus:outline-none disabled:opacity-50"
+          >
+            {CHAT_COMPLETION_MODEL_OPTIONS.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.label}
+              </option>
+            ))}
+          </select>
         </div>
       )}
 

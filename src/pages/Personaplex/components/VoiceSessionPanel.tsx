@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, type CSSProperties } from "react";
 import type { VoiceSessionState } from "../hooks/useVoiceSession";
-import type { PersonaplexChatMessage } from "../PersonaplexChatContext";
 
 export type VoiceSessionPanelProps = {
   voiceState: VoiceSessionState;
@@ -13,7 +12,6 @@ export type VoiceSessionPanelProps = {
   onExitVoiceMode: () => void;
   /** Interrupt TTS playback and return to listening (skip current response). */
   onSkipResponse?: () => void;
-  latestAssistant?: PersonaplexChatMessage;
 };
 
 const RING_COUNT = 4;
@@ -108,26 +106,6 @@ function statusLabel(state: VoiceSessionState): string {
   }
 }
 
-function ReasoningTrace({ message }: { message: PersonaplexChatMessage }) {
-  const steps = message.agentSteps;
-  if (!steps || steps.length === 0) return null;
-  return (
-    <details className="w-full max-w-lg rounded-xl border border-white/10 bg-black/25 px-3 py-2 text-white/80">
-      <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-[0.15em] text-white/50">
-        Reasoning
-      </summary>
-      <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-white/65">
-        {steps
-          .filter((s) => typeof s?.summary === "string" && s.summary.trim())
-          .slice(0, 12)
-          .map((s, idx) => (
-            <li key={idx}>{s.summary}</li>
-          ))}
-      </ul>
-    </details>
-  );
-}
-
 export function VoiceSessionPanel({
   voiceState,
   partialTranscript,
@@ -137,7 +115,6 @@ export function VoiceSessionPanel({
   onToggleMute,
   onExitVoiceMode,
   onSkipResponse,
-  latestAssistant,
 }: VoiceSessionPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -190,9 +167,6 @@ export function VoiceSessionPanel({
           </div>
         )}
 
-        {latestAssistant && (voiceState === "thinking" || voiceState === "speaking") && (
-          <ReasoningTrace message={latestAssistant} />
-        )}
       </div>
 
       <div className="flex flex-col items-center gap-3 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-4">

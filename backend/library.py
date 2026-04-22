@@ -19,6 +19,7 @@ import time
 import json
 import math
 import os
+import re
 import struct
 import urllib.error
 import urllib.request
@@ -1394,6 +1395,283 @@ def list_memory_facts(instance_id: str = "") -> list[dict]:
 def list_memory_summaries(instance_id: str = "") -> list[dict]:
     """Legacy episodic route; journal system stores a single entry stream — return []."""
     return []
+
+
+def list_consumed_media(instance_id: str = "", category: str | None = None) -> list[dict]:
+    import vec_store
+
+    _ensure_storage()
+    return vec_store.consumed_media_list(instance_id, category)
+
+
+def add_consumed_media(
+    *,
+    instance_id: str = "",
+    category: str,
+    title: str,
+    creator_or_source: str | None = None,
+    notes: str | None = None,
+    consumed_on: str | None = None,
+) -> int | None:
+    import vec_store
+
+    _ensure_storage()
+    return vec_store.consumed_media_create(
+        instance_id=instance_id,
+        category=category,
+        title=title,
+        creator_or_source=creator_or_source,
+        notes=notes,
+        consumed_on=consumed_on,
+    )
+
+
+def update_consumed_media(
+    *,
+    instance_id: str = "",
+    item_id: int,
+    category: str,
+    title: str,
+    creator_or_source: str | None = None,
+    notes: str | None = None,
+    consumed_on: str | None = None,
+) -> bool:
+    import vec_store
+
+    _ensure_storage()
+    return vec_store.consumed_media_update(
+        instance_id=instance_id,
+        item_id=item_id,
+        category=category,
+        title=title,
+        creator_or_source=creator_or_source,
+        notes=notes,
+        consumed_on=consumed_on,
+    )
+
+
+def delete_consumed_media(*, instance_id: str = "", item_id: int) -> bool:
+    import vec_store
+
+    _ensure_storage()
+    return vec_store.consumed_media_delete(instance_id=instance_id, item_id=item_id)
+
+
+def _compose_consumed_notes(
+    *,
+    note: str | None,
+    url: str | None,
+    liked: bool,
+) -> str | None:
+    parts: list[str] = []
+    if note and str(note).strip():
+        parts.append(str(note).strip())
+    if url and str(url).strip():
+        parts.append(f"URL: {str(url).strip()}")
+    if not liked:
+        parts.append("Did not enjoy.")
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def _consumed_media_near_duplicate(
+    instance_id: str, category: str, title: str, creator: str | None
+) -> bool:
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    t_key = norm(title)
+    if not t_key:
+        return False
+    a_key = norm(creator or "")
+    try:
+        rows = list_consumed_media(instance_id, category)
+    except Exception:
+        rows = []
+    for r in rows:
+        if norm(r.get("title") or "") != t_key:
+            continue
+        ra = norm(r.get("creator_or_source") or "")
+        if not a_key or not ra or a_key == ra:
+            return True
+    return False
+
+
+def apply_library_tool_items(items: object, instance_id: str = "") -> tuple[int, list[str]]:
+    """
+    Validate structured items from the chat agent (tool calls) and insert into Semantic Memory (consumed_media).
+    Returns (count_added, short labels for confirmation).
+    """
+    if not isinstance(items, list):
+        return 0, []
+    added = 0
+    labels: list[str] = []
+    type_to_category = {
+        "book": "book",
+        "podcast": "podcast",
+        "article": "research_article",
+        "research": "research_article",
+    }
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        ctype = str(raw.get("type", "")).lower().strip()
+        category = type_to_category.get(ctype)
+        if not category:
+            continue
+        title = (raw.get("title") or "").strip()
+        if not title:
+            continue
+        author = (raw.get("author") or "").strip() or None
+        url = (raw.get("url") or "").strip() or None
+        liked = raw.get("liked", True)
+        if isinstance(liked, str):
+            liked = liked.strip().lower() in ("true", "1", "yes")
+        note = (raw.get("note") or "").strip() or None
+        notes = _compose_consumed_notes(note=note, url=url, liked=bool(liked))
+        if _consumed_media_near_duplicate(instance_id, category, title, author):
+            continue
+        try:
+            row_id = add_consumed_media(
+                instance_id=instance_id,
+                category=category,
+                title=title,
+                creator_or_source=author,
+                notes=notes,
+            )
+        except Exception as e:
+            print("[backend] apply_library_tool_items add error:", e)
+            continue
+        if row_id:
+            added += 1
+            labels.append(
+                f"{ctype}: {title[:80]}" + (f" ({author[:60]})" if author else "")
+            )
+    return added, labels
+
+
+_BOOK_VALIDATION_MODEL = os.getenv("OPENROUTER_BOOK_VALIDATION_MODEL", "openai/gpt-4.1-mini")
+
+_BOOK_TOOL_NORMALIZE_PROMPT = """The user mentioned these books in conversation. For each entry, output a clean standard English title and the primary author (fix typos and casing for well-known books).
+Return ONLY a JSON array — same length and order as the input. Each element: {"title":"...","author":"..."}.
+Use "" for author only if unknown. No markdown, no explanation.
+
+Input:
+"""
+
+
+def resolve_books_via_openlibrary(books: list[dict]) -> list[dict]:
+    """
+    Normalize title/author via OpenRouter (OPENROUTER_BOOK_VALIDATION_MODEL), then save_resolved_books.
+    """
+    resolved: list[dict] = []
+    for raw in books:
+        if not isinstance(raw, dict):
+            continue
+        raw_title = (raw.get("raw_title") or "").strip()
+        raw_author = (raw.get("raw_author") or "").strip() or None
+        if not raw_title:
+            continue
+        resolved.append(
+            {
+                "type": "book",
+                "title": raw_title,
+                "author": raw_author,
+                "raw_title": raw_title,
+                "raw_author": raw_author,
+                "liked": raw.get("liked", True),
+                "note": (raw.get("note") or "").strip() or None,
+            }
+        )
+
+    if not resolved or not openrouter_api_configured():
+        return resolved
+
+    batch_size = 12
+    for start in range(0, len(resolved), batch_size):
+        batch = resolved[start : start + batch_size]
+        payload = [
+            {
+                "raw_title": b.get("raw_title", ""),
+                "raw_author": str(b.get("raw_author") or ""),
+            }
+            for b in batch
+        ]
+        prompt = _BOOK_TOOL_NORMALIZE_PROMPT + json.dumps(payload, ensure_ascii=False)
+        try:
+            raw = _openrouter_chat_completion(
+                prompt,
+                model=_BOOK_VALIDATION_MODEL,
+                temperature=0.1,
+                timeout_sec=45,
+                max_tokens=2048,
+            )
+            raw = (raw or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            corrections = json.loads(raw)
+            if not isinstance(corrections, list) or len(corrections) != len(batch):
+                print(
+                    f"[backend] Book normalize batch: expected {len(batch)} items, got "
+                    f"{len(corrections) if isinstance(corrections, list) else 'non-list'} — skip"
+                )
+                continue
+            for k, correction in enumerate(corrections):
+                if not isinstance(correction, dict):
+                    continue
+                idx = start + k
+                new_title = (correction.get("title") or "").strip()
+                new_author = (correction.get("author") or "").strip()
+                if new_title:
+                    resolved[idx]["title"] = new_title
+                if new_author:
+                    resolved[idx]["author"] = new_author
+                elif correction.get("author") == "":
+                    resolved[idx]["author"] = None
+        except Exception as e:
+            print(f"[backend] Book normalize LLM error (non-fatal): {e}")
+
+    return resolved
+
+
+def save_resolved_books(resolved: list[dict], instance_id: str = "") -> tuple[int, list[str]]:
+    """Persist normalized books to consumed_media; skip near-duplicates. Returns (count_saved, labels)."""
+    saved = 0
+    skipped = 0
+    labels: list[str] = []
+    for book in resolved:
+        title = (book.get("title") or "").strip()
+        if not title:
+            continue
+        author = book.get("author")
+        author_s = (author or "").strip() if author else ""
+        liked = bool(book.get("liked", True))
+        note = (book.get("note") or "").strip() or None
+        notes = _compose_consumed_notes(note=note, url=None, liked=liked)
+        if _consumed_media_near_duplicate(instance_id, "book", title, author_s or None):
+            skipped += 1
+            continue
+        try:
+            row_id = add_consumed_media(
+                instance_id=instance_id,
+                category="book",
+                title=title,
+                creator_or_source=author_s or None,
+                notes=notes,
+            )
+        except Exception as e:
+            print(f"[backend] save_resolved_books error for '{title}': {e}")
+            continue
+        if row_id:
+            saved += 1
+            label = f"book: {title[:80]}"
+            if author_s:
+                label += f" ({author_s[:60]})"
+            labels.append(label)
+    if skipped:
+        labels.append(f"({skipped} already in library)")
+    return saved, labels
 
 
 def get_person_events(person_name: str) -> list[dict]:

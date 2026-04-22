@@ -1,6 +1,6 @@
 import type { Dispatch, ReactNode, SetStateAction } from "react";
 
-export type PersonaplexView = "voice_memo" | "brain";
+export type PersonaplexView = "voice_memo" | "brain" | "semantic_memory";
 
 type Props = {
   /** Expanded width on desktop (Open WebUI–style rail). */
@@ -11,12 +11,6 @@ type Props = {
   view: PersonaplexView;
   setView: Dispatch<SetStateAction<PersonaplexView>>;
 };
-
-function sectionLabel(text: string) {
-  return (
-    <p className="px-2 pb-1.5 pt-3 text-[0.6rem] font-semibold uppercase tracking-[0.18em] text-white/40">{text}</p>
-  );
-}
 
 function navRow(
   active: boolean,
@@ -74,8 +68,7 @@ export function PersonaplexLeftRail({
         )}
       </div>
 
-      <nav className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-1.5 pb-3" aria-label="Primary">
-        {sectionLabel("Navigate")}
+      <nav className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-1.5 pb-3 pt-2" aria-label="Primary">
         {navRow(
           view === "voice_memo",
           () => {
@@ -97,6 +90,18 @@ export function PersonaplexLeftRail({
           "The Brain",
           <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+          </svg>,
+          narrow
+        )}
+        {navRow(
+          view === "semantic_memory",
+          () => {
+            setView("semantic_memory");
+            closeMobile();
+          },
+          "Semantic Memory",
+          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v12a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z" />
           </svg>,
           narrow
         )}

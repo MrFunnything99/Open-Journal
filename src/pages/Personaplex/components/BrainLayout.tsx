@@ -106,6 +106,8 @@ type BrainLayoutProps = {
   onPrepareJournalDumpUpload?: () => boolean;
   /** Wipe server vectors for this instance and clear local journals, caches, and in-progress chat (Start fresh). */
   onStartFresh?: () => void | Promise<void>;
+  /** After local journal edits, re-post to `/ingest-history` (server replaces vectors by stable session_id). */
+  syncUnsyncedEntries?: () => Promise<number>;
 };
 
 function countJournalText(entries: JournalEntry[], mode: "tokens" | "words"): number {
@@ -169,6 +171,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   onImportJournalDumpFolder,
   onPrepareJournalDumpUpload,
   onStartFresh,
+  syncUnsyncedEntries,
 }) => {
   type ExplorerTab = "journals" | "conversations";
   const [explorerTab, setExplorerTab] = useState<ExplorerTab>("journals");
@@ -206,8 +209,10 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
   const [journalEditing, setJournalEditing] = useState(false);
   const [journalMarkdownDraft, setJournalMarkdownDraft] = useState("");
   const editBaselineMarkdownRef = useRef("");
-  /** When set, selecting this transcript id opens the Markdown editor immediately (one-step from day list). */
-  const openTranscriptEditAfterSelectIdRef = useRef<string | null>(null);
+  /** Inline Markdown edit for one manual journal card while staying on the day list (scroll other entries). */
+  const [dayListEditEntryId, setDayListEditEntryId] = useState<string | null>(null);
+  const [dayListEditMarkdown, setDayListEditMarkdown] = useState("");
+  const dayListEditBaselineRef = useRef("");
 
   const journalSorted = useMemo(() => {
     const list = entries.filter((e) => !isConversationEntry(e));
@@ -261,11 +266,18 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
         setJournalMarkdownDraft("");
         editBaselineMarkdownRef.current = "";
       }
+      if (dayListEditEntryId) {
+        const dirty = dayListEditMarkdown !== dayListEditBaselineRef.current;
+        if (dirty && !confirm("Discard unsaved edits to switch tabs?")) return;
+        setDayListEditEntryId(null);
+        setDayListEditMarkdown("");
+        dayListEditBaselineRef.current = "";
+      }
       setExplorerTab(next);
       setSelection(selectFirstForTab(next));
       setExpandedLogKey(null);
     },
-    [explorerTab, journalEditing, journalMarkdownDraft, selectFirstForTab]
+    [explorerTab, journalEditing, journalMarkdownDraft, dayListEditEntryId, dayListEditMarkdown, selectFirstForTab]
   );
 
   useEffect(() => {
@@ -302,9 +314,6 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
     return null;
   }, [selection, journalSorted, conversationSorted]);
 
-  const selectedTranscriptRef = useRef<JournalEntry | null>(null);
-  selectedTranscriptRef.current = selectedTranscript;
-
   const selectedJournalDayEntries = useMemo(() => {
     if (selection?.kind !== "journal_day") return null;
     return journalSorted.filter((e) => localCalendarDayKey(e.date) === selection.dayKey);
@@ -312,7 +321,20 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
 
   /** User-driven selection changes; prompts if leaving a transcript with unsaved edits. */
   const trySelect = useCallback(
-    (next: Selection, opts?: { openEdit?: boolean }) => {
+    (next: Selection) => {
+      if (dayListEditEntryId) {
+        const sameJournalDay =
+          next.kind === "journal_day" &&
+          selection?.kind === "journal_day" &&
+          next.dayKey === selection.dayKey;
+        if (!sameJournalDay) {
+          const dirty = dayListEditMarkdown !== dayListEditBaselineRef.current;
+          if (dirty && !confirm("Discard unsaved edits to this entry?")) return;
+          setDayListEditEntryId(null);
+          setDayListEditMarkdown("");
+          dayListEditBaselineRef.current = "";
+        }
+      }
       if (journalEditing && (selection?.kind === "journal" || selection?.kind === "conversation")) {
         const leaving =
           next.kind !== selection.kind
@@ -330,36 +352,84 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
           editBaselineMarkdownRef.current = "";
         }
       }
-      if (opts?.openEdit && (next.kind === "journal" || next.kind === "conversation")) {
-        openTranscriptEditAfterSelectIdRef.current = next.id;
-      }
       setSelection(next);
       setExpandedLogKey(null);
     },
-    [journalEditing, journalMarkdownDraft, selection]
+    [dayListEditEntryId, dayListEditMarkdown, journalEditing, journalMarkdownDraft, selection]
   );
 
   useEffect(() => {
-    const entry = selectedTranscriptRef.current;
-    const id = entry?.id;
-    if (!id || !entry) {
-      setJournalEditing(false);
-      setJournalMarkdownDraft("");
-      editBaselineMarkdownRef.current = "";
-      return;
-    }
-    if (openTranscriptEditAfterSelectIdRef.current === id) {
-      openTranscriptEditAfterSelectIdRef.current = null;
-      const md = transcriptToMarkdownForEdit(entry.fullTranscript);
-      editBaselineMarkdownRef.current = md;
-      setJournalMarkdownDraft(md);
-      setJournalEditing(true);
-      return;
-    }
     setJournalEditing(false);
     setJournalMarkdownDraft("");
     editBaselineMarkdownRef.current = "";
   }, [selectedTranscript?.id]);
+
+  useEffect(() => {
+    if (dayListEditEntryId && !journalSorted.some((e) => e.id === dayListEditEntryId)) {
+      setDayListEditEntryId(null);
+      setDayListEditMarkdown("");
+      dayListEditBaselineRef.current = "";
+    }
+  }, [journalSorted, dayListEditEntryId]);
+
+  const beginDayListInlineEdit = useCallback(
+    (entry: JournalEntry) => {
+      if (dayListEditEntryId === entry.id) return;
+      if (dayListEditEntryId && dayListEditMarkdown !== dayListEditBaselineRef.current) {
+        if (!confirm("Discard unsaved edits to this entry?")) return;
+      }
+      const md = transcriptToMarkdownForEdit(entry.fullTranscript);
+      dayListEditBaselineRef.current = md;
+      setDayListEditMarkdown(md);
+      setDayListEditEntryId(entry.id);
+    },
+    [dayListEditEntryId, dayListEditMarkdown]
+  );
+
+  const cancelDayListInlineEdit = useCallback(() => {
+    if (dayListEditMarkdown !== dayListEditBaselineRef.current) {
+      if (!confirm("Discard unsaved changes?")) return;
+    }
+    setDayListEditEntryId(null);
+    setDayListEditMarkdown("");
+    dayListEditBaselineRef.current = "";
+  }, [dayListEditMarkdown]);
+
+  const persistJournalEditAndReingest = useCallback(
+    async (entryId: string, parsed: ChatMessage[]) => {
+      onUpdateJournalEntry(entryId, parsed);
+      onToast?.("Saved on this device.");
+      if (!syncUnsyncedEntries) return;
+      await new Promise<void>((r) => setTimeout(r, 0));
+      try {
+        const n = await syncUnsyncedEntries();
+        if (n === 0) {
+          onToast?.(
+            "Your edit is saved on this device, but server memory did not update. Check your connection and try again."
+          );
+        }
+      } catch {
+        onToast?.("Your edit is saved on this device, but syncing to server failed.");
+      }
+    },
+    [onUpdateJournalEntry, onToast, syncUnsyncedEntries]
+  );
+
+  const saveDayListInlineEdit = useCallback(
+    (entryId: string) => {
+      const parsed = markdownToTranscript(dayListEditMarkdown);
+      const hasText = parsed.some((m) => m.text.trim().length > 0);
+      if (!hasText) {
+        onToast?.("Add some text before saving.");
+        return;
+      }
+      void persistJournalEditAndReingest(entryId, parsed);
+      setDayListEditEntryId(null);
+      setDayListEditMarkdown("");
+      dayListEditBaselineRef.current = "";
+    },
+    [dayListEditMarkdown, onToast, persistJournalEditAndReingest]
+  );
 
   const toggleJournalYear = (y: number) => {
     setJournalExpandedYears((prev) => {
@@ -771,11 +841,10 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                         onToast?.("Add some text before saving.");
                         return;
                       }
-                      onUpdateJournalEntry(selectedTranscript.id, parsed);
+                      void persistJournalEditAndReingest(selectedTranscript.id, parsed);
                       setJournalEditing(false);
                       setJournalMarkdownDraft("");
                       editBaselineMarkdownRef.current = "";
-                      onToast?.("Saved on this device.");
                     }}
                     className="rounded-full bg-white/95 px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition-colors hover:bg-white"
                   >
@@ -907,7 +976,7 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
             <div className={kbMetaRowClass}>
               <span className="text-xs font-semibold uppercase tracking-widest text-[#5F7585]">The Brain</span>
               <span className="text-xs text-[#9BB1BE]">
-                {selectedJournalDayEntries.length} entr{selectedJournalDayEntries.length === 1 ? "y" : "ies"} · scroll to read oldest → newest
+                {selectedJournalDayEntries.length} entr{selectedJournalDayEntries.length === 1 ? "y" : "ies"}
               </span>
             </div>
             <div className="flex-1 overflow-y-auto scrollbar px-6 py-8 md:px-10 md:py-10">
@@ -928,47 +997,76 @@ export const BrainLayout: FC<BrainLayoutProps> = ({
                           )}
                           <p className="mt-0.5 text-xs text-[#5F7585]">Saved {formatRelativeSaved(entry.date)}</p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => trySelect({ kind: "journal", id: entry.id }, { openEdit: true })}
-                          className="shrink-0 rounded-lg p-2 text-[#9BB1BE] transition-colors hover:bg-white/[0.08] hover:text-[#E8F1F5]"
-                          aria-label="Edit this entry"
-                          title="Edit this entry"
-                        >
-                          <PencilEditIcon />
-                        </button>
+                        {dayListEditEntryId === entry.id ? (
+                          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => saveDayListInlineEdit(entry.id)}
+                              className="rounded-full bg-white/95 px-4 py-1.5 text-xs font-medium text-gray-900 shadow-sm transition-colors hover:bg-white"
+                            >
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              onClick={cancelDayListInlineEdit}
+                              className="rounded-lg px-2 py-1.5 text-xs font-medium text-[#9BB1BE] transition-colors hover:bg-white/[0.08] hover:text-[#E8F1F5]"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => beginDayListInlineEdit(entry)}
+                            className="shrink-0 rounded-lg p-2 text-[#9BB1BE] transition-colors hover:bg-white/[0.08] hover:text-[#E8F1F5]"
+                            aria-label="Edit this entry"
+                            title="Edit this entry"
+                          >
+                            <PencilEditIcon />
+                          </button>
+                        )}
                       </div>
-                      <div className="space-y-8">
-                        {entry.fullTranscript.map((msg, i) => {
-                          const logKey = `${entry.id}:${i}`;
-                          return (
-                            <div key={i} className="space-y-2">
-                              <p className="text-xs font-semibold uppercase tracking-widest text-[#5F7585]">
-                                {msg.role === "user" ? "You" : "AI"}
-                              </p>
-                              <p className="whitespace-pre-wrap">{msg.text}</p>
-                              {msg.role === "ai" && msg.retrievalLog && (
-                                <div className="pt-2">
-                                  <button
-                                    type="button"
-                                    onClick={() => setExpandedLogKey((prev) => (prev === logKey ? null : logKey))}
-                                    className="text-xs font-medium text-[#9BB1BE] hover:underline hover:text-[#E8F1F5]"
-                                  >
-                                    {expandedLogKey === logKey ? "Hide" : "Show"} memory context (vector DB)
-                                  </button>
-                                  {expandedLogKey === logKey && (
-                                    <pre
-                                      className={`mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-xl border ${kbTreeBorder} bg-[rgba(10,18,28,0.7)] p-3 text-xs text-[#C5D4DE] backdrop-blur-sm`}
+                      {dayListEditEntryId === entry.id ? (
+                        <textarea
+                          value={dayListEditMarkdown}
+                          onChange={(e) => setDayListEditMarkdown(e.target.value)}
+                          spellCheck
+                          aria-label="Journal entry (Markdown)"
+                          className="mt-2 min-h-[min(40vh,16rem)] w-full resize-y rounded-lg border border-[rgba(120,180,200,0.14)] bg-transparent px-3 py-3 font-sans text-[15px] leading-[1.75] text-[#E8F1F5] placeholder:text-[#5F7585] focus:border-[rgba(45,212,191,0.45)] focus:outline-none focus:ring-2 focus:ring-[rgba(45,212,191,0.2)] md:text-base"
+                        />
+                      ) : (
+                        <div className="space-y-8">
+                          {entry.fullTranscript.map((msg, i) => {
+                            const logKey = `${entry.id}:${i}`;
+                            return (
+                              <div key={i} className="space-y-2">
+                                <p className="text-xs font-semibold uppercase tracking-widest text-[#5F7585]">
+                                  {msg.role === "user" ? "You" : "AI"}
+                                </p>
+                                <p className="whitespace-pre-wrap">{msg.text}</p>
+                                {msg.role === "ai" && msg.retrievalLog && (
+                                  <div className="pt-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => setExpandedLogKey((prev) => (prev === logKey ? null : logKey))}
+                                      className="text-xs font-medium text-[#9BB1BE] hover:underline hover:text-[#E8F1F5]"
                                     >
-                                      {msg.retrievalLog}
-                                    </pre>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
+                                      {expandedLogKey === logKey ? "Hide" : "Show"} memory context (vector DB)
+                                    </button>
+                                    {expandedLogKey === logKey && (
+                                      <pre
+                                        className={`mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-xl border ${kbTreeBorder} bg-[rgba(10,18,28,0.7)] p-3 text-xs text-[#C5D4DE] backdrop-blur-sm`}
+                                      >
+                                        {msg.retrievalLog}
+                                      </pre>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </article>
                   );
                 })}

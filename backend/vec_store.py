@@ -203,6 +203,26 @@ def _init_db(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS consumed_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            creator_or_source TEXT,
+            notes TEXT,
+            consumed_on TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_consumed_media_instance ON consumed_media(instance_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_consumed_media_category ON consumed_media(instance_id, category)"
+    )
+
     # Simple login (no email): username + password_hash for persistent data (legacy)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS auth_users (
@@ -507,6 +527,144 @@ def instance_settings_get_with_meta(instance_id: str) -> tuple[dict, str | None]
     except Exception:
         d = {}
     return d, (row[1] if len(row) > 1 else None)
+
+
+_CONSUMED_MEDIA_CATEGORIES = {"book", "podcast", "research_article"}
+
+
+def _normalize_consumed_category(category: str) -> str | None:
+    c = (category or "").strip().lower()
+    if c in ("article", "research"):
+        c = "research_article"
+    return c if c in _CONSUMED_MEDIA_CATEGORIES else None
+
+
+@_sqlite_serialized
+def consumed_media_list(instance_id: str, category: str | None = None) -> list[dict]:
+    conn = _get_conn()
+    where, params = _instance_where(instance_id, "consumed_media")
+    cat = _normalize_consumed_category(category or "") if category else None
+    if cat:
+        where = f"{where} AND category = ?"
+        params = [*params, cat]
+    rows = conn.execute(
+        f"""
+        SELECT id, instance_id, category, title, creator_or_source, notes, consumed_on, created_at, updated_at
+        FROM consumed_media
+        WHERE {where}
+        ORDER BY COALESCE(consumed_on, '') DESC, id DESC
+        """,
+        params,
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        out.append(
+            {
+                "id": int(r[0]),
+                "instance_id": r[1] or "",
+                "category": r[2] or "",
+                "title": r[3] or "",
+                "creator_or_source": r[4] or "",
+                "notes": r[5] or "",
+                "consumed_on": r[6] or None,
+                "created_at": r[7] or "",
+                "updated_at": r[8] or "",
+            }
+        )
+    return out
+
+
+@_sqlite_serialized
+def consumed_media_create(
+    *,
+    instance_id: str,
+    category: str,
+    title: str,
+    creator_or_source: str | None = None,
+    notes: str | None = None,
+    consumed_on: str | None = None,
+) -> int | None:
+    conn = _get_conn()
+    cat = _normalize_consumed_category(category)
+    t = (title or "").strip()
+    if not cat or not t:
+        return None
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        """
+        INSERT INTO consumed_media (
+            instance_id, category, title, creator_or_source, notes, consumed_on, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            instance_id or "",
+            cat,
+            t,
+            (creator_or_source or "").strip(),
+            (notes or "").strip(),
+            (consumed_on or "").strip() or None,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    return int(row[0]) if row and row[0] else None
+
+
+@_sqlite_serialized
+def consumed_media_update(
+    *,
+    instance_id: str,
+    item_id: int,
+    category: str,
+    title: str,
+    creator_or_source: str | None = None,
+    notes: str | None = None,
+    consumed_on: str | None = None,
+) -> bool:
+    conn = _get_conn()
+    cat = _normalize_consumed_category(category)
+    t = (title or "").strip()
+    if not cat or not t:
+        return False
+    cur = conn.execute(
+        "SELECT id FROM consumed_media WHERE id = ? AND instance_id = ?",
+        (item_id, instance_id or ""),
+    ).fetchone()
+    if not cur:
+        return False
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        """
+        UPDATE consumed_media
+        SET category = ?, title = ?, creator_or_source = ?, notes = ?, consumed_on = ?, updated_at = ?
+        WHERE id = ? AND instance_id = ?
+        """,
+        (
+            cat,
+            t,
+            (creator_or_source or "").strip(),
+            (notes or "").strip(),
+            (consumed_on or "").strip() or None,
+            now,
+            item_id,
+            instance_id or "",
+        ),
+    )
+    conn.commit()
+    return True
+
+
+@_sqlite_serialized
+def consumed_media_delete(*, instance_id: str, item_id: int) -> bool:
+    conn = _get_conn()
+    cur = conn.execute(
+        "DELETE FROM consumed_media WHERE id = ? AND instance_id = ?",
+        (item_id, instance_id or ""),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 @_sqlite_serialized
