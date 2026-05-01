@@ -1,25 +1,25 @@
 /// <reference types="node" />
 
-const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
-const INTERVIEWER_MODEL =
-  process.env.OPENROUTER_INTERVIEWER_MODEL?.trim() ||
-  process.env.OPENROUTER_CHAT_MODEL?.trim() ||
-  "openai/gpt-4.1-mini";
+const TINFOIL_CHAT_URL = "https://inference.tinfoil.sh/v1/chat/completions";
+const INTERVIEWER_MODEL = process.env.TINFOIL_INTERVIEWER_MODEL?.trim() || process.env.TINFOIL_CHAT_MODEL?.trim() || "kimi-k2-6";
 
 type ChatMessage = { role: "user" | "ai"; text: string };
 
+function assistantText(data: Record<string, unknown>): string {
+  const choices = data.choices as Array<{ message?: { content?: unknown } }> | undefined;
+  const content = choices?.[0]?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) return content.map((b) => (b && typeof b === "object" && "text" in b ? String((b as { text?: unknown }).text ?? "") : "")).join("").trim();
+  return "";
+}
+
 export async function POST(request: Request) {
   const jsonResponse = (body: { error?: string; question?: string }, status: number) =>
-    new Response(JSON.stringify(body), {
-      status,
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-    });
+    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json; charset=utf-8" } });
 
   try {
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) {
-      return jsonResponse({ error: "OPENROUTER_API_KEY is not configured" }, 500);
-    }
+    const apiKey = process.env.TINFOIL_API_KEY?.trim();
+    if (!apiKey) return jsonResponse({ error: "TINFOIL_API_KEY is not configured" }, 500);
 
     let body: { systemPrompt?: string; messages?: ChatMessage[] };
     try {
@@ -27,92 +27,35 @@ export async function POST(request: Request) {
     } catch {
       return jsonResponse({ error: "Invalid JSON in request body" }, 400);
     }
-    const { systemPrompt, messages } = body as {
-      systemPrompt: string;
-      messages: ChatMessage[];
-    };
 
-    if (!systemPrompt || typeof systemPrompt !== "string") {
-      return jsonResponse({ error: "systemPrompt is required" }, 400);
-    }
-
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return jsonResponse({ error: "messages array is required and must not be empty" }, 400);
-    }
+    const { systemPrompt, messages } = body;
+    if (!systemPrompt || typeof systemPrompt !== "string") return jsonResponse({ error: "systemPrompt is required" }, 400);
+    if (!Array.isArray(messages) || messages.length === 0) return jsonResponse({ error: "messages array is required and must not be empty" }, 400);
 
     const chatMessages = [
       { role: "system" as const, content: systemPrompt },
-      ...messages.map((m) => ({
-        role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-        content: m.text,
-      })),
+      ...messages.map((m) => ({ role: m.role === "user" ? ("user" as const) : ("assistant" as const), content: m.text })),
     ];
 
-    const res = await fetch(OPENROUTER_API_URL, {
+    const res = await fetch(TINFOIL_CHAT_URL, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: INTERVIEWER_MODEL,
-        messages: chatMessages,
-        max_tokens: 4096,
-      }),
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: INTERVIEWER_MODEL, messages: chatMessages, max_tokens: 8192 }),
     });
 
     const rawText = await res.text();
-    let data: Record<string, unknown> = {};
-    if (rawText.trim()) {
-      try {
-        data = JSON.parse(rawText) as Record<string, unknown>;
-      } catch {
-        console.error("[interviewer] OpenRouter returned non-JSON:", rawText.slice(0, 200));
-      }
-    }
-
+    const data = rawText.trim() ? (JSON.parse(rawText) as Record<string, unknown>) : {};
     if (!res.ok) {
-      const errMsg =
-        (data?.error as { message?: string })?.message ??
-        (data?.error as string) ??
-        (rawText.trim() ? rawText.slice(0, 200) : null) ??
-        `OpenRouter request failed (${res.status})`;
-      return jsonResponse({ error: String(errMsg) }, 500);
+      const err = data.error as { message?: string } | string | undefined;
+      const msg = typeof err === "string" ? err : err?.message || rawText.slice(0, 200) || `Tinfoil request failed (${res.status})`;
+      return jsonResponse({ error: msg }, 500);
     }
 
-    const choices = data?.choices as Array<{
-      message?: { content?: string | Array<{ type?: string; text?: string }> };
-      finish_reason?: string;
-    }> | undefined;
-    const choice = choices?.[0];
-    const finishReason = choice?.finish_reason;
-    const content = choice?.message?.content;
-
-    let text: string;
-    if (typeof content === "string") {
-      text = content;
-    } else if (Array.isArray(content)) {
-      text = content
-        .map((block) => (block && typeof block.text === "string" ? block.text : ""))
-        .join("");
-    } else {
-      return jsonResponse({ error: "No content generated" }, 500);
-    }
-
-    if (!text || !text.trim()) {
-      return jsonResponse({ error: "No content generated" }, 500);
-    }
-
-    const trimmed = text.trim();
-    if (finishReason === "length") {
-      console.warn("[interviewer] Model hit token limit (finish_reason: length), response may be truncated");
-    }
-    console.log("[interviewer] Response:", { finish_reason: finishReason, length: trimmed.length, preview: trimmed.slice(0, 80) });
-
-    return jsonResponse({ question: trimmed }, 200);
+    const text = assistantText(data);
+    if (!text) return jsonResponse({ error: "No content generated" }, 500);
+    return jsonResponse({ question: text }, 200);
   } catch (err) {
     console.error("[interviewer] Error:", err);
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return jsonResponse({ error: message }, 500);
+    return jsonResponse({ error: err instanceof Error ? err.message : "Unknown error" }, 500);
   }
 }

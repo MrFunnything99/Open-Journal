@@ -28,6 +28,12 @@ from library import (
     resolve_books_via_openlibrary,
     save_resolved_books,
 )
+from tinfoil_client import (
+    chat_completion,
+    normalize_chat_response,
+    tinfoil_chat_fallback_model,
+    tinfoil_chat_model,
+)
 from agent_site_tools import (
     log_tool_invocation,
     tool_navigate_ui,
@@ -44,8 +50,8 @@ class JournalState(TypedDict):
     personalization: float
     intrusiveness: NotRequired[float]
     mode: NotRequired[str]  # "journal" | "conversation" | "autobiography" (UI: Assisted Journal; recommendations in main)
-    # OpenRouter model id (allowlisted); used only for conversation + autobiography when set
-    openrouter_model: NotRequired[str]
+    # Tinfoil model id (allowlisted); used only for conversation + autobiography when set
+    tinfoil_model: NotRequired[str]
     retrieval_log: NotRequired[str]
     last_transcript: NotRequired[str]
     last_summary: NotRequired[str]
@@ -58,23 +64,21 @@ class JournalState(TypedDict):
     library_items_added: NotRequired[int]  # chat agent saved N items to Semantic Memory (consumed_media)
 
 
-DEFAULT_OPENROUTER_CHAT_MODEL = "openai/gpt-4.1-mini"
-DEFAULT_OPENROUTER_PRIMARY_MODEL = "anthropic/claude-opus-4.6"
-DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL = DEFAULT_OPENROUTER_PRIMARY_MODEL
-DEFAULT_OPENROUTER_CONVERSATION_MODEL = "x-ai/grok-4.1-fast"
-DEFAULT_ASSISTED_JOURNAL_MODEL = DEFAULT_OPENROUTER_PRIMARY_MODEL
+DEFAULT_TINFOIL_CHAT_MODEL = "kimi-k2-6"
+DEFAULT_TINFOIL_CHAT_FALLBACK_MODEL = "deepseek-v4-pro"
+DEFAULT_TINFOIL_CONVERSATION_MODEL = DEFAULT_TINFOIL_CHAT_MODEL
+DEFAULT_ASSISTED_JOURNAL_MODEL = DEFAULT_TINFOIL_CHAT_MODEL
 
-# Allowlist for client-provided OpenRouter id (must match frontend CHAT_COMPLETION_MODEL_OPTIONS)
+# Allowlist for client-provided Tinfoil id (must match frontend CHAT_COMPLETION_MODEL_OPTIONS)
 USER_SELECTABLE_CHAT_MODELS: frozenset[str] = frozenset(
     {
-        DEFAULT_OPENROUTER_PRIMARY_MODEL,
-        "anthropic/claude-sonnet-4.6",
-        "openai/gpt-5.4",
+        "kimi-k2-6",
+        "deepseek-v4-pro",
     }
 )
 
 
-def _user_pick_openrouter_model(mode: str, requested: str | None) -> str | None:
+def _user_pick_tinfoil_model(mode: str, requested: str | None) -> str | None:
     if mode not in ("conversation", "autobiography"):
         return None
     rid = (requested or "").strip()
@@ -83,47 +87,18 @@ def _user_pick_openrouter_model(mode: str, requested: str | None) -> str | None:
     return rid
 
 
-def _reasoning_extra_body_for_model(model: str) -> dict | None:
-    ml = model.lower()
-    if ml.startswith("x-ai/") or "/grok" in ml:
-        return {"reasoning": {"enabled": True}}
-    return None
-
-
-def _openrouter_chat_client_and_model():
-    """OpenAI-compatible client pointed at OpenRouter for /chat (journal interviewer)."""
-    from openai import OpenAI
-
-    key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-    if not key:
-        raise ValueError(
-            "OPENROUTER_API_KEY is required for the chat interviewer (/chat). "
-            "Get a key at https://openrouter.ai/keys"
-        )
-    model = (os.getenv("OPENROUTER_CHAT_MODEL") or DEFAULT_OPENROUTER_CHAT_MODEL).strip()
-    client = OpenAI(
-        api_key=key,
-        base_url="https://openrouter.ai/api/v1",
-        default_headers={
-            "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://selfmeridian.local"),
-            "X-Title": os.getenv("OPENROUTER_TITLE", "SelfMeridian"),
-        },
-    )
-    return client, model
-
-
-def _openrouter_chat_client_models():
+def _tinfoil_chat_models():
     """
-    Return (client, primary_model, fallback_model) for /chat.
+    Return (primary_model, fallback_model) for /chat.
     Primary should be cheap + good at tool calling; fallback should be stronger for ambiguity/errors.
     """
-    client, primary = _openrouter_chat_client_and_model()
-    fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL).strip()
+    primary = (os.getenv("TINFOIL_CHAT_MODEL") or tinfoil_chat_model()).strip()
+    fallback = (os.getenv("TINFOIL_CHAT_FALLBACK_MODEL") or tinfoil_chat_fallback_model()).strip()
     if not fallback:
-        fallback = DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL
+        fallback = DEFAULT_TINFOIL_CHAT_FALLBACK_MODEL
     if fallback == primary:
-        fallback = DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL
-    return client, primary, fallback
+        fallback = DEFAULT_TINFOIL_CHAT_FALLBACK_MODEL
+    return primary, fallback
 
 
 NAVIGATE_UI_TOOL = {
@@ -309,8 +284,8 @@ _ASSISTED_JOURNAL_PROMPT = (
 )
 
 
-def _messages_to_openai_dicts(messages: list[BaseMessage]) -> list[dict]:
-    """Convert LangChain messages to OpenAI chat format (system/user/assistant text only)."""
+def _messages_to_chat_dicts(messages: list[BaseMessage]) -> list[dict]:
+    """Convert LangChain messages to chat-completions dicts (system/user/assistant text only)."""
     out: list[dict] = []
     for m in messages:
         content = getattr(m, "content", str(m))
@@ -329,7 +304,12 @@ def _messages_to_openai_dicts(messages: list[BaseMessage]) -> list[dict]:
 
 
 def _assistant_message_to_dict(msg) -> dict:
-    """OpenAI SDK assistant message including optional tool_calls."""
+    """Assistant message including optional tool_calls."""
+    if isinstance(msg, dict):
+        d: dict = {"role": "assistant", "content": msg.get("content")}
+        if msg.get("tool_calls"):
+            d["tool_calls"] = msg.get("tool_calls")
+        return d
     d: dict = {"role": "assistant"}
     tcalls = getattr(msg, "tool_calls", None)
     if tcalls:
@@ -352,45 +332,40 @@ def _assistant_message_to_dict(msg) -> dict:
 
 
 def _interviewer_run_with_tools(
-    client,
     model: str,
     oai_messages: list[dict],
     instance_id: str,
     *,
     max_tool_rounds: int = 5,
-    extra_body: dict | None = None,
     temperature: float | None = None,
 ) -> tuple[AIMessage, int, list[dict], list[dict]]:
     """
-    Multi-turn chat completion (OpenRouter) with allowlisted site tools.
+    Multi-turn Tinfoil chat completion with allowlisted site tools.
     Returns (assistant message, library_items_saved_this_turn, agent_steps, client_actions).
     """
     total_saved = 0
     agent_steps: list[dict] = []
     client_actions: list[dict] = []
     rounds = 0
-    fallback_model = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL).strip()
+    fallback_model = (os.getenv("TINFOIL_CHAT_FALLBACK_MODEL") or tinfoil_chat_fallback_model()).strip()
     if not fallback_model:
-        fallback_model = DEFAULT_OPENROUTER_CHAT_FALLBACK_MODEL
+        fallback_model = DEFAULT_TINFOIL_CHAT_FALLBACK_MODEL
     active_model = model
     escalated = False
     while rounds < max_tool_rounds:
         rounds += 1
         try:
-            create_kwargs: dict = dict(
+            resp = chat_completion(
+                oai_messages,
                 model=active_model,
-                messages=oai_messages,
                 tools=_CHAT_TOOLS,
                 tool_choice="auto",
                 max_tokens=4096,
+                temperature=temperature,
+                timeout_sec=180.0,
             )
-            if temperature is not None:
-                create_kwargs["temperature"] = float(temperature)
-            if extra_body:
-                create_kwargs["extra_body"] = extra_body
-            resp = client.chat.completions.create(**create_kwargs)
         except Exception as e:
-            # If the cheap model fails (timeouts, provider errors, tool-call glitches), retry once on fallback.
+            # If the primary model fails (timeouts, provider errors, tool-call glitches), retry once on fallback.
             if (not escalated) and fallback_model and active_model != fallback_model:
                 escalated = True
                 active_model = fallback_model
@@ -402,19 +377,28 @@ def _interviewer_run_with_tools(
                 )
                 continue
             raise
-        msg = resp.choices[0].message
-        if not getattr(msg, "tool_calls", None):
-            text = (msg.content or "").strip()
+        choices = resp.get("choices") if isinstance(resp, dict) else None
+        choice0 = choices[0] if isinstance(choices, list) and choices else {}
+        msg = choice0.get("message") if isinstance(choice0, dict) else {}
+        if not isinstance(msg, dict):
+            msg = {}
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            text = (msg.get("content") or "").strip()
             return AIMessage(content=text), total_saved, agent_steps, client_actions
 
         oai_messages.append(_assistant_message_to_dict(msg))
-        for tc in msg.tool_calls:
-            name = tc.function.name
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = func.get("name")
+            tc_id = tc.get("id") or f"tool-{rounds}"
             try:
-                args = json.loads(tc.function.arguments or "{}")
+                args = json.loads(func.get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            log_tool_invocation(name, instance_id, json.dumps(args)[:400])
+            log_tool_invocation(str(name or ""), instance_id, json.dumps(args)[:400])
 
             if name == "add_library_items":
                 try:
@@ -475,7 +459,7 @@ def _interviewer_run_with_tools(
                     "summary": f"Blocked disallowed tool: {name}",
                 })
             oai_messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)}
+                {"role": "tool", "tool_call_id": tc_id, "content": json.dumps(result)}
             )
 
     return (
@@ -487,25 +471,24 @@ def _interviewer_run_with_tools(
 
 
 def _get_llm():
-    """Plain chat completion via OpenRouter (no tools) for fallback when the tool loop errors."""
-    client, model, _fallback = _openrouter_chat_client_models()
+    """Plain Tinfoil chat completion (no tools) for fallback when the tool loop errors."""
+    model, _fallback = _tinfoil_chat_models()
 
-    class _OpenRouterChatWrapper:
-        def __init__(self, client, model: str):
-            self._client = client
+    class _TinfoilChatWrapper:
+        def __init__(self, model: str):
             self._model = model
 
         def invoke(self, messages: list[BaseMessage]):
-            oai_messages = _messages_to_openai_dicts(messages)
-            resp = self._client.chat.completions.create(
+            oai_messages = _messages_to_chat_dicts(messages)
+            resp = chat_completion(
+                oai_messages,
                 model=self._model,
-                messages=oai_messages,
                 max_tokens=4096,
             )
-            text = (resp.choices[0].message.content or "").strip()
+            text = normalize_chat_response(resp)
             return AIMessage(content=text)
 
-    return _OpenRouterChatWrapper(client, model)
+    return _TinfoilChatWrapper(model)
 
 
 def _last_user_text(messages: list) -> str:
@@ -617,38 +600,32 @@ def interviewer_node(state: JournalState) -> JournalState:
     system = SystemMessage(content="\n".join(system_parts))
 
     lc_messages = [system] + state["messages"]
-    oai_messages = _messages_to_openai_dicts(lc_messages)
+    oai_messages = _messages_to_chat_dicts(lc_messages)
     instance_id = state.get("instance_id") or ""
     agent_steps: list[dict] = []
     client_actions: list[dict] = []
     response: AIMessage
     try:
-        client, model, _fallback = _openrouter_chat_client_models()
-        extra_body: dict | None = None
-        picked = _user_pick_openrouter_model(mode_raw, state.get("openrouter_model"))
+        model, _fallback = _tinfoil_chat_models()
+        picked = _user_pick_tinfoil_model(mode_raw, state.get("tinfoil_model"))
         if picked:
             model = picked
-            extra_body = _reasoning_extra_body_for_model(model)
         elif mode_raw == "conversation":
-            model = (os.getenv("OPENROUTER_CONVERSATION_MODEL") or DEFAULT_OPENROUTER_CONVERSATION_MODEL).strip()
-            extra_body = {"reasoning": {"enabled": True}}
+            model = (os.getenv("TINFOIL_CONVERSATION_MODEL") or DEFAULT_TINFOIL_CONVERSATION_MODEL).strip()
         elif mode_raw == "autobiography":
-            model = (os.getenv("OPENROUTER_ASSISTED_JOURNAL_MODEL") or DEFAULT_ASSISTED_JOURNAL_MODEL).strip()
-            extra_body = _reasoning_extra_body_for_model(model)
+            model = (os.getenv("TINFOIL_ASSISTED_JOURNAL_MODEL") or DEFAULT_ASSISTED_JOURNAL_MODEL).strip()
         assisted_temp = 0.525 if mode_raw == "autobiography" else None
         response, lib_saved, tool_steps, nav_actions = _interviewer_run_with_tools(
-            client,
             model,
             oai_messages,
             instance_id,
-            extra_body=extra_body,
             temperature=assisted_temp,
         )
         agent_steps = list(tool_steps)
         client_actions = list(nav_actions)
         library_items_added = int(lib_saved) if lib_saved > 0 else 0
     except Exception as e:
-        print("[backend] interviewer tool path failed; plain OpenRouter chat fallback:", e)
+        print("[backend] interviewer tool path failed; plain Tinfoil chat fallback:", e)
         response = llm.invoke(lc_messages)
         agent_steps = []
         client_actions = []

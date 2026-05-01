@@ -345,9 +345,20 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       let filename: string;
       let mimeType: string;
       if (isUploadedFile) {
-        b64 = await blobToBase64(blob);
-        filename = (blob as File).name;
-        mimeType = blob.type || "audio/mpeg";
+        const file = blob as File;
+        const rawMime = (file.type || "").toLowerCase();
+        const rawName = file.name || "";
+        const supported = rawMime.includes("wav") || rawMime.includes("mpeg") || rawMime.includes("mp3") || /\.(wav|mp3)$/i.test(rawName);
+        if (supported) {
+          b64 = await blobToBase64(file);
+          filename = rawName || (rawMime.includes("mp3") || rawMime.includes("mpeg") ? "upload.mp3" : "upload.wav");
+          mimeType = file.type || (filename.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav");
+        } else {
+          const converted = await micBlobToTranscriptionPayload(file);
+          b64 = converted.b64;
+          filename = "upload.wav";
+          mimeType = "audio/wav";
+        }
       } else {
         const mic = await micBlobToTranscriptionPayload(blob);
         b64 = mic.b64;

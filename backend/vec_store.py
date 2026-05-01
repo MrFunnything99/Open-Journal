@@ -28,8 +28,8 @@ except ImportError:
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-# Embedding dimension must match the active embedding model (Perplexity pplx-embed-context-v1-4b full = 2560)
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "2560"))
+# Embedding dimension must match Tinfoil nomic-embed-text.
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
 # Use VECTOR_DB_PATH in production (e.g. Fly volume) so data persists across deploys
 _default_db = Path(__file__).resolve().parent.parent / "data" / "open_journal.db"
 DB_PATH = Path(os.getenv("VECTOR_DB_PATH", str(_default_db))).resolve()

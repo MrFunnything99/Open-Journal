@@ -1,7 +1,7 @@
 /**
  * Converts a MediaRecorder blob (audio/webm or audio/mp4) to WAV format
- * for sending to Voxtral/OpenRouter which expects base64 WAV.
- * Only use for short mic recordings — uploaded files should use blobToBase64.
+ * for Tinfoil Whisper, which accepts mp3 and wav.
+ * Only use for reasonably short recordings/files that the browser can decode.
  */
 export async function blobToWavBase64(blob: Blob): Promise<string> {
   const arrayBuffer = await blob.arrayBuffer();
@@ -23,9 +23,8 @@ export async function blobToBase64(blob: Blob): Promise<string> {
 
 /**
  * Prepare a MediaRecorder blob for /voice-memo transcription.
- * Webm (the default from most browsers) isn't accepted by OpenRouter audio
- * models, so we decode → re-encode to WAV for that case. Formats already
- * supported natively (m4a, mp3, ogg, wav, flac) are sent as-is.
+ * Tinfoil Whisper accepts mp3 and wav, so other browser-decodable audio is
+ * converted to WAV before upload.
  */
 export async function micBlobToTranscriptionPayload(blob: Blob): Promise<{
   b64: string;
@@ -34,7 +33,7 @@ export async function micBlobToTranscriptionPayload(blob: Blob): Promise<{
 }> {
   const rawMime = (blob.type || "").trim().toLowerCase() || "audio/webm";
 
-  const needsWavConversion = rawMime.includes("webm");
+  const needsWavConversion = !(rawMime.includes("wav") || rawMime.includes("mpeg") || rawMime.includes("mp3"));
 
   if (needsWavConversion) {
     const b64 = await blobToWavBase64(blob);
@@ -43,16 +42,10 @@ export async function micBlobToTranscriptionPayload(blob: Blob): Promise<{
 
   const b64 = await blobToBase64(blob);
   let filename = "dictation.wav";
-  if (rawMime.includes("mp4") || rawMime.includes("m4a") || rawMime.includes("aac")) {
-    filename = "dictation.m4a";
-  } else if (rawMime.includes("wav")) {
+  if (rawMime.includes("wav")) {
     filename = "dictation.wav";
   } else if (rawMime.includes("mpeg") || rawMime.includes("mp3")) {
     filename = "dictation.mp3";
-  } else if (rawMime.includes("ogg") || rawMime.includes("opus")) {
-    filename = "dictation.ogg";
-  } else if (rawMime.includes("flac")) {
-    filename = "dictation.flac";
   }
   return { b64, filename, mimeType: rawMime };
 }

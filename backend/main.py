@@ -4,7 +4,6 @@ FastAPI backend for Selfmeridian: /chat and /end-session.
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import math
 import os
@@ -43,7 +42,6 @@ for name in (".env", ".env.local"):
     load_dotenv(Path.cwd().parent / name)
 
 import vec_store
-from lightrag_bridge import query_for_context, schedule_lightrag_index_after_ingest
 from graph import build_graph, build_librarian_graph, JournalState
 from langchain_core.messages import AIMessage, HumanMessage
 from library import (
@@ -53,7 +51,6 @@ from library import (
     delete_consumed_media,
     delete_memory_fact,
     delete_memory_summary,
-    DEFAULT_PERPLEXITY_EMBEDDING_MODEL,
     generate_memory_mermaid,
     _embed_texts,
     generate_derived_insights,
@@ -69,11 +66,21 @@ from library import (
     refresh_pattern_memory,
     save_session_data,
     extraction_llm_backend,
-    _openrouter_chat_completion,
     update_memory_fact,
     update_memory_summary,
     update_consumed_media,
     wipe_memory,
+)
+from tinfoil_client import (
+    TINFOIL_EMBEDDING_DIM,
+    chat_text,
+    normalize_chat_response,
+    tinfoil_api_configured,
+    tinfoil_chat_fallback_model,
+    tinfoil_chat_model,
+    tinfoil_embedding_model,
+    tinfoil_transcription_model,
+    transcribe_audio,
 )
 
 def _instance_id(request: Request) -> str:
@@ -84,7 +91,7 @@ def _instance_id(request: Request) -> str:
 # In-memory session store (minimal for 1hr sprint; replace with Redis/DB later)
 sessions: dict[str, list] = {}
 
-# Chat may run OpenRouter + tool round-trips; keep headroom.
+# Chat may run Tinfoil + tool round-trips; keep headroom.
 CHAT_INVOKE_TIMEOUT_SEC = 180
 
 
@@ -119,38 +126,19 @@ def _session_messages_for_client(session_id: str) -> List[Dict[str, str]]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Avoid proxy 403s: send API calls (OpenRouter, Listen Notes) direct, not via system proxy
+    # Avoid proxy issues: send API calls (Tinfoil, OpenLibrary, Listen Notes) direct.
     for v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ.pop(v, None)
     os.environ["NO_PROXY"] = "*"
     # Startup: pipeline roles (no secrets)
-    emb_model = (os.getenv("PERPLEXITY_EMBEDDING_MODEL") or DEFAULT_PERPLEXITY_EMBEDDING_MODEL).strip()
-    pplx_key = (os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY") or "").strip()
-    print(f"[backend] Embeddings: Perplexity ({emb_model})")
-    if not pplx_key:
-        print("[backend] WARNING: PERPLEXITY_API_KEY missing — vector ingest and retrieval will fail until set.")
-
-    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    chat_model = (os.getenv("OPENROUTER_CHAT_MODEL") or "openai/gpt-4.1-mini").strip()
-    chat_fallback = (os.getenv("OPENROUTER_CHAT_FALLBACK_MODEL") or "anthropic/claude-opus-4.6").strip()
-    convo_model = (os.getenv("OPENROUTER_CONVERSATION_MODEL") or "x-ai/grok-4.1-fast").strip()
-    if or_key:
+    if tinfoil_api_configured():
         print(
-            f"[backend] OPENROUTER_API_KEY is set — /chat journal ({chat_model}; fallback {chat_fallback}), "
-            f"conversation ({convo_model} + reasoning), journal validation, "
-            "voice-memo polish, and date inference"
+            f"[backend] Tinfoil: chat {tinfoil_chat_model()} (fallback {tinfoil_chat_fallback_model()}), "
+            f"embeddings {tinfoil_embedding_model()} ({TINFOIL_EMBEDDING_DIM}d), "
+            f"STT {tinfoil_transcription_model()}, helpers {extraction_llm_backend()}"
         )
-        print(
-            f"[backend] Speech-to-text: OpenRouter ({(os.getenv('OPENROUTER_TRANSCRIPTION_MODEL') or 'openai/gpt-audio-mini').strip()})"
-        )
-    elif (os.getenv("OPENAI_API_KEY") or "").strip():
-        print("[backend] Speech-to-text: OpenAI direct (OPENAI_TRANSCRIPTION_MODEL / gpt-4o-mini-transcribe)")
     else:
-        print("[backend] WARNING: Set OPENROUTER_API_KEY (recommended for STT) or OPENAI_API_KEY — transcription routes need one of these.")
-    if not or_key:
-        print(
-            "[backend] WARNING: OPENROUTER_API_KEY missing — /chat interviewer and journal validation will not work until set."
-        )
+        print("[backend] WARNING: TINFOIL_API_KEY missing — inference, embeddings, and transcription are disabled.")
     vec_store.ensure_db()
     try:
         vec_store.decision_log_rotate()
@@ -192,8 +180,8 @@ class ChatRequest(BaseModel):
     personalization: Optional[float] = None  # ignored for graph /chat; server uses 1.0 (full memory)
     intrusiveness: Optional[float] = None
     mode: Optional[str] = None  # "journal" | "conversation" | "autobiography"
-    # Allowlisted OpenRouter id for conversation + autobiography only (see graph.USER_SELECTABLE_CHAT_MODELS)
-    openrouter_model: Optional[str] = None
+    # Allowlisted Tinfoil id for conversation + autobiography only (see graph.USER_SELECTABLE_CHAT_MODELS)
+    tinfoil_model: Optional[str] = None
     # Optional: client-formatted local time + daypart string for Assisted Journal (autobiography) check-ins
     client_time_context: Optional[str] = None
 
@@ -407,143 +395,7 @@ class MemoryDiagramResponse(BaseModel):
     mermaid: str
 
 
-# --- TTS voice list fallback when Mistral list API fails (catalog slugs) ---
-MISTRAL_TTS_FALLBACK_VOICES = [
-    {"voice_id": "en_paul_neutral", "name": "Paul (neutral)"},
-]
-
-_MISTRAL_VOICE_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.I,
-)
-# Preset voices from Mistral (voice_id can be a slug, not only a saved UUID).
-_MISTRAL_PRESET_VOICE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,62}$", re.I)
-
-# Catalog voice slug from GET /v1/audio/voices (e.g. "Paul - Neutral" → en_paul_neutral).
-DEFAULT_MISTRAL_TTS_VOICE_ID = "en_paul_neutral"
-
-
-def _mistral_voice_id_valid(raw: str) -> bool:
-    t = raw.strip()
-    if not t:
-        return False
-    return bool(_MISTRAL_VOICE_UUID_RE.match(t) or _MISTRAL_PRESET_VOICE_RE.match(t))
-
-
-def _resolve_mistral_voice_id(req_voice_id: Optional[str]) -> str:
-    """
-    Voxtral voice_id: saved voice UUID or catalog slug from /v1/audio/voices (e.g. en_paul_neutral).
-    https://docs.mistral.ai/capabilities/audio/text_to_speech
-    """
-    env_vid = os.getenv("MISTRAL_TTS_VOICE_ID", "").strip()
-    if env_vid:
-        return env_vid
-    if req_voice_id and _mistral_voice_id_valid(req_voice_id):
-        return req_voice_id.strip()
-    api_key = os.getenv("MISTRAL_API_KEY", "").strip()
-    if api_key:
-        import urllib.request
-
-        try:
-            request = urllib.request.Request(
-                "https://api.mistral.ai/v1/audio/voices?limit=30&offset=0",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            with urllib.request.urlopen(request, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            items = data.get("items") or []
-            # Prefer the default catalog neutral voice if Mistral lists it (slug or UUID).
-            want = DEFAULT_MISTRAL_TTS_VOICE_ID.lower()
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                slug = ((it.get("slug") or "") or "").lower()
-                vid = (it.get("id") or "").strip()
-                if slug == want or vid.lower() == want:
-                    return (it.get("slug") or it.get("id") or "").strip() or vid
-            if len(items) == 1 and isinstance(items[0], dict):
-                vid = (items[0].get("id") or "").strip()
-                if vid:
-                    return vid
-        except Exception as e:
-            print("[backend] Mistral voices list:", e)
-    return DEFAULT_MISTRAL_TTS_VOICE_ID
-
-
-def _mistral_tts_playback_rate() -> float:
-    """Client hint for HTMLAudioElement.playbackRate (API has no speed field in OpenAPI)."""
-    raw = (os.getenv("MISTRAL_TTS_PLAYBACK_RATE") or "1.05").strip()
-    try:
-        r = float(raw)
-    except (TypeError, ValueError):
-        return 1.05
-    if r < 0.25 or r > 4.0:
-        return 1.05
-    return r
-
-
-def _mistral_tts_response_format() -> str:
-    """Smaller/faster-to-encode opus vs mp3 for chat read-aloud; override with MISTRAL_TTS_RESPONSE_FORMAT."""
-    raw = (os.getenv("MISTRAL_TTS_RESPONSE_FORMAT") or "opus").strip().lower()
-    if raw in ("opus", "mp3", "wav", "flac"):
-        return raw
-    return "opus"
-
-
-def _mistral_tts_speech(text: str, voice_id: str, response_format: str) -> bytes:
-    """https://docs.mistral.ai/capabilities/audio/text_to_speech/speech"""
-    import base64 as b64mod
-    import urllib.request
-    import urllib.error
-
-    api_key = os.getenv("MISTRAL_API_KEY", "").strip()
-    if not api_key or not voice_id:
-        raise ValueError("Mistral TTS not configured (API key or voice id missing).")
-    model = (os.getenv("MISTRAL_TTS_MODEL") or "voxtral-mini-tts-2603").strip()
-    inp = text.strip()
-    if len(inp) > 12_000:
-        inp = inp[:12_000] + "…"
-    fmt = (response_format or "opus").strip().lower()
-    if fmt not in ("opus", "mp3", "wav", "flac", "pcm"):
-        fmt = "opus"
-    body = json.dumps({
-        "model": model,
-        "input": inp,
-        "voice_id": voice_id,
-        "response_format": fmt,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        "https://api.mistral.ai/v1/audio/speech",
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8")
-            err_json = json.loads(err_body) if err_body.strip() else {}
-            detail = err_json.get("detail") or err_json.get("message")
-            if isinstance(detail, list) and detail:
-                detail = detail[0] if isinstance(detail[0], str) else detail[0].get("msg")
-            if isinstance(detail, dict):
-                detail = detail.get("message") or str(detail)
-            msg = detail if isinstance(detail, str) else (err_body[:400] if err_body else str(e))
-        except Exception:
-            msg = str(e)
-        print(f"[backend] Mistral TTS HTTP {e.code}: {msg}")
-        raise ValueError(msg or f"Mistral TTS failed (HTTP {e.code})") from e
-    if not isinstance(payload, dict):
-        raise ValueError("Invalid Mistral TTS response")
-    audio_b64 = payload.get("audio_data")
-    if not audio_b64 or not isinstance(audio_b64, str):
-        raise ValueError("Mistral TTS returned no audio_data")
-    return b64mod.b64decode(audio_b64)
+# TTS/read-aloud is disabled until Tinfoil exposes a text-to-speech model.
 
 
 class VoiceRequest(BaseModel):
@@ -559,19 +411,18 @@ class TranscribeRequest(BaseModel):
 
 
 class VoiceMemoRequest(BaseModel):
-    """Voice Memo tab: base64 audio → OpenRouter gpt-audio-mini → optional OpenRouter text polish."""
+    """Voice Memo tab: base64 audio -> Tinfoil Whisper STT -> optional Tinfoil text polish."""
     audio: str
     filename: Optional[str] = None
     mime_type: Optional[str] = None
     journal_mode: bool = False
 
 
-# Manual Journal AI feedback + cleanup: client may pass model; only these OpenRouter ids are accepted.
+# Manual Journal AI feedback + cleanup: client may pass model; only these Tinfoil ids are accepted.
 _JOURNAL_MANUAL_AI_MODEL_ALLOWLIST = frozenset(
     {
-        "anthropic/claude-opus-4.6",
-        "anthropic/claude-sonnet-4.6",
-        "openai/gpt-5.4",
+        "kimi-k2-6",
+        "deepseek-v4-pro",
     }
 )
 
@@ -684,241 +535,65 @@ def _guess_audio_filename(filename: Optional[str], mime_type: Optional[str]) -> 
     return "recording.webm"
 
 
-def _openrouter_transcription_model() -> str:
-    return (os.getenv("OPENROUTER_TRANSCRIPTION_MODEL") or "openai/gpt-audio-mini").strip() or "openai/gpt-audio-mini"
-
-
-def _openrouter_audio_format(filename: str, mime_type: Optional[str], format_hint: Optional[str] = None) -> str:
-    """Format string for OpenRouter input_audio (see https://openrouter.ai/docs/guides/overview/multimodal/audio)."""
-    h = (format_hint or "").strip().lower().lstrip(".")
-    allowed = {"wav", "mp3", "aac", "ogg", "flac", "m4a", "aiff", "pcm16", "pcm24"}
-    if h in allowed:
-        return h
-    fn = (filename or "").lower()
+def _supported_tinfoil_audio_filename(filename: str, mime_type: Optional[str], format_hint: Optional[str] = None) -> str:
+    """Tinfoil Whisper supports mp3 and wav. Frontend normalizes recorder blobs to wav."""
+    hint = (format_hint or "").strip().lower().lstrip(".")
+    if hint in {"mp3", "wav"}:
+        return f"audio.{hint}"
+    fn = (filename or "").strip().replace("\\", "/").split("/")[-1].lower()
     ext = fn.rsplit(".", 1)[-1] if "." in fn else ""
-    if ext in allowed:
-        return ext
-    if ext in ("mp4", "mpeg"):
-        return "m4a"
-    if ext == "webm":
-        return "webm"
-    if ext == "wav":
-        return "wav"
+    if ext in {"mp3", "wav"}:
+        return fn[:120] if fn else f"audio.{ext}"
     mt = (mime_type or "").lower()
-    if "webm" in mt:
-        return "webm"
-    if "mp4" in mt or "m4a" in mt or "aac" in mt:
-        return "m4a"
-    if "mpeg" in mt or "mp3" in mt:
-        return "mp3"
-    if "wav" in mt:
-        return "wav"
-    if "ogg" in mt or "opus" in mt:
-        return "ogg"
-    if "flac" in mt:
-        return "flac"
-    return "wav"
+    if "mp3" in mt or "mpeg" in mt:
+        return "audio.mp3"
+    if "wav" in mt or not mt:
+        return "audio.wav"
+    raise ValueError("Tinfoil Whisper transcription supports mp3 and wav audio. Browser recordings are converted to wav before upload.")
 
 
-def _openrouter_completion_assistant_text(data: dict) -> str:
-    choices = data.get("choices") if isinstance(data.get("choices"), list) else []
-    if not choices:
-        return ""
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    if not isinstance(msg, dict):
-        return ""
-    content = msg.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text") or ""))
-        return "".join(parts).strip()
-    return ""
-
-
-def _openrouter_speech_to_text(
-    audio_bytes: bytes,
-    filename: str,
-    mime_type: Optional[str] = None,
-    format_hint: Optional[str] = None,
-    model_override: Optional[str] = None,
+def _tinfoil_chat_completion(
+    prompt: str,
+    *,
+    model: str,
+    temperature: float = 0.2,
+    timeout_sec: float = 90.0,
+    max_tokens: Optional[int] = None,
 ) -> str:
-    import base64 as b64
-    import urllib.error
-    import urllib.request
-
-    key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not key:
-        raise ValueError("OPENROUTER_API_KEY is not configured")
-    model = model_override or _openrouter_transcription_model()
-    fmt = _openrouter_audio_format(filename, mime_type, format_hint)
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Transcribe this audio verbatim. Reply with the transcript only — no preamble or quotes.",
-                    },
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": b64.b64encode(audio_bytes).decode("ascii"),
-                            "format": fmt,
-                        },
-                    },
-                ],
-            }
-        ],
-    }
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://selfmeridian.local"),
-            "X-Title": os.getenv("OPENROUTER_TITLE", "SelfMeridian"),
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            raw_text = resp.read().decode("utf-8")
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        status = e.code
-        try:
-            raw_text = e.read().decode("utf-8")
-        except Exception:
-            raw_text = ""
+        return chat_text(prompt, model=model, temperature=temperature, timeout_sec=timeout_sec, max_tokens=max_tokens)
     except Exception as e:
-        raise ValueError(f"OpenRouter transcription request failed: {e}") from e
-    if status < 200 or status >= 300:
-        try:
-            err_j = json.loads(raw_text)
-            err_obj = err_j.get("error")
-            if isinstance(err_obj, dict):
-                detail = err_obj.get("message") or str(err_obj)
-            else:
-                detail = err_obj or err_j.get("message")
-        except Exception:
-            detail = raw_text[:500] if raw_text else None
-        raise ValueError(detail or f"OpenRouter transcription error ({status})")
-    try:
-        data = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return (raw_text or "").strip()
-    return _openrouter_completion_assistant_text(data)
+        print("[backend] Tinfoil chat request failed:", e)
+        return ""
 
 
 def _transcribe_audio_bytes(
     audio_bytes: bytes,
-    filename: str = "audio.webm",
+    filename: str = "audio.wav",
     mime_type: Optional[str] = None,
     format_hint: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Speech-to-text via OpenRouter with model fallback: primary → xiaomi/mimo-v2-omni."""
-    key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-    if not key:
-        raise ValueError("Configure OPENROUTER_API_KEY for transcription.")
-    primary = _openrouter_transcription_model()
-    fallback = (os.getenv("OPENROUTER_TRANSCRIPTION_FALLBACK_MODEL") or "xiaomi/mimo-v2-omni").strip()
-    for model in (primary, fallback):
-        try:
-            text = _openrouter_speech_to_text(audio_bytes, filename, mime_type, format_hint, model_override=model)
-            return (text, f"openrouter/{model}")
-        except Exception as e:
-            print(f"[backend] STT {model} failed, trying next: {e}")
-    raise ValueError(f"All OpenRouter transcription models failed ({primary}, {fallback})")
+    """Speech-to-text via Tinfoil Whisper Large V3 Turbo."""
+    fname = _supported_tinfoil_audio_filename(filename, mime_type, format_hint)
+    text = transcribe_audio(audio_bytes, filename=fname, mime_type=mime_type)
+    return (text, f"tinfoil/{tinfoil_transcription_model()}")
 
 
-def _openai_transcription_model() -> str:
-    return (os.getenv("OPENAI_TRANSCRIPTION_MODEL") or "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
-
-
-def _build_openai_transcription_multipart(audio_bytes: bytes, filename: str, model: str) -> tuple[str, bytes]:
-    boundary = f"----SelfMeridianSTT{uuid.uuid4().hex[:20]}"
-    buf = io.BytesIO()
-    buf.write(f"--{boundary}\r\n".encode())
-    buf.write(b'Content-Disposition: form-data; name="model"\r\n\r\n')
-    buf.write(model.encode("utf-8"))
-    buf.write(b"\r\n")
-    buf.write(f"--{boundary}\r\n".encode())
-    buf.write(f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode())
-    buf.write(b"Content-Type: application/octet-stream\r\n\r\n")
-    buf.write(audio_bytes)
-    buf.write(f"\r\n--{boundary}--\r\n".encode())
-    return boundary, buf.getvalue()
-
-
-def _openai_speech_to_text(audio_bytes: bytes, filename: str) -> str:
-    import urllib.error
-    import urllib.request
-
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key:
-        raise ValueError("OPENAI_API_KEY is not configured")
-    model = _openai_transcription_model()
-    boundary, body = _build_openai_transcription_multipart(audio_bytes, filename, model)
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/audio/transcriptions",
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            raw_text = resp.read().decode("utf-8")
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        status = e.code
-        try:
-            raw_text = e.read().decode("utf-8")
-        except Exception:
-            raw_text = ""
-    except Exception as e:
-        raise ValueError(f"OpenAI transcription request failed: {e}") from e
-    if status < 200 or status >= 300:
-        try:
-            err_j = json.loads(raw_text)
-            detail = err_j.get("error", {}).get("message") if isinstance(err_j.get("error"), dict) else err_j.get("error")
-        except Exception:
-            detail = raw_text[:400] if raw_text else None
-        raise ValueError(detail or f"OpenAI transcription error ({status})")
-    try:
-        data = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return raw_text.strip()
-    text = data.get("text")
-    return str(text).strip() if text is not None else ""
-
-
-async def _polish_voice_memo_openrouter(raw: str, model_override: Optional[str] = None) -> str:
+async def _polish_voice_memo_tinfoil(raw: str, model_override: Optional[str] = None) -> str:
     """Single LLM call: clean up filler words, fix STT errors, polish into readable prose."""
     text = (raw or "").strip()
-    if not text or not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+    if not text or not (os.getenv("TINFOIL_API_KEY") or "").strip():
         return text
     model = _resolve_journal_manual_ai_model(
         model_override,
-        env_fallback="OPENROUTER_VOICE_MEMO_POLISH_MODEL",
-        hard_default="anthropic/claude-opus-4.6",
+        env_fallback="TINFOIL_VOICE_MEMO_POLISH_MODEL",
+        hard_default="kimi-k2-6",
     )
     prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
 
     def _call():
         try:
-            return _openrouter_chat_completion(prompt, model=model, temperature=0.2, timeout_sec=90.0)
+            return _tinfoil_chat_completion(prompt, model=model, temperature=0.2, timeout_sec=90.0)
         except Exception as e:
             print("[backend] voice-memo polish error:", e)
             return ""
@@ -927,32 +602,29 @@ async def _polish_voice_memo_openrouter(raw: str, model_override: Optional[str] 
     return out if out else text
 
 
-async def _validate_journal_openrouter(
+async def _validate_journal_tinfoil(
     raw: str,
     model_override: Optional[str] = None,
     instance_id: str = "",
 ) -> tuple[str, str, list[str], Optional[str]]:
-    key = os.getenv("OPENROUTER_API_KEY", "").strip()
     text = (raw or "").strip()
     if not text:
         return "", "", [], None
-    if not key:
+    if not tinfoil_api_configured():
         return (
             text,
-            "Add OPENROUTER_API_KEY to the project root .env (uncomment and paste your key), save the file, and restart the Python API server (uvicorn / backend on port 8000) so it reloads environment variables.",
+            "Add TINFOIL_API_KEY to the project root .env (uncomment and paste your key), save the file, and restart the Python API server (uvicorn / backend on port 8000) so it reloads environment variables.",
             [],
             None,
         )
     try:
-        import urllib.error
-        import urllib.request
         import time as _time
 
         t0 = _time.perf_counter()
         model = _resolve_journal_manual_ai_model(
             model_override,
-            env_fallback="OPENROUTER_JOURNAL_VALIDATE_MODEL",
-            hard_default="anthropic/claude-opus-4.6",
+            env_fallback="TINFOIL_JOURNAL_VALIDATE_MODEL",
+            hard_default="kimi-k2-6",
         )
 
         # --- 0. Measure today's entry first (words / chars / token estimate) — drives prompt + max_tokens ---
@@ -962,8 +634,11 @@ async def _validate_journal_openrouter(
         input_token_est = max(input_words, input_chars // 4)
         reply_word_target = _journal_feedback_reply_word_target(input_words)
         reply_token_est = max(1, reply_word_target)
-        # Brief note in prompt; generous cap so longer replies still complete if the model drifts.
-        max_tokens = min(8192, max(256, int(reply_token_est * 4) + 256))
+        # Tinfoil's Kimi K2.6 / DeepSeek V4 Pro are reasoning models: they emit hidden
+        # chain-of-thought into `message.reasoning` first, then visible `message.content`.
+        # Budget enough room so reasoning + final answer both fit, otherwise we get
+        # finish_reason=length with content=None.
+        max_tokens = min(16384, max(4096, int(reply_token_est * 8) + 1024))
         metrics_block = _journal_entry_metrics_block(
             input_words=input_words,
             input_chars=input_chars,
@@ -1021,51 +696,25 @@ async def _validate_journal_openrouter(
             + entry_body
         )
 
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.525,
-            "max_tokens": max_tokens,
-        }
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://selfmeridian.local"),
-                "X-Title": os.getenv("OPENROUTER_TITLE", "SelfMeridian"),
-            },
-        )
+        def _call(model_id: str) -> str:
+            return chat_text(
+                prompt,
+                model=model_id,
+                temperature=0.525,
+                timeout_sec=180.0,
+                max_tokens=max_tokens,
+            )
 
-        def _call() -> str:
-            try:
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    raw_text = resp.read().decode("utf-8")
-                    status = resp.status
-            except urllib.error.HTTPError as e:
-                status = e.code
-                try:
-                    raw_text = e.read().decode("utf-8")
-                except Exception:
-                    raw_text = ""
-            if status < 200 or status >= 300:
-                try:
-                    err_j = json.loads(raw_text)
-                    detail = err_j.get("error", {}).get("message") if isinstance(err_j.get("error"), dict) else err_j.get("error")
-                except Exception:
-                    detail = raw_text[:300] if raw_text else None
-                raise ValueError(detail or f"OpenRouter error ({status})")
-            data = json.loads(raw_text) if raw_text else {}
-            choices = data.get("choices") if isinstance(data, dict) else None
-            if isinstance(choices, list) and choices:
-                msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-                content = msg.get("content") if isinstance(msg, dict) else ""
-                return str(content or "").strip()
-            return ""
-
-        out = await asyncio.to_thread(_call)
+        model_used = model
+        out = await asyncio.to_thread(_call, model_used)
+        if not out:
+            alternates = [m for m in _JOURNAL_MANUAL_AI_MODEL_ALLOWLIST if m != model_used]
+            for alt in alternates:
+                print(f"[backend] journal-feedback: empty output from {model_used}; retrying with {alt}")
+                out = await asyncio.to_thread(_call, alt)
+                if out:
+                    model_used = alt
+                    break
         t_llm = _time.perf_counter()
         print(
             f"[backend] journal-feedback: LLM {t_llm - t_ctx:.1f}s (total {t_llm - t0:.1f}s); "
@@ -1073,7 +722,7 @@ async def _validate_journal_openrouter(
         )
 
         if not out:
-            return text, "AI returned empty output.", [], model
+            return text, "AI returned empty output. Try switching between Kimi K2.6 and DeepSeek V4 Pro.", [], model_used
 
         def _between(src: str, start: str, end: Optional[str]) -> str:
             i = src.find(start)
@@ -1090,84 +739,24 @@ async def _validate_journal_openrouter(
         if not feedback:
             feedback = out.strip()
 
-        return text, feedback, [], model
+        return text, feedback, [], model_used
     except Exception as e:
-        print("[backend] journal feedback openrouter error:", e)
+        print("[backend] journal feedback tinfoil error:", e)
         import traceback; traceback.print_exc()
         return text, "Feedback failed; please try again.", [], None
 
 
 @api_router.post("/voice")
 async def api_voice(req: VoiceRequest):
-    """
-    Text-to-speech: Mistral Voxtral (requires MISTRAL_API_KEY).
-    Returns { audio: base64, format: \"opus\" | \"mp3\" | ... }.
-    """
-    import base64 as b64
-
-    text = (req.text or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="text is required")
-
-    mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
-    if not mistral_key:
-        raise HTTPException(
-            status_code=500,
-            detail="TTS requires MISTRAL_API_KEY (Mistral Voxtral).",
-        )
-    vid = _resolve_mistral_voice_id(req.voiceId)
-    tts_fmt = _mistral_tts_response_format()
-    last_err: Exception | None = None
-    for attempt in range(3):
-        try:
-            audio_bytes = await asyncio.to_thread(_mistral_tts_speech, text, vid, tts_fmt)
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                print(f"[backend] Mistral TTS attempt {attempt + 1} failed, retrying: {e}")
-                await asyncio.sleep(0.5 * (attempt + 1))
-            else:
-                print(f"[backend] Mistral TTS failed after 3 attempts: {e}")
-    if last_err is not None:
-        raise HTTPException(status_code=500, detail=str(last_err))
-    rate = _mistral_tts_playback_rate()
-    return {
-        "audio": b64.b64encode(audio_bytes).decode("ascii"),
-        "format": tts_fmt,
-        "provider": "mistral",
-        "playback_rate": rate,
-    }
+    """Text-to-speech is disabled until Tinfoil exposes a TTS model."""
+    _ = req
+    raise HTTPException(status_code=501, detail="Text-to-speech is unavailable in the Tinfoil-only build.")
 
 
 @api_router.get("/voices")
 async def api_voices():
-    """Voices for TTS UI (Mistral Voxtral catalog). Returns { voices: [{ voice_id, name }], provider? }."""
-    import urllib.request
-    import urllib.error
-
-    mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
-    if mistral_key:
-        try:
-            request = urllib.request.Request(
-                "https://api.mistral.ai/v1/audio/voices?limit=50&offset=0",
-                headers={"Authorization": f"Bearer {mistral_key}"},
-            )
-            with urllib.request.urlopen(request, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            items = data.get("items") or []
-            voices = [
-                {"voice_id": (v.get("id") or ""), "name": (v.get("name") or "Voice")}
-                for v in items
-                if isinstance(v, dict) and v.get("id")
-            ]
-            if voices:
-                return {"voices": voices, "provider": "mistral"}
-        except Exception as e:
-            print("[backend] Mistral /voices list:", e)
-
-    return {"voices": MISTRAL_TTS_FALLBACK_VOICES, "provider": "fallback"}
+    """No TTS voice catalog is available in the Tinfoil-only build."""
+    return {"voices": [], "provider": "none"}
 
 
 @api_router.get("/memory-diagram", response_model=MemoryDiagramResponse)
@@ -1200,7 +789,7 @@ async def chat(req: ChatRequest, request: Request):
         intrusiveness = 0.5
     intrusiveness = max(0.0, min(1.0, intrusiveness))
     messages.append(HumanMessage(content=req.text))
-    _orm = (req.openrouter_model or "").strip() or None
+    _orm = (req.tinfoil_model or "").strip() or None
     _ctc = (req.client_time_context or "").strip() or None
     state: JournalState = {
         "messages": list(messages),
@@ -1209,7 +798,7 @@ async def chat(req: ChatRequest, request: Request):
         "intrusiveness": intrusiveness,
         "mode": mode,
         "instance_id": instance_id,
-        **({"openrouter_model": _orm} if _orm else {}),
+        **({"tinfoil_model": _orm} if _orm else {}),
         **({"client_time_context": _ctc} if _ctc else {}),
     }
     try:
@@ -1283,7 +872,7 @@ async def get_chat_session_history(session_id: str):
 
 @api_router.post("/end-session", response_model=EndSessionResponse)
 async def end_session(req: EndSessionRequest, request: Request):
-    """Trigger Librarian: extract, embed, save to SQLite+sqlite-vec. Optional LightRAG indexing via bridge when enabled."""
+    """Trigger Librarian: extract, embed, save to SQLite+sqlite-vec."""
     instance_id = _instance_id(request)
     session_id = get_or_create_session(req.session_id)
     messages = sessions.get(session_id, [])
@@ -1295,18 +884,6 @@ async def end_session(req: EndSessionRequest, request: Request):
         "instance_id": instance_id,
     }
     state = await asyncio.to_thread(librarian_graph.invoke, state)
-    # Feed LightRAG in background so response returns fast
-    summary = state.get("last_summary") or ""
-    facts = state.get("last_facts") or []
-    if summary or facts:
-        parts = []
-        if summary:
-            parts.append(f"Summary: {summary}")
-        if facts:
-            parts.append("Facts: " + "; ".join(facts))
-        doc = "\n\n".join(parts)
-        asyncio.create_task(schedule_lightrag_index_after_ingest(doc))
-
     return EndSessionResponse(ok=True, session_id=session_id)
 
 
@@ -1317,7 +894,7 @@ INGEST_HISTORY_TIMEOUT_SEC = 55
 async def ingest_history(req: IngestHistoryRequest, request: Request):
     """
     Ingest a prior journal text into SQLite+sqlite-vec.
-    Treats `text` as a single-session transcript. Optional LightRAG indexing when LIGHTRAG_ENABLED=true.
+    Treats `text` as a single-session transcript.
     Returns 200 always (so CORS headers are sent); ok=False on failure or timeout.
     """
     instance_id = _instance_id(request)
@@ -1343,17 +920,6 @@ async def ingest_history(req: IngestHistoryRequest, request: Request):
         )
         if extracted.get("skipped"):
             return IngestHistoryResponse(ok=True, session_id=session_id)
-        summary = extracted.get("summary") or ""
-        facts = extracted.get("facts") or []
-        if summary or facts:
-            parts = []
-            if summary:
-                parts.append(f"Summary: {summary}")
-            if facts:
-                parts.append("Facts: " + "; ".join(facts))
-            doc = "\n\n".join(parts)
-            asyncio.create_task(schedule_lightrag_index_after_ingest(doc))
-
         return IngestHistoryResponse(ok=True, session_id=session_id)
     except asyncio.TimeoutError:
         print("[backend] ingest_history timed out after", INGEST_HISTORY_TIMEOUT_SEC, "s")
@@ -1659,11 +1225,10 @@ async def infer_entry_date(req: InferEntryDateRequest):
     Use an LLM to infer the best-guess date/time when a journal entry was written.
     Returns ISO 8601 string or null if unclear.
     """
-    or_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-    if not or_key:
+    if not tinfoil_api_configured():
         return InferEntryDateResponse(date=None)
     try:
-        model = (os.getenv("OPENROUTER_INFER_ENTRY_DATE_MODEL") or "openai/gpt-4.1-mini").strip()
+        model = (os.getenv("TINFOIL_INFER_ENTRY_DATE_MODEL") or tinfoil_chat_model()).strip()
         # Truncate very long text to avoid token limits
         text = (req.text or "")[:8000].strip()
         if not text:
@@ -1678,7 +1243,7 @@ async def infer_entry_date(req: InferEntryDateRequest):
             prompt += f'\n\nOnly if the entry above has no date: file name is "{filename}". Otherwise ignore the filename.'
 
         def _call():
-            return _openrouter_chat_completion(
+            return chat_text(
                 prompt, model=model, temperature=0.0, timeout_sec=60.0, max_tokens=256
             )
 
@@ -1714,7 +1279,7 @@ async def infer_entry_date(req: InferEntryDateRequest):
 @api_router.post("/infer-journal-filename-dates", response_model=InferJournalFilenameDatesResponse)
 async def infer_journal_filename_dates(req: InferJournalFilenameDatesRequest):
     """
-    OpenRouter (default MiniMax M2.7): infer filing calendar day from paths/filenames only.
+    Tinfoil: infer filing calendar day from paths/filenames only.
     Returns YYYY-MM-DD per path; null when unclear. No file contents are sent or read.
     """
     paths = [(p or "").strip() for p in req.paths]
@@ -1722,20 +1287,19 @@ async def infer_journal_filename_dates(req: InferJournalFilenameDatesRequest):
     n = len(paths)
     if n == 0:
         return InferJournalFilenameDatesResponse(dates=[])
-    or_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-    if not or_key:
+    if not tinfoil_api_configured():
         fb_only = [_journal_path_date_fallback(paths[i]) for i in range(n)]
         return InferJournalFilenameDatesResponse(dates=fb_only)
     if n > 100:
         raise HTTPException(status_code=400, detail="Maximum 100 paths per request.")
-    model = (os.getenv("OPENROUTER_JOURNAL_FILENAME_DATE_MODEL") or "minimax/minimax-m2.7").strip()
+    model = (os.getenv("TINFOIL_JOURNAL_FILENAME_DATE_MODEL") or tinfoil_chat_model()).strip()
     numbered = "\n".join(f"{i + 1}. {paths[i]}" for i in range(n))
     user_msg = f"N={n}. Return JSON with key \"dates\" (array of length {n}).\n\n{numbered}"
     prompt = JOURNAL_FILENAME_DATE_SYSTEM + "\n\n" + user_msg
     try:
 
         def _call():
-            return _openrouter_chat_completion(
+            return chat_text(
                 prompt,
                 model=model,
                 temperature=0.0,
@@ -2151,22 +1715,6 @@ async def brain_person_thought_delete(person_id: int, thought_id: int):
 
 
 
-@api_router.get("/lightrag-context")
-async def lightrag_context(q: str = "", mode: str = "hybrid"):
-    """
-    Optional LightRAG-only RAG context (disabled by default). Primary retrieval is sqlite-vec via /chat.
-    Query param: q=... (required), mode=local|global|hybrid|naive|mix (default hybrid).
-    """
-    if not (q or "").strip():
-        return {"context": ""}
-    try:
-        context = await query_for_context(q.strip(), mode=mode)
-        return {"context": context}
-    except Exception as e:
-        print("[backend] /lightrag-context error:", e)
-        return {"context": ""}
-
-
 @api_router.post("/memory-wipe")
 async def memory_wipe(request: Request):
     """
@@ -2217,17 +1765,16 @@ def serve_decision_logs_html():
 @app.post("/api/transcribe", include_in_schema=False)
 async def api_transcribe(req: TranscribeRequest):
     """
-    Speech-to-text: OpenRouter `openai/gpt-audio-mini` (requires OPENROUTER_API_KEY).
+    Speech-to-text: Tinfoil Whisper Large V3 Turbo (requires TINFOIL_API_KEY).
     Registered on the main app (not only APIRouter) so POST is never shadowed by the SPA
     catch-all GET /{full_path} (which would otherwise yield 405 Method Not Allowed).
     """
     import base64 as b64
 
-    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not or_key:
+    if not tinfoil_api_configured():
         raise HTTPException(
             status_code=500,
-            detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini).",
+            detail="Configure TINFOIL_API_KEY for transcription (default whisper-large-v3-turbo).",
         )
     audio_b64 = (req.audio or "").strip()
     if not audio_b64:
@@ -2252,8 +1799,8 @@ async def api_transcribe(req: TranscribeRequest):
 @app.post("/api/voice-memo", include_in_schema=False)
 async def api_voice_memo(req: VoiceMemoRequest):
     """
-    Voice Memo tab: transcribe via OpenRouter openai/gpt-audio-mini (requires OPENROUTER_API_KEY).
-    Optionally polish transcript via OpenRouter (OPENROUTER_VOICE_MEMO_POLISH_MODEL, default openai/gpt-4.1-mini).
+    Voice Memo tab: transcribe via Tinfoil Whisper Large V3 Turbo (requires TINFOIL_API_KEY).
+    Optionally polish transcript via Tinfoil (TINFOIL_VOICE_MEMO_POLISH_MODEL, default kimi-k2-6).
     """
     import base64 as b64
 
@@ -2271,11 +1818,10 @@ async def api_voice_memo(req: VoiceMemoRequest):
     _t0 = _time.monotonic()
 
     fname = _guess_audio_filename(req.filename, req.mime_type)
-    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not or_key:
+    if not tinfoil_api_configured():
         raise HTTPException(
             status_code=500,
-            detail="Configure OPENROUTER_API_KEY for transcription (default openai/gpt-audio-mini).",
+            detail="Configure TINFOIL_API_KEY for transcription (default whisper-large-v3-turbo).",
         )
     audio_kb = len(raw_audio) / 1024
     print(f"[backend] voice-memo: transcribing {audio_kb:.0f} KB audio ({fname})")
@@ -2301,11 +1847,11 @@ async def api_voice_memo(req: VoiceMemoRequest):
         _t2 = _time.monotonic()
         print(f"[backend] voice-memo: journal_mode polish skipped in {_t2 - _t1:.1f}s (total {_t2 - _t0:.1f}s)")
     else:
-        polished = await _polish_voice_memo_openrouter(raw_transcript)
+        polished = await _polish_voice_memo_tinfoil(raw_transcript)
         _t2 = _time.monotonic()
         print(f"[backend] voice-memo: polish done in {_t2 - _t1:.1f}s (total {_t2 - _t0:.1f}s)")
         did_polish = bool(
-            or_key
+            tinfoil_api_configured()
             and (raw_transcript or "").strip()
             and (polished or "").strip()
             and (polished or "").strip() != (raw_transcript or "").strip()
@@ -2329,7 +1875,7 @@ async def api_journal_cleanup(req: JournalCleanupRequest):
         raise HTTPException(status_code=400, detail="text is required")
     if len(text) < 3:
         raise HTTPException(status_code=400, detail="Text too short to clean up")
-    cleaned = await _polish_voice_memo_openrouter(text, req.model)
+    cleaned = await _polish_voice_memo_tinfoil(text, req.model)
     return JournalCleanupResponse(cleaned_text=cleaned)
 
 
@@ -2341,7 +1887,7 @@ async def api_journal_validate(req: JournalValidateRequest, request: Request):
     if len(text) < 10:
         raise HTTPException(status_code=400, detail="Please provide a longer transcript before validation")
     instance_id = _instance_id(request)
-    reformatted, feedback, notes, model_used = await _validate_journal_openrouter(
+    reformatted, feedback, notes, model_used = await _validate_journal_tinfoil(
         text, req.model, instance_id=instance_id
     )
     return JournalValidateResponse(

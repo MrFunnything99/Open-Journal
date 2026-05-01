@@ -1,8 +1,8 @@
 # SelfMeridian Python backend
 
-FastAPI application plus LangGraph chat flow, SQLite + **sqlite-vec** for memory, and optional **LightRAG** (`LIGHTRAG_ENABLED`, off by default).
+FastAPI application plus LangGraph chat flow and SQLite + **sqlite-vec** memory. All inference, embeddings, and speech-to-text route through Tinfoil.
 
-**Environment:** copy `.env.example` to `.env` in the **project root** (not only `backend/`). See the main **[README.md](../README.md)** for OpenRouter, Perplexity, and Mistral setup.
+**Environment:** copy `.env.example` to `.env` in the project root (not only `backend/`). Required: `TINFOIL_API_KEY`. Reserved: `LISTENNOTES_API_KEY`. OpenLibrary lookup is used without an API key for book normalization.
 
 ## One-time setup
 
@@ -27,4 +27,4 @@ On macOS, if system SQLite lacks extension support, you may need `pysqlite3` for
 
 ## Fly.io
 
-Deploy from the **repository root** (`fly deploy`). Persist the vector DB with a volume and `VECTOR_DB_PATH` — details in the main **[README.md](../README.md#deployment-flyio)** and **[STORAGE.md](./STORAGE.md)**.
+Deploy from the repository root (`fly deploy`). Persist the vector DB with a volume and `VECTOR_DB_PATH`; details live in the main README and `STORAGE.md`.

@@ -165,7 +165,7 @@ type PersonaplexChatContextValue = {
   resetAssistedWorkspace: () => void;
   chatInteractionMode: ChatInteractionMode;
   setChatInteractionMode: (m: ChatInteractionMode) => void;
-  /** OpenRouter model for AI-Assisted Journal Mode /chat (allowlisted on server). */
+  /** Tinfoil model for AI-Assisted Journal Mode /chat (allowlisted on server). */
   userChatModel: UserSelectableChatModelId;
   setUserChatModel: (m: UserSelectableChatModelId) => void;
 };
@@ -413,7 +413,7 @@ export function PersonaplexChatProvider({
         mode: chatInteractionMode,
       };
       if (chatInteractionMode === "autobiography") {
-        payload.openrouter_model = userChatModel;
+        payload.tinfoil_model = userChatModel;
         payload.client_time_context = buildAssistedJournalClientTimeContext();
       }
       const res = await backendFetch("/chat", {
@@ -520,7 +520,7 @@ export function PersonaplexChatProvider({
         personalization: CHAT_PERSONALIZATION_FULL,
         intrusiveness: 0.5,
         mode: "autobiography",
-        openrouter_model: userChatModel,
+        tinfoil_model: userChatModel,
         client_time_context: buildAssistedJournalClientTimeContext(),
       };
       const res = await backendFetch("/chat", {

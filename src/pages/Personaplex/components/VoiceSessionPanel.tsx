@@ -10,7 +10,7 @@ export type VoiceSessionPanelProps = {
   onToggleMute: () => void;
   /** Full teardown: stop audio/mic, reset to idle, return to composer (End + Close). */
   onExitVoiceMode: () => void;
-  /** Interrupt TTS playback and return to listening (skip current response). */
+  /** Skip current spoken response if voice mode is enabled in the future. */
   onSkipResponse?: () => void;
 };
 

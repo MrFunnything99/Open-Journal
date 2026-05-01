@@ -1,15 +1,14 @@
-/** OpenRouter ids for AI-Assisted Journal /chat (must match backend graph.USER_SELECTABLE_CHAT_MODELS). */
+/** Tinfoil model ids for AI-Assisted Journal /chat (must match backend graph.USER_SELECTABLE_CHAT_MODELS). */
 export const CHAT_COMPLETION_MODEL_OPTIONS = [
-  { id: "anthropic/claude-opus-4.6", label: "Claude Opus 4.6" },
-  { id: "anthropic/claude-sonnet-4.6", label: "Claude Sonnet 4.6" },
-  { id: "openai/gpt-5.4", label: "GPT‑5.4" },
+  { id: "kimi-k2-6", label: "Kimi K2.6" },
+  { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
 ] as const;
 
 export type UserSelectableChatModelId = (typeof CHAT_COMPLETION_MODEL_OPTIONS)[number]["id"];
 
-export const DEFAULT_OPENROUTER_PRIMARY_MODEL: UserSelectableChatModelId = "anthropic/claude-opus-4.6";
+export const DEFAULT_TINFOIL_PRIMARY_MODEL: UserSelectableChatModelId = "kimi-k2-6";
 
-export const DEFAULT_USER_CHAT_MODEL = DEFAULT_OPENROUTER_PRIMARY_MODEL;
+export const DEFAULT_USER_CHAT_MODEL = DEFAULT_TINFOIL_PRIMARY_MODEL;
 
 export const USER_CHAT_MODEL_STORAGE_KEY = "personaplex-user-chat-model-v1";
 
@@ -27,16 +26,15 @@ export function readStoredUserChatModel(): UserSelectableChatModelId {
   return DEFAULT_USER_CHAT_MODEL;
 }
 
-/** OpenRouter ids for Manual Journal: AI feedback + spelling/cleanup (must match backend journal LLM allowlist). */
+/** Tinfoil model ids for Manual Journal: AI feedback + spelling/cleanup (must match backend journal LLM allowlist). */
 export const JOURNAL_MANUAL_AI_MODEL_OPTIONS = [
-  { id: "anthropic/claude-opus-4.6", label: "Claude Opus 4.6" },
-  { id: "anthropic/claude-sonnet-4.6", label: "Claude Sonnet 4.6" },
-  { id: "openai/gpt-5.4", label: "GPT‑5.4" },
+  { id: "kimi-k2-6", label: "Kimi K2.6" },
+  { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
 ] as const;
 
 export type JournalManualAiModelId = (typeof JOURNAL_MANUAL_AI_MODEL_OPTIONS)[number]["id"];
 
-export const DEFAULT_JOURNAL_MANUAL_AI_MODEL: JournalManualAiModelId = "anthropic/claude-opus-4.6";
+export const DEFAULT_JOURNAL_MANUAL_AI_MODEL: JournalManualAiModelId = "kimi-k2-6";
 
 export const JOURNAL_MANUAL_AI_MODEL_STORAGE_KEY = "selfmeridian:journal-manual-ai-model-v1";
 

@@ -448,7 +448,7 @@ export function AskAnythingComposer({
   const iconSize = isRail ? "h-[18px] w-[18px]" : "h-5 w-5";
   const btnSize = isRail ? "h-9 w-9" : "h-10 w-10";
   const canSend = !sending && micPhase === "idle" && (!!draft.trim() || !!pendingAudioFile);
-  const showVoice = assistedJournalMinimal && chatInteractionMode === "autobiography" && !!onStartVoiceSession && micPhase === "idle";
+  const showVoice = false;
 
   const composerIconButtons = (
     <>

@@ -98,7 +98,7 @@ function resolveFilingIsoFromApiAndPath(apiDay: string | null | undefined, path:
   return fallbackNow;
 }
 
-/** OpenRouter (MiniMax M2.7 by default): paths/filenames only — no file contents. */
+/** Tinfoil: paths/filenames only — no file contents. */
 async function inferJournalPathDatesMap(paths: string[]): Promise<Map<string, string>> {
   const map = new Map<string, string>();
   if (paths.length === 0) return map;

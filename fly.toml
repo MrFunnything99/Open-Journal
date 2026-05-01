@@ -11,7 +11,6 @@ primary_region = 'iad'
 [env]
   VECTOR_DB_PATH = "/data/open_journal.db"
   ENVIRONMENT = "production"
-  LIGHTRAG_ENABLED = "false"
 
 [mounts]
   source = "data"

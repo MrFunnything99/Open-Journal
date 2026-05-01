@@ -19,6 +19,6 @@ export const CHAT_INTERACTION_MODE_META: Record<
     sublabel: "Reflect with AI",
     composerChipLabel: "AI-Assisted Journal Mode",
     description:
-      "Reflective chat via OpenRouter — pick the model above the composer. Model-data training is turned off for these API calls; however disclose at your own discretion.",
+      "Reflective chat via Tinfoil — pick the model above the composer. Keep private details inside Selfmeridian at your discretion.",
   },
 };

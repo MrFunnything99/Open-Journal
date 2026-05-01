@@ -43,7 +43,7 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Backend learning synthesis log (full Grok theme output)
+# Backend logs
 backend/logs/
 
 # Unit test / coverage reports

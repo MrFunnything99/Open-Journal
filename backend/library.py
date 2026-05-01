@@ -2,17 +2,10 @@
 Journal and memory helpers for Selfmeridian: gist_facts (semantic) and episodic_log (episodic)
 via SQLite + sqlite-vec.
 
-Embeddings: Perplexity (`_embed_texts` → PERPLEXITY_API_KEY); without a key, placeholder vectors
-match EMBEDDING_DIM so memory rows still persist (semantic retrieval is degraded).
-
-Extraction / helpers: OpenRouter chat completions (`OPENROUTER_API_KEY`; model
-`OPENROUTER_EXTRACTION_MODEL`, with legacy fallback `OPENROUTER_GEMINI_MODEL`).
-Tune `OPENROUTER_EXTRACTION_MAX_TOKENS` (default 8192) so OpenRouter does not reserve huge
-output budgets per request.
+Embeddings and helper inference are routed through Tinfoil.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import ssl
 import time
@@ -40,68 +33,34 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from decision_logger import DecisionLogger
+from tinfoil_client import (
+    TINFOIL_EMBEDDING_DIM,
+    chat_text,
+    embeddings as tinfoil_embeddings,
+    tinfoil_api_configured,
+    tinfoil_chat_model,
+)
 
-_PERPLEXITY_EMBED_FALLBACK_WARNED = False
-
-PPLX_EMBEDDINGS_URL = "https://api.perplexity.ai/v1/embeddings"
-PPLX_CONTEXTUAL_EMBEDDINGS_URL = "https://api.perplexity.ai/v1/contextualizedembeddings"
-# Context model: use contextualized endpoint (one chunk per pseudo-document for unrelated texts).
-PPLX_EMBED_BATCH_DOCS = 480
-DEFAULT_PERPLEXITY_EMBEDDING_MODEL = "pplx-embed-context-v1-4b"
-PPLX_SEARCH_URL = "https://api.perplexity.ai/search"
-OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_OPENROUTER_EXTRACTION_MODEL = "google/gemini-3-pro-preview"
-
-
-def openrouter_api_configured() -> bool:
-    return bool((os.getenv("OPENROUTER_API_KEY") or "").strip())
+_TINFOIL_EMBED_FALLBACK_WARNED = False
+TINFOIL_EMBED_BATCH = 256
 
 
-def openrouter_extraction_model() -> str:
-    return (
-        (os.getenv("OPENROUTER_EXTRACTION_MODEL") or os.getenv("OPENROUTER_GEMINI_MODEL") or DEFAULT_OPENROUTER_EXTRACTION_MODEL)
-        .strip()
-    )
+def inference_api_configured() -> bool:
+    return tinfoil_api_configured()
+
+
+def helper_llm_model() -> str:
+    return (os.getenv("TINFOIL_EXTRACTION_MODEL") or tinfoil_chat_model()).strip() or tinfoil_chat_model()
 
 
 def extraction_llm_backend() -> str:
-    """Startup label: extraction / helper LLM (OpenRouter only)."""
-    if openrouter_api_configured():
-        return f"openrouter ({openrouter_extraction_model()})"
-    return "none (set OPENROUTER_API_KEY for extraction/helpers)"
+    """Startup label: extraction / helper LLM."""
+    if inference_api_configured():
+        return f"tinfoil ({helper_llm_model()})"
+    return "none (set TINFOIL_API_KEY for extraction/helpers)"
 
 
-def gemini_extraction_backend() -> str:
-    """Deprecated alias for startup logs; OpenRouter-only."""
-    return extraction_llm_backend()
-
-
-def _openrouter_normalize_message_content(msg: dict | None) -> str:
-    if not isinstance(msg, dict):
-        return ""
-    content = msg.get("content")
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict):
-                t = block.get("text")
-                if isinstance(t, str) and t.strip():
-                    parts.append(t.strip())
-                elif block.get("type") == "text":
-                    tx = block.get("text")
-                    if isinstance(tx, str) and tx.strip():
-                        parts.append(tx.strip())
-            elif isinstance(block, str) and block.strip():
-                parts.append(block.strip())
-        return "\n".join(parts).strip() if parts else ""
-    return str(content).strip()
-
-
-def _openrouter_chat_completion(
+def _llm_chat_completion(
     prompt: str,
     *,
     model: str | None = None,
@@ -109,14 +68,13 @@ def _openrouter_chat_completion(
     timeout_sec: float | None = None,
     max_tokens: int | None = None,
 ) -> str:
-    key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-    if not key:
+    if not inference_api_configured():
         return ""
     eff_timeout = float(timeout_sec) if timeout_sec is not None else float(
-        os.getenv("OPENROUTER_EXTRACTION_TIMEOUT_SEC") or os.getenv("OPENROUTER_GEMINI_TIMEOUT_SEC") or "75"
+        os.getenv("TINFOIL_EXTRACTION_TIMEOUT_SEC") or "120"
     )
-    m = (model or openrouter_extraction_model()).strip() or DEFAULT_OPENROUTER_EXTRACTION_MODEL
-    temp_raw = os.getenv("OPENROUTER_EXTRACTION_TEMPERATURE") or os.getenv("OPENROUTER_GEMINI_TEMPERATURE")
+    m = (model or helper_llm_model()).strip() or helper_llm_model()
+    temp_raw = os.getenv("TINFOIL_EXTRACTION_TEMPERATURE")
     if temperature is not None:
         temp = float(temperature)
     elif temp_raw is not None and str(temp_raw).strip() != "":
@@ -129,60 +87,16 @@ def _openrouter_chat_completion(
         except (TypeError, ValueError):
             eff_max = 256
     else:
-        _mt = (os.getenv("OPENROUTER_EXTRACTION_MAX_TOKENS") or os.getenv("OPENROUTER_GEMINI_MAX_TOKENS") or "8192").strip()
+        _mt = (os.getenv("TINFOIL_EXTRACTION_MAX_TOKENS") or "8192").strip()
         try:
             eff_max = max(256, min(int(_mt), 65536))
         except ValueError:
             eff_max = 8192
-    max_tokens = eff_max
-    payload: dict = {
-        "model": m,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temp,
-        "max_tokens": max_tokens,
-    }
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        OPENROUTER_CHAT_COMPLETIONS_URL,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://selfmeridian.local"),
-            "X-Title": os.getenv("OPENROUTER_TITLE", "SelfMeridian"),
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
-            raw_text = resp.read().decode("utf-8")
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        status = e.code
-        try:
-            raw_text = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            raw_text = ""
-        try:
-            err_j = json.loads(raw_text) if raw_text else {}
-            detail = err_j.get("error", {}).get("message") if isinstance(err_j.get("error"), dict) else err_j.get("error")
-        except Exception:
-            detail = raw_text[:500] if raw_text else None
-        print("[backend] OpenRouter chat error:", status, detail or "")
+        return chat_text(prompt, model=m, temperature=temp, timeout_sec=eff_timeout, max_tokens=eff_max)
+    except Exception as e:
+        print("[backend] Tinfoil helper chat error:", e)
         return ""
-    if status < 200 or status >= 300:
-        print("[backend] OpenRouter chat error: HTTP", status)
-        return ""
-    try:
-        data = json.loads(raw_text) if raw_text else {}
-    except json.JSONDecodeError:
-        print("[backend] OpenRouter chat: invalid JSON response")
-        return ""
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not isinstance(choices, list) or not choices:
-        return ""
-    msg0 = choices[0].get("message") if isinstance(choices[0], dict) else None
-    return _openrouter_normalize_message_content(msg0 if isinstance(msg0, dict) else None)
 
 
 def _ensure_storage() -> None:
@@ -192,38 +106,8 @@ def _ensure_storage() -> None:
     vec_store.ensure_db()
 
 
-def _decode_perplexity_int8_b64(b64: str) -> list[float]:
-    """Decode Perplexity base64_int8 embedding and L2-normalize for cosine search in sqlite-vec."""
-    raw = base64.b64decode(b64)
-    arr = np.frombuffer(raw, dtype=np.int8).astype(np.float32)
-    n = float(np.linalg.norm(arr))
-    if n > 0:
-        arr = arr / n
-    return arr.tolist()
-
-
-def _perplexity_post_json(url: str, payload: dict, api_key: str, timeout_sec: float = 120.0) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        print("[backend] Perplexity embeddings HTTP error:", e.code, err_body[:500])
-        raise
-
-
 def _placeholder_embeddings(texts: list[str], dim: int) -> list[list[float]]:
-    """L2-normalized pseudo-vectors (same dim as vec tables) when Perplexity is unavailable."""
+    """L2-normalized pseudo-vectors (same dim as vec tables) when Tinfoil is unavailable."""
     out: list[list[float]] = []
     u32_max = float(2**32 - 1)
     for i, t in enumerate(texts):
@@ -245,87 +129,43 @@ def _placeholder_embeddings(texts: list[str], dim: int) -> list[list[float]]:
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
     """
-    Embed texts via Perplexity (default: pplx-embed-context-v1-4b on contextualized API).
-    Each unrelated string is sent as a single-chunk \"document\" so the context model applies per text.
+    Embed texts via Tinfoil `nomic-embed-text`.
     Vectors are L2-normalized float32 for sqlite-vec cosine distance.
     """
     if not texts:
         return []
-    api_key = (os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY") or "").strip()
-    if not api_key:
-        global _PERPLEXITY_EMBED_FALLBACK_WARNED
-        if not _PERPLEXITY_EMBED_FALLBACK_WARNED:
-            _PERPLEXITY_EMBED_FALLBACK_WARNED = True
+    if not tinfoil_api_configured():
+        global _TINFOIL_EMBED_FALLBACK_WARNED
+        if not _TINFOIL_EMBED_FALLBACK_WARNED:
+            _TINFOIL_EMBED_FALLBACK_WARNED = True
             print(
-                "[backend] PERPLEXITY_API_KEY unset — using placeholder embeddings "
+                "[backend] TINFOIL_API_KEY unset — using placeholder embeddings "
                 "(memory rows still save; semantic retrieval is degraded)."
             )
-        dim = int(os.getenv("EMBEDDING_DIM", "2560"))
+        dim = int(os.getenv("EMBEDDING_DIM", str(TINFOIL_EMBEDDING_DIM)))
         return _placeholder_embeddings(texts, dim)
-    model = os.getenv("PERPLEXITY_EMBEDDING_MODEL", DEFAULT_PERPLEXITY_EMBEDDING_MODEL).strip()
-    use_contextual = "context" in model.lower()
 
     def _sanitize(t: str) -> str:
         s = (t or "").strip()
         return s if s else " "
 
     out: list[list[float]] = []
-    for start in range(0, len(texts), PPLX_EMBED_BATCH_DOCS):
-        batch = [_sanitize(t) for t in texts[start : start + PPLX_EMBED_BATCH_DOCS]]
-        if use_contextual:
-            payload = {
-                "model": model,
-                "input": [[t] for t in batch],
-                "encoding_format": "base64_int8",
-            }
-            body = _perplexity_post_json(PPLX_CONTEXTUAL_EMBEDDINGS_URL, payload, api_key)
-            docs = sorted(body.get("data") or [], key=lambda x: x.get("index", 0))
-            if len(docs) != len(batch):
-                raise ValueError(
-                    f"Perplexity contextualized embeddings: expected {len(batch)} documents, got {len(docs)}"
-                )
-            for doc in docs:
-                chunks = sorted(doc.get("data") or [], key=lambda x: x.get("index", 0))
-                if not chunks or "embedding" not in chunks[0]:
-                    raise ValueError("Perplexity contextualized response missing embedding chunk")
-                out.append(_decode_perplexity_int8_b64(chunks[0]["embedding"]))
-        else:
-            payload = {
-                "model": model,
-                "input": batch,
-                "encoding_format": "base64_int8",
-            }
-            body = _perplexity_post_json(PPLX_EMBEDDINGS_URL, payload, api_key)
-            rows = sorted(body.get("data") or [], key=lambda x: x.get("index", 0))
-            if len(rows) != len(batch):
-                raise ValueError(
-                    f"Perplexity embeddings: expected {len(batch)} vectors, got {len(rows)}"
-                )
-            for row in rows:
-                if "embedding" not in row:
-                    raise ValueError("Perplexity embeddings response missing embedding")
-                out.append(_decode_perplexity_int8_b64(row["embedding"]))
+    for start in range(0, len(texts), TINFOIL_EMBED_BATCH):
+        batch = [_sanitize(t) for t in texts[start : start + TINFOIL_EMBED_BATCH]]
+        vectors = tinfoil_embeddings(batch)
+        for vec in vectors:
+            arr = np.asarray(vec, dtype=np.float32)
+            n = float(np.linalg.norm(arr))
+            if n > 0:
+                arr = arr / n
+            out.append(arr.tolist())
 
     return out
 
 
-def _call_gemini(prompt: str) -> str:
-    """
-    Extraction / helper LLM: OpenRouter chat completions only (`OPENROUTER_API_KEY`).
-    Returns empty string if OpenRouter is not configured or the request fails.
-    """
-    if not openrouter_api_configured():
-        return ""
-    try:
-        return _openrouter_chat_completion(prompt)
-    except Exception as e:
-        print("[backend] _call_gemini (OpenRouter) error:", e)
-        return ""
-
-
-def _call_gemini_with_google_search(prompt: str) -> str:
-    """Legacy alias: identical to `_call_gemini` (OpenRouter chat completions)."""
-    return _call_gemini(prompt)
+def _call_helper_llm(prompt: str) -> str:
+    """Extraction / helper LLM routed through Tinfoil."""
+    return _llm_chat_completion(prompt)
 
 
 def wipe_memory() -> None:
@@ -514,7 +354,7 @@ Passages:
 {joined}
 ---
 """
-    text = _call_gemini(prompt)
+    text = _call_helper_llm(prompt)
     text = (text or "").strip()
     # Very light post-processing: cap at 4 sentences
     if not text:
@@ -559,7 +399,7 @@ The following passages are from a journal. The journal writer (the "user") often
 CRITICAL RULES:
 - Each fact must be ABOUT {person_name} (their age, job, school, hobbies, traits, projects, role in the user's life). The SUBJECT of the fact must be {person_name}.
 - Do NOT include any fact that describes the journal writer / user (e.g. "I work at X", "I go to UNCA", "I like hiking"). Those are facts about the user, not about {person_name}.
-- If the passage only describes what the user did or who the user is, leave it out. Only include facts that clearly describe {person_name} (e.g. "{person_name} works at Google", "{person_name} is in grad school", "My friend {person_name} is 25").
+- If the passage only describes what the user did or who the user is, leave it out. Only include facts that clearly describe {person_name} (e.g. "{person_name} works at external", "{person_name} is in grad school", "My friend {person_name} is 25").
 - When in doubt, omit. Include only facts that unambiguously describe {person_name}.
 
 Focus on stable, factual information about {person_name}:
@@ -586,7 +426,7 @@ Passages (from the user's journal; extract only facts about {person_name}, not a
 {joined}
 ---
 """
-    raw = _call_gemini(prompt)
+    raw = _call_helper_llm(prompt)
     raw = (raw or "").strip()
     if not raw:
         return []
@@ -701,7 +541,7 @@ Return ONLY valid JSON with this structure (no markdown, no comments):
 People:
 {people_blob}
 """
-    raw = _call_gemini(prompt)
+    raw = _call_helper_llm(prompt)
     raw = (raw or "").strip()
     if not raw:
         return
@@ -770,7 +610,7 @@ Summaries:
 Profile (JSON):
 {json.dumps(prof2, ensure_ascii=False)[:4000]}
 """
-    summary_text = (_call_gemini(prompt) or "").strip()[:25_000]
+    summary_text = (_call_helper_llm(prompt) or "").strip()[:25_000]
     ms = int((time.perf_counter() - t0) * 1000)
     vec_store.user_media_profile_merge_json(
         inst,
@@ -1551,7 +1391,7 @@ def apply_library_tool_items(items: object, instance_id: str = "") -> tuple[int,
     return added, labels
 
 
-_BOOK_VALIDATION_MODEL = os.getenv("OPENROUTER_BOOK_VALIDATION_MODEL", "openai/gpt-4.1-mini")
+_BOOK_VALIDATION_MODEL = os.getenv("TINFOIL_BOOK_VALIDATION_MODEL", "kimi-k2-6")
 
 _BOOK_TOOL_NORMALIZE_PROMPT = """The user mentioned these books in conversation. For each entry, output a clean standard English title and the primary author (fix typos and casing for well-known books).
 Return ONLY a JSON array — same length and order as the input. Each element: {"title":"...","author":"..."}.
@@ -1563,7 +1403,7 @@ Input:
 
 def resolve_books_via_openlibrary(books: list[dict]) -> list[dict]:
     """
-    Normalize title/author via OpenRouter (OPENROUTER_BOOK_VALIDATION_MODEL), then save_resolved_books.
+    Normalize title/author via Tinfoil (TINFOIL_BOOK_VALIDATION_MODEL), then save_resolved_books.
     """
     resolved: list[dict] = []
     for raw in books:
@@ -1585,7 +1425,7 @@ def resolve_books_via_openlibrary(books: list[dict]) -> list[dict]:
             }
         )
 
-    if not resolved or not openrouter_api_configured():
+    if not resolved or not inference_api_configured():
         return resolved
 
     batch_size = 12
@@ -1600,7 +1440,7 @@ def resolve_books_via_openlibrary(books: list[dict]) -> list[dict]:
         ]
         prompt = _BOOK_TOOL_NORMALIZE_PROMPT + json.dumps(payload, ensure_ascii=False)
         try:
-            raw = _openrouter_chat_completion(
+            raw = _llm_chat_completion(
                 prompt,
                 model=_BOOK_VALIDATION_MODEL,
                 temperature=0.1,
@@ -1784,7 +1624,7 @@ Instructions:
 - Use simple labels; avoid long sentences. Use parentheses for the root: root((My journal)).
 - Maximum 30–40 nodes total to keep the diagram clean."""
 
-    code = _call_gemini(prompt)
+    code = _call_helper_llm(prompt)
     code = (code or "").strip()
     if code.startswith("```"):
         lines = code.split("\n")
@@ -1904,7 +1744,7 @@ Return ONLY valid JSON: {{"summary": "2-5 sentences", "tags": ["short-tag", ...]
 Summaries:
 {blob}
 """
-    raw = (_call_gemini(prompt) or "").strip()
+    raw = (_call_helper_llm(prompt) or "").strip()
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = (parts[1] if len(parts) > 1 else raw).strip()
@@ -1960,7 +1800,7 @@ Profile: {json.dumps(prof)[:2500]}
 Patterns: {json.dumps(patterns)[:2500]}
 Recent excerpts: {json.dumps(excerpts)[:3500]}
 """
-    raw = (_call_gemini(prompt) or "").strip()
+    raw = (_call_helper_llm(prompt) or "").strip()
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = (parts[1] if len(parts) > 1 else raw).strip()

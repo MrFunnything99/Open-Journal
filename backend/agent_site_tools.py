@@ -1,5 +1,5 @@
 """
-Server-side actions the journal chat agent may invoke via OpenRouter tool calls.
+Server-side actions the journal chat agent may invoke via Tinfoil tool calls.
 
 Tools implemented here:
 - update_library_item — update a Semantic Memory (consumed_media) row by id or title search
