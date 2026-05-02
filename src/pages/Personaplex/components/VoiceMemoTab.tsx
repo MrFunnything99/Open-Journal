@@ -495,7 +495,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
       const res = await backendFetch("/journal-cleanup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, model: journalManualAiModel }),
+        body: JSON.stringify({ text }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         detail?: string;
@@ -516,7 +516,7 @@ export const VoiceMemoTab: FC<Props> = ({ onToast, saveEntry, syncUnsyncedEntrie
     } finally {
       setJournalCleanupBusy(false);
     }
-  }, [reviewText, journalCleanupBusy, gettingFeedback, onToast, journalManualAiModel]);
+  }, [reviewText, journalCleanupBusy, gettingFeedback, onToast]);
 
   const startAnotherEntry = useCallback(() => {
     setRawTranscript("");

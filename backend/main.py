@@ -66,6 +66,7 @@ from library import (
     refresh_pattern_memory,
     save_session_data,
     extraction_llm_backend,
+    effective_journal_entry_kind,
     update_memory_fact,
     update_memory_summary,
     update_consumed_media,
@@ -418,13 +419,14 @@ class VoiceMemoRequest(BaseModel):
     journal_mode: bool = False
 
 
-# Manual Journal AI feedback + cleanup: client may pass model; only these Tinfoil ids are accepted.
+# Manual Journal AI feedback: client may pass model; only these Tinfoil ids are accepted.
 _JOURNAL_MANUAL_AI_MODEL_ALLOWLIST = frozenset(
     {
         "kimi-k2-6",
         "deepseek-v4-pro",
     }
 )
+_JOURNAL_CLEANUP_AI_MODEL = "gemma4-31b"
 
 
 def _resolve_journal_manual_ai_model(requested: Optional[str], *, env_fallback: str, hard_default: str) -> str:
@@ -515,6 +517,54 @@ def _journal_entry_metrics_block(
     )
 
 
+def _recent_manual_journal_context_block(
+    *,
+    instance_id: str,
+    current_entry: str,
+    limit: int = 7,
+) -> str:
+    """
+    Simple manual-journal memory for tonight: pass the last few solo entries as
+    plain context so feedback can notice patterns without invoking vector retrieval.
+    """
+    current_norm = " ".join((current_entry or "").split()).strip().lower()
+    try:
+        rows = vec_store.list_journal_entries_recent(instance_id or "", limit=40)
+    except Exception as e:
+        print("[backend] journal-feedback recent manual context:", e)
+        return ""
+
+    picked: list[dict] = []
+    for row in rows:
+        doc = (row.get("document") or "").strip()
+        if not doc:
+            continue
+        doc_norm = " ".join(doc.split()).strip().lower()
+        if current_norm and doc_norm == current_norm:
+            continue
+        if effective_journal_entry_kind(entry_source=row.get("entry_source"), document=doc) != "manual":
+            continue
+        picked.append(row)
+        if len(picked) >= max(1, limit):
+            break
+
+    if not picked:
+        return ""
+
+    sections: list[str] = [
+        "Use these recent manual entries only to notice broad patterns, repeated tensions, themes, or changes.",
+        "Do not summarize them back, do not over-explain the history, and do not invent continuity.",
+        "If a pattern is weak, stay with today's entry.",
+    ]
+    # Present oldest -> newest for easier temporal reading.
+    for idx, row in enumerate(reversed(picked), start=1):
+        doc = (row.get("document") or "").strip()
+        date = (row.get("timestamp") or row.get("created_at") or "").strip()
+        label = f"Recent manual entry {idx}" + (f" ({date[:10]})" if date else "")
+        sections.append(f"{label}:\n{doc[:2400]}")
+    return "\n\n".join(sections)
+
+
 def _guess_audio_filename(filename: Optional[str], mime_type: Optional[str]) -> str:
     fn = (filename or "").strip()
     if fn and "." in fn:
@@ -584,11 +634,7 @@ async def _polish_voice_memo_tinfoil(raw: str, model_override: Optional[str] = N
     text = (raw or "").strip()
     if not text or not (os.getenv("TINFOIL_API_KEY") or "").strip():
         return text
-    model = _resolve_journal_manual_ai_model(
-        model_override,
-        env_fallback="TINFOIL_VOICE_MEMO_POLISH_MODEL",
-        hard_default="kimi-k2-6",
-    )
+    model = (model_override or os.getenv("TINFOIL_VOICE_MEMO_POLISH_MODEL") or _JOURNAL_CLEANUP_AI_MODEL).strip()
     prompt = VOICE_MEMO_POLISH_INSTRUCTION + "\n\n--- Transcript ---\n" + text[:48000]
 
     def _call():
@@ -647,14 +693,25 @@ async def _validate_journal_tinfoil(
             reply_token_est=reply_token_est,
         )
 
-        # --- 1–2. Recent entries + vector journal context (off for now; prompt = metrics + instruction + entry only) ---
+        # --- 1. Simple recent-entry context for manual journaling feedback ---
+        recent_context = _recent_manual_journal_context_block(
+            instance_id=instance_id,
+            current_entry=entry_body,
+            limit=7,
+        )
         recent_entries: list[dict] = []
         vec_chunks: list[dict] = []
         t_ctx = _time.perf_counter()
-        print("[backend] journal-feedback: retrieval disabled (no recent-entry or vector context)")
+        print(
+            "[backend] journal-feedback: simple recent manual context "
+            + ("enabled" if recent_context else "empty")
+            + " (vector retrieval disabled)"
+        )
 
         # --- 3. Assemble context block for the prompt ---
         context_parts: list[str] = []
+        if recent_context:
+            context_parts.append("Last seven manual journal entries:\n" + recent_context)
 
         if recent_entries:
             for i, entry in enumerate(recent_entries):
@@ -1800,7 +1857,7 @@ async def api_transcribe(req: TranscribeRequest):
 async def api_voice_memo(req: VoiceMemoRequest):
     """
     Voice Memo tab: transcribe via Tinfoil Whisper Large V3 Turbo (requires TINFOIL_API_KEY).
-    Optionally polish transcript via Tinfoil (TINFOIL_VOICE_MEMO_POLISH_MODEL, default kimi-k2-6).
+    Optionally polish transcript via Tinfoil (TINFOIL_VOICE_MEMO_POLISH_MODEL, default gemma4-31b).
     """
     import base64 as b64
 
@@ -1875,7 +1932,8 @@ async def api_journal_cleanup(req: JournalCleanupRequest):
         raise HTTPException(status_code=400, detail="text is required")
     if len(text) < 3:
         raise HTTPException(status_code=400, detail="Text too short to clean up")
-    cleaned = await _polish_voice_memo_tinfoil(text, req.model)
+    _ = req.model
+    cleaned = await _polish_voice_memo_tinfoil(text)
     return JournalCleanupResponse(cleaned_text=cleaned)
 
 

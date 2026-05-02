@@ -26,7 +26,7 @@ export function readStoredUserChatModel(): UserSelectableChatModelId {
   return DEFAULT_USER_CHAT_MODEL;
 }
 
-/** Tinfoil model ids for Manual Journal: AI feedback + spelling/cleanup (must match backend journal LLM allowlist). */
+/** Tinfoil model ids for Manual Journal AI feedback (spelling/cleanup uses gemma4-31b on the backend). */
 export const JOURNAL_MANUAL_AI_MODEL_OPTIONS = [
   { id: "kimi-k2-6", label: "Kimi K2.6" },
   { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },

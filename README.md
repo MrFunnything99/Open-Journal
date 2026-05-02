@@ -11,7 +11,8 @@ Current defaults:
 | Capability | Tinfoil model | Notes |
 | --- | --- | --- |
 | Chat / assisted journal / helper inference | `kimi-k2-6` | Fallback: `deepseek-v4-pro` |
-| Manual journal feedback / cleanup | `kimi-k2-6` or `deepseek-v4-pro` | User-selectable in the UI |
+| Manual journal feedback | `kimi-k2-6` or `deepseek-v4-pro` | User-selectable in the UI |
+| Manual journal spelling/correction | `gemma4-31b` | Can be overridden with `TINFOIL_VOICE_MEMO_POLISH_MODEL` |
 | Speech-to-text | `whisper-large-v3-turbo` | Tinfoil documents mp3 + wav support; browser recordings are converted to wav before upload |
 | Embeddings | `nomic-embed-text` | 768 dimensions |
 

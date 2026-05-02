@@ -3,16 +3,22 @@
  * for Tinfoil Whisper, which accepts mp3 and wav.
  * Only use for reasonably short recordings/files that the browser can decode.
  */
+const TRANSCRIPTION_WAV_SAMPLE_RATE = 16_000;
+
 export async function blobToWavBase64(blob: Blob): Promise<string> {
   const arrayBuffer = await blob.arrayBuffer();
-  const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+  const AudioContextCtor =
+    window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const audioContext = new AudioContextCtor();
 
-  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-  const wavBuffer = audioBufferToWav(audioBuffer);
-  const base64 = arrayBufferToBase64(wavBuffer);
-
-  audioContext.close();
-  return base64;
+  try {
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    const transcriptionBuffer = await audioBufferToTranscriptionBuffer(audioContext, audioBuffer);
+    const wavBuffer = audioBufferToWav(transcriptionBuffer);
+    return arrayBufferToBase64(wavBuffer);
+  } finally {
+    void audioContext.close();
+  }
 }
 
 /** Base64-encode a blob without format conversion (keeps mp3/m4a/etc. small). */
@@ -106,6 +112,45 @@ function audioBufferToWav(audioBuffer: AudioBuffer): ArrayBuffer {
   }
 
   return buffer;
+}
+
+async function audioBufferToTranscriptionBuffer(
+  audioContext: BaseAudioContext,
+  audioBuffer: AudioBuffer,
+): Promise<AudioBuffer> {
+  const monoBuffer = downmixToMono(audioContext, audioBuffer);
+  if (monoBuffer.sampleRate === TRANSCRIPTION_WAV_SAMPLE_RATE) {
+    return monoBuffer;
+  }
+
+  try {
+    const length = Math.max(1, Math.ceil(monoBuffer.duration * TRANSCRIPTION_WAV_SAMPLE_RATE));
+    const offlineContext = new OfflineAudioContext(1, length, TRANSCRIPTION_WAV_SAMPLE_RATE);
+    const source = offlineContext.createBufferSource();
+    source.buffer = monoBuffer;
+    source.connect(offlineContext.destination);
+    source.start(0);
+    return await offlineContext.startRendering();
+  } catch {
+    // If browser resampling is unavailable, still return a valid mono WAV.
+    return monoBuffer;
+  }
+}
+
+function downmixToMono(audioContext: BaseAudioContext, audioBuffer: AudioBuffer): AudioBuffer {
+  if (audioBuffer.numberOfChannels === 1) {
+    return audioBuffer;
+  }
+
+  const monoBuffer = audioContext.createBuffer(1, audioBuffer.length, audioBuffer.sampleRate);
+  const monoData = monoBuffer.getChannelData(0);
+  for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+    const input = audioBuffer.getChannelData(ch);
+    for (let i = 0; i < input.length; i++) {
+      monoData[i] = (monoData[i] ?? 0) + input[i]! / audioBuffer.numberOfChannels;
+    }
+  }
+  return monoBuffer;
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
